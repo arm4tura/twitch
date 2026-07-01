@@ -1,0 +1,134 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================================
+ * Design tokens
+ * ============================================================================
+ * Значения — в rgb-триплетах (без "rgb(...)"), чтобы Tailwind мог применить
+ * <alpha-value>. Всё сидит в CSS-переменных → light-theme можно будет добавить
+ * без пересборки. Sem-цвета — от Tailwind emerald/amber/rose 500.
+ */
+:root {
+  color-scheme: dark;
+  /* Surfaces (zinc-based) */
+  --bg: 9 9 11; /* zinc-950 */
+  --surface: 24 24 27; /* zinc-900 */
+  --elevated: 39 39 42; /* zinc-800 */
+  --border: 63 63 70; /* zinc-700 - только для видимых бордеров, полупрозрачных чаще */
+  /* Foreground */
+  --fg: 250 250 250; /* zinc-50 */
+  --muted: 161 161 170; /* zinc-400 */
+  --subtle: 113 113 122; /* zinc-500 */
+  /* Semantic */
+  --ok: 16 185 129; /* emerald-500 */
+  --warn: 245 158 11; /* amber-500 */
+  --err: 244 63 94; /* rose-500 */
+  /* Brand (violet-500 → indigo-500) */
+  --brand-from: 139 92 246;
+  --brand-to: 99 102 241;
+}
+
+/* ============================================================================
+ * Base overrides
+ * ============================================================================
+ */
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: rgb(var(--bg));
+  color: rgb(var(--fg));
+  font-family:
+    "Inter Variable",
+    "Inter",
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    sans-serif;
+  font-feature-settings:
+    "cv11",
+    "ss01",
+    "ss03";
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden; /* main scroll — внутри AppShell */
+
+  /* Радиальный accent-градиент на 3% opacity + едва заметный шум для премиум-текстуры. */
+  background-image:
+    radial-gradient(
+      1200px 800px at 15% -10%,
+      rgb(var(--brand-from) / 0.08),
+      transparent 60%
+    ),
+    radial-gradient(
+      900px 600px at 100% 0%,
+      rgb(var(--brand-to) / 0.05),
+      transparent 55%
+    );
+  background-attachment: fixed;
+}
+
+/* Кастомный scrollbar под тёмную тему. Тонкий, полупрозрачный, appears-on-hover. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgb(255 255 255 / 0.06);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(255 255 255 / 0.12);
+  background-clip: padding-box;
+}
+
+/* Focus-ring: Tailwind ring-2 ring-brand-from + offset — но глобально снимаем
+ * дефолтный outline браузера, чтобы жила только наша визуальная система. */
+:focus {
+  outline: none;
+}
+:focus-visible {
+  outline: 2px solid rgb(var(--brand-from));
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* Общий класс монолог/лог: моно-шрифт, subtle цвет, mute на длинных строках. */
+.font-mono-tabular {
+  font-family:
+    "JetBrains Mono", ui-monospace, "Cascadia Mono", Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Motion — уважаем настройки ОС. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Radix Dialog / Popover overlay: mount-node в конце body. */
+[data-radix-popper-content-wrapper] {
+  z-index: 60 !important;
+}

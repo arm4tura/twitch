@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ru" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      CSP:
+      - style-src 'unsafe-inline' — Radix Popper/Dialog и framer-motion
+        применяют инлайновый style="" для позиционирования и transform'ов;
+        отключить это можно только патчем runtime, что не стоит того.
+      - Vite dev-режим стягивает HMR по ws://localhost:5173 — разрешаем
+        отдельным connect-src.
+      - Backend только 127.0.0.1 — GET /media стримит аудио через
+        media-src, WS-события через connect-src.
+    -->
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self';
+                   script-src 'self';
+                   style-src 'self' 'unsafe-inline';
+                   img-src 'self' data: blob:;
+                   font-src 'self' data:;
+                   media-src 'self' http://127.0.0.1:* blob:;
+                   connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*;" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Twitch Cut</title>
+  </head>
+  <body class="bg-bg text-fg">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

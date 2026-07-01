@@ -1,0 +1,43 @@
+{
+  "schema_version": "1.0",
+  "source": "./input/stream.mp4",
+  "original": "./input/original_video.mp4",
+  "range_in": "00:01:00.000",
+  "range_out": "00:02:00.000",
+  "local_duration": "00:01:00.000",
+  "cuts": [
+    {
+      "id": "cut_000001",
+      "start": 4.22,
+      "end": 4.82,
+      "action": "CUT",
+      "target": "audio",
+      "operation": "split_and_mute_audio",
+      "status": "accepted",
+      "stream_start": 64.22,
+      "stream_end": 64.82,
+      "word": "блин",
+      "reason": "profanity",
+      "intro_risk": true,
+      "match_type": "surface",
+      "confidence": 0.96
+    }
+  ],
+  "mutes": [
+    {
+      "id": "mute_000001",
+      "start": 4.22,
+      "end": 4.82,
+      "action": "MUTE",
+      "status": "accepted",
+      "word": "блин",
+      "reason": "profanity",
+      "intro_risk": true,
+      "stream_start": 64.22,
+      "stream_end": 64.82,
+      "match_type": "surface",
+      "confidence": 0.96
+    }
+  ],
+  "summary": {"cuts": 1, "mutes": 1}
+}

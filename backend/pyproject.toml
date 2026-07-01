@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "twitch-reaction-cutter"
+version = "0.1.0"
+description = "Phase 1 CLI core for Twitch reaction stream profanity markers and Vegas export."
+requires-python = ">=3.10,<3.13"
+
+# Прямые (top-level) зависимости. Транзитивные пиннятся в requirements-gpu.txt.
+# Версии здесь совпадают с lock — patch-функции в transcription.py написаны
+# ПОД ЭТИ версии pyannote/torch/speechbrain. Не двигай мажоры без пересмотра
+# transcription.py / smoke-теста.
+#
+# ВАЖНО: torch указан БЕЗ +cu126 суффикса — pip install по этому pyproject
+# без extra-index-url поставит CPU-версию. Для GPU используйте
+#   pip install -r requirements-gpu.txt
+# (там первая строка --extra-index-url PyTorch CUDA).
+dependencies = [
+    "whisperx==3.4.5",
+    "faster-whisper==1.2.1",
+    "ctranslate2==4.4.0",
+    "torch==2.6.0",
+    "torchaudio==2.6.0",
+    "torchvision==0.21.0",
+    "pyannote.audio==3.4.0",
+    "speechbrain==1.1.0",
+    "pytorch-lightning==2.6.5",
+    "lightning==2.6.5",
+    "transformers==5.12.1",
+    "huggingface_hub==1.21.0",
+    "omegaconf==2.3.1",
+    "imageio-ffmpeg==0.6.0",
+    "pymorphy3==2.0.6",
+    "pymorphy3-dicts-ru==2.4.417150.4580142",
+    "rapidfuzz==3.14.5",
+    "pydantic==2.13.4",
+    "typer==0.25.1",
+    "rich==15.0.0",
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.32.1",
+    "websockets==14.1",
+    "python-multipart==0.0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "httpx==0.28.1",
+]
+
+[project.scripts]
+twitch-cut = "twitch_cut.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
