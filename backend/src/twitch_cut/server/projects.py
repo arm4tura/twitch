@@ -192,3 +192,79 @@ def prune_registry(*, store_path: Optional[Path] = None) -> int:
     if removed:
         _save_registry(store, kept)
     return removed
+
+
+# --- deletion ----------------------------------------------------------------
+
+
+def _looks_like_project_dir(path: Path) -> bool:
+    """Грубая защита от rmtree по чему попало.
+
+    Удаляем папку проекта только если она достаточно «глубокая» (не корень
+    диска и не домашний каталог) — т.е. это подпапка внутри work/, созданная
+    пайплайном. Домашний каталог и корни трогать запрещаем.
+    """
+    try:
+        resolved = path.expanduser().resolve()
+    except Exception:  # noqa: BLE001
+        return False
+    if not resolved.is_dir():
+        return False
+    home = Path.home().resolve()
+    # Не корень диска (у корня нет "настоящего" родителя) и не сам home.
+    if resolved == resolved.parent or resolved == home:
+        return False
+    # Достаточно вложенная: минимум 2 сегмента пути после якоря.
+    if len(resolved.relative_to(resolved.anchor).parts) < 2:
+        return False
+    return True
+
+
+def unregister_project(
+    decisions_path: str | Path,
+    *,
+    delete_files: bool = False,
+    store_path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Убрать проект из реестра и (опционально) удалить его файлы с диска.
+
+    Реестр — источник правды для Dashboard. При delete_files=True дополнительно
+    удаляем папку проекта (родитель decisions.json — обычно подпапка в work/,
+    куда пайплайн кладёт decisions.json + mutes.cs + cache). Удаление файлов —
+    best-effort: если папка «подозрительная» (корень/домашний каталог) или
+    удаление упало, реестр всё равно чистим, а причину возвращаем в ответе.
+
+    Возвращает {"unregistered": bool, "deleted_dir": str|None, "error": str|None}.
+    """
+    store = store_path or default_projects_file()
+    key = str(Path(decisions_path).expanduser().resolve())
+
+    paths = _load_registry(store)
+    before = len(paths)
+    paths = [p for p in paths if p != key]
+    unregistered = len(paths) != before
+    if unregistered:
+        try:
+            _save_registry(store, paths)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("failed to save projects registry after unregister: %s", exc)
+
+    deleted_dir: Optional[str] = None
+    error: Optional[str] = None
+    if delete_files:
+        import shutil
+
+        project_dir = Path(key).parent
+        if _looks_like_project_dir(project_dir):
+            try:
+                shutil.rmtree(project_dir)
+                deleted_dir = str(project_dir)
+            except Exception as exc:  # noqa: BLE001
+                error = f"не удалось удалить папку {project_dir}: {exc}"
+                logger.warning(error)
+        else:
+            error = f"папка {project_dir} не похожа на папку проекта — файлы не тронуты"
+            logger.warning(error)
+
+    return {"unregistered": unregistered, "deleted_dir": deleted_dir, "error": error}
+

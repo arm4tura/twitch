@@ -15,7 +15,50 @@
     "build:renderer": "vite build",
     "build:main": "tsc -p electron/tsconfig.json",
     "start": "electron electron/dist/main.js",
-    "typecheck": "tsc --noEmit && tsc -p electron/tsconfig.json --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p electron/tsconfig.json --noEmit",
+    "dist": "npm run build && electron-builder --publish never",
+    "dist:publish": "npm run build && electron-builder --publish always"
+  },
+  "build": {
+    "appId": "com.arm4tura.twitchcut",
+    "productName": "Twitch Cut",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**",
+      "electron/dist/**"
+    ],
+    "extraResources": [
+      {
+        "from": "../backend",
+        "to": "backend",
+        "filter": [
+          "src/**",
+          "requirements*.txt",
+          "pyproject.toml",
+          "banwords*.txt",
+          "!**/__pycache__/**",
+          "!**/*.pyc"
+        ]
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "arm4tura",
+      "repo": "twitch"
+    }
   },
   "devDependencies": {
     "@types/react": "18.3.12",
@@ -25,6 +68,7 @@
     "concurrently": "9.1.0",
     "cross-env": "7.0.3",
     "electron": "33.2.0",
+    "electron-builder": "25.1.8",
     "postcss": "8.4.49",
     "tailwindcss": "3.4.17",
     "typescript": "5.7.2",

@@ -91,7 +91,7 @@ export function DashboardScreen({
         <div>
           <h1 className="text-2xl font-semibold tracking-tight text-fg">Проекты</h1>
           <p className="mt-1 text-sm text-muted">
-            Последние обработанные стримы и их decisions.json.
+            Обработанные записи — открой любую, чтобы поправить и выгрузить.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -104,9 +104,13 @@ export function DashboardScreen({
           >
             <RefreshCw className="h-4 w-4" /> Обновить
           </Button>
-          <Button onClick={onNew}>
-            <Plus className="h-4 w-4" /> Новый проект
-          </Button>
+          {/* «Новый проект» показываем только когда список непустой — при пустом
+              реестре главный CTA живёт в EmptyState по центру, дублировать не нужно. */}
+          {projects && projects.length > 0 && (
+            <Button onClick={onNew}>
+              <Plus className="h-4 w-4" /> Новый проект
+            </Button>
+          )}
         </div>
       </header>
 
@@ -116,7 +120,7 @@ export function DashboardScreen({
           icon={<FolderOpen className="h-3.5 w-3.5" />}
           label="Проектов"
           value={projects === null ? "—" : projects.length}
-          hint={projects && projects.length > 0 ? "в реестре недавних" : "начните с нового"}
+          hint={projects && projects.length > 0 ? "завершено" : "начните с нового"}
         />
         <StatCard
           icon={<Film className="h-3.5 w-3.5" />}
@@ -125,16 +129,14 @@ export function DashboardScreen({
           hint={
             runningCount > 0
               ? "в очереди или выполняются"
-              : jobs.length > 0
-                ? `${jobs.length} завершено`
-                : "backend простаивает"
+              : "нет активных обработок"
           }
         />
         <StatCard
           icon={<Sparkles className="h-3.5 w-3.5" />}
-          label="Правок всего"
+          label="Всего правок"
           value={totalEdits}
-          hint="mutes + cuts + highlights"
+          hint="заглушки + хайлайты"
         />
       </section>
 
@@ -146,7 +148,10 @@ export function DashboardScreen({
           className="mb-4 flex items-center gap-3 border-err/40 bg-err/10 text-sm text-fg"
         >
           <AlertCircle className="h-4 w-4 shrink-0 text-err" />
-          <span className="flex-1">Backend не отвечает: {error}</span>
+          <span className="flex-1">
+            Приложение ещё запускается или не отвечает. Подождите пару секунд и
+            нажмите «Повторить».
+          </span>
           <Button variant="ghost" size="sm" onClick={reload}>
             Повторить
           </Button>
@@ -160,10 +165,10 @@ export function DashboardScreen({
         <EmptyState
           icon={<LayoutDashboard className="h-6 w-6" />}
           title="Пока пусто"
-          description="Первый проект появится здесь после запуска обработки. Реестр обновится автоматически, как только job завершится."
+          description="Здесь появится первая обработанная запись. Список обновится сам, как только обработка закончится."
           action={
             <Button onClick={onNew}>
-              <Plus className="h-4 w-4" /> Запустить первый job
+              <Plus className="h-4 w-4" /> Обработать первую запись
             </Button>
           }
         />
@@ -230,15 +235,15 @@ function ProjectCard({
 
         {/* Meta rows */}
         <div className="flex items-center gap-3 text-[11px] text-muted">
-          <span className="flex items-center gap-1" title="Mutes">
+          <span className="flex items-center gap-1" title="Заглушки мата">
             <Volume2 className="h-3 w-3 text-brand-from" />
             <span className="font-mono-tabular">{project.mutes_count}</span>
           </span>
-          <span className="flex items-center gap-1" title="Cuts">
+          <span className="flex items-center gap-1" title="Вырезы">
             <Scissors className="h-3 w-3 text-warn" />
             <span className="font-mono-tabular">{project.cuts_count}</span>
           </span>
-          <span className="flex items-center gap-1" title="Highlights">
+          <span className="flex items-center gap-1" title="Хайлайты">
             <Sparkles className="h-3 w-3 text-ok" />
             <span className="font-mono-tabular">{project.highlights_count}</span>
           </span>
@@ -261,7 +266,7 @@ function ProjectCard({
             className="w-full"
             onClick={() => onOpen(project.decisions_path)}
           >
-            Открыть таймлайн
+            Открыть
           </Button>
         </div>
       </div>

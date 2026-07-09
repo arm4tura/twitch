@@ -131,33 +131,33 @@ function findStepIndex(steps: StepDef[], currentStage: string): number {
 export const PROCESS_STEPS: StepDef[] = [
   {
     key: "init",
-    title: "Инициализация",
-    description: "Проверка конфига, подготовка workdir",
+    title: "Подготовка",
+    description: "Проверяем настройки и рабочую папку",
   },
   {
     key: "extract_audio",
-    title: "Извлечение аудио",
-    description: "ffmpeg → wav в кэше",
+    title: "Извлечение звука",
+    description: "Достаём аудиодорожку из записи",
     aliases: ["mock_transcript"],
   },
   {
     key: "transcribe",
-    title: "Транскрипция",
-    description: "WhisperX + VAD",
+    title: "Распознавание речи",
+    description: "Переводим речь в текст с таймингами",
   },
   {
     key: "detect_profanity",
-    title: "Поиск матов",
-    description: "Нормализация + словарь банвордов",
+    title: "Поиск мата",
+    description: "Сверяем слова со словарём",
   },
   {
     key: "build_decisions",
-    title: "Сборка решений",
-    description: "mutes + cuts → decisions.json",
+    title: "Сборка правок",
+    description: "Готовим список заглушек и вырезов",
   },
   {
     key: "write_outputs",
-    title: "Запись файлов",
-    description: "decisions.json + Vegas .cs",
+    title: "Сохранение",
+    description: "Записываем результат и скрипт для Vegas",
   },
 ];

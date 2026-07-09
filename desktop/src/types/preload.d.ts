@@ -13,6 +13,11 @@ declare global {
   interface Window {
     twitchCut: {
       getBackendPort(): Promise<number>;
+      getPathForFile(file: File): string;
+      getGpuMode(): Promise<boolean>;
+      onBootstrapProgress(cb: (p: unknown) => void): () => void;
+      openBootstrapLog(): Promise<boolean>;
+      retryBootstrap(): Promise<boolean>;
       openFile(opts?: {
         filters?: Array<{ name: string; extensions: string[] }>;
         title?: string;

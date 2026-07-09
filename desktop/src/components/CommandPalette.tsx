@@ -97,9 +97,9 @@ export function CommandPalette(props: CommandContext) {
 
     const list: Command[] = [
       nav("dashboard", "Открыть проекты", <LayoutDashboard className="h-4 w-4" />, "⌘1"),
-      nav("new", "Новый job", <Plus className="h-4 w-4" />, "⌘2"),
+      nav("new", "Новая обработка", <Plus className="h-4 w-4" />, "⌘2"),
       nav("job", "Прогресс", <Sparkles className="h-4 w-4" />, "⌘3", !props.hasActiveJob),
-      nav("timeline", "Таймлайн", <Film className="h-4 w-4" />, "⌘4", !props.hasDecisions),
+      nav("timeline", "Правка", <Film className="h-4 w-4" />, "⌘4", !props.hasDecisions),
       nav("export", "Экспорт", <Send className="h-4 w-4" />, "⌘5", !props.hasDecisions),
     ];
 

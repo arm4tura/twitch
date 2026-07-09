@@ -13,12 +13,17 @@ env/
 node_modules/
 dist/
 build/
+release/
 .vite/
 .turbo/
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# electron-builder buildResources (иконка нужна в репо, не игнорируем)
+!desktop/build/
+!desktop/build/**
 
 # ── Media (large binaries) ────────────────────────────────
 *.mp4
@@ -30,6 +35,10 @@ yarn-error.log*
 *.mp3
 *.flac
 *.m4a
+*.sfk
+
+# ── Personal config (keep only *.example.*) ───────────────
+backend/banwords.txt
 
 # ── Models / weights ──────────────────────────────────────
 *.bin

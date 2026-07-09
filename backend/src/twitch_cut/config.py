@@ -7,21 +7,62 @@ from typing import Any
 
 
 # =============================================================================
-# Пути к моделям.
+# Пути к данным (модели и т.п.).
 #
-# Мы храним HuggingFace-кэш ЛОКАЛЬНО в репозитории (./models/) вместо дефолтного
+# Мы храним HuggingFace-кэш ЛОКАЛЬНО (./models/) вместо дефолтного
 # ~/.cache/huggingface/. Причины:
 #   1. Пользователю очевидно, где лежат 4 GB весов — можно посмотреть/удалить.
 #   2. Не мешает другим проектам того же пользователя.
 #   3. `twitch-cut prefetch` кладёт всё в предсказуемое место — можно заранее
-#      скачать на машине с быстрым интернетом, а потом скопировать .venv+models
+#      скачать на машине с быстрым интернетом, а потом скопировать models/
 #      на офлайн-машину монтажёра.
 #
-# MODELS_DIR вычисляется от расположения этого файла:
-#   backend/src/twitch_cut/config.py  →  parents[2] = backend/  →  ../models
-# Итого:  <repo>/models/
+# Корень данных (DATA_ROOT):
+#   - В dev (запуск из репо) — корень репозитория. Считается от этого файла:
+#       backend/src/twitch_cut/config.py  →  parents[3] = <repo>/
+#   - В упакованном приложении сам код лежит в read-only каталоге
+#     (Program Files\...\resources\backend) — туда писать НЕЛЬЗЯ. Electron
+#     задаёт TWITCH_CUT_DATA_DIR, указывающий на writable-каталог данных
+#     (userData или portable-папка рядом с exe). Тогда models/ живёт там.
 # =============================================================================
-MODELS_DIR: Path = (Path(__file__).resolve().parents[3] / "models").resolve()
+def _resolve_data_root() -> Path:
+    override = os.environ.get("TWITCH_CUT_DATA_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    # dev-фолбэк: корень репозитория (backend/src/twitch_cut/config.py → parents[3]).
+    return Path(__file__).resolve().parents[3]
+
+
+DATA_ROOT: Path = _resolve_data_root()
+MODELS_DIR: Path = (DATA_ROOT / "models").resolve()
+
+
+def default_device() -> str:
+    """Устройство по умолчанию. bootstrap выставляет TWITCH_CUT_CPU=1, если
+    NVIDIA GPU не найден, — тогда весь пайплайн едет на CPU без падений."""
+    return "cpu" if os.environ.get("TWITCH_CUT_CPU") == "1" else "cuda"
+
+
+def default_compute_type() -> str:
+    """compute_type для faster-whisper. На CPU float16 не поддерживается —
+    берём int8 (быстрее и работает); на GPU остаётся float16."""
+    return "int8" if os.environ.get("TWITCH_CUT_CPU") == "1" else "float16"
+
+
+def default_banwords_path() -> Path:
+    """Встроенный словарь мата.
+
+    Используется «простым режимом» UI, когда пользователь не выбирал свой
+    файл банвордов, — чтобы человеку не нужно было искать/составлять словарь
+    руками. Лежит в backend/banwords.txt (рядом с исходниками; копируется в
+    resources/backend при сборке installer'а). Fallback — banwords.example.txt.
+    """
+    base = Path(__file__).resolve().parents[2]  # .../backend
+    for name in ("banwords.txt", "banwords.example.txt"):
+        candidate = base / name
+        if candidate.exists():
+            return candidate
+    return base / "banwords.txt"
 
 
 def configure_hf_cache() -> Path:
@@ -72,8 +113,12 @@ DEFAULT_ASR_OPTIONS: dict[str, Any] = {
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    # 'whisperx' (PyTorch+CUDA, default) или 'whispercpp' (subprocess whisper-cli.exe).
-    transcriber: str = "whisperx"
+    # Движок ASR:
+    #   'gigaam'    — GigaAM v3 (Salute), DEFAULT. Лучше ловит русский мат,
+    #                 узкие пословные тайминги, не требует CTranslate2/cuDNN.
+    #   'whisperx'  — faster-whisper через WhisperX (PyTorch+CUDA).
+    #   'whispercpp'— subprocess whisper-cli.exe.
+    transcriber: str = "gigaam"
     language: str = "ru"
     model: str = "large-v3"
     device: str = "cuda"
@@ -143,5 +188,5 @@ class PipelineConfig:
             raise ValueError("mute_join_gap_ms cannot be negative")
         if self.mute_max_word_seconds <= 0:
             raise ValueError("mute_max_word_seconds must be positive")
-        if self.transcriber not in {"whisperx", "whispercpp"}:
-            raise ValueError("transcriber must be 'whisperx' or 'whispercpp'")
+        if self.transcriber not in {"gigaam", "whisperx", "whispercpp"}:
+            raise ValueError("transcriber must be 'gigaam', 'whisperx' or 'whispercpp'")

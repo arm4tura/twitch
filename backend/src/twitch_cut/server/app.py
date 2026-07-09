@@ -110,8 +110,8 @@ def create_app(
     async def create_process_job(req: ProcessJobRequest):
         # Пополняем медиа-whitelist сразу: как только пользователь запустил job,
         # ему легально смотреть исходный stream/оригинал через /media (для
-        # Timeline после завершения).
-        app.state.store.allow_media(req.stream, req.original)
+        # Timeline после завершения). original может быть None (простой режим).
+        app.state.store.allow_media(req.stream, req.original or "")
         state = _spawn(
             JobKind.PROCESS,
             lambda s: run_process_job(app.state.store, s, req),
@@ -218,14 +218,42 @@ def create_app(
         """
         return _list_projects_registry()
 
+    @app.delete("/projects")
+    async def delete_project(
+        path: str = Query(..., description="Путь к decisions.json проекта"),
+        delete_files: bool = Query(
+            False, description="Также удалить папку проекта с диска"
+        ),
+    ):
+        """Удалить проект из реестра недавних.
+
+        По умолчанию убирает только запись из реестра (файлы на диске остаются).
+        При delete_files=true дополнительно удаляет папку проекта (родитель
+        decisions.json) — best-effort, с защитой от rmtree по корню/домашнему
+        каталогу. Результат см. `projects.unregister_project`.
+        """
+        from .projects import unregister_project
+
+        return unregister_project(path, delete_files=delete_files)
+
     # --- settings -----------------------------------------------------------
 
     @app.get("/settings")
     async def get_settings():
         """Прочитать пользовательские настройки. Формат плоский dict; см.
         `settings.py`. Отсутствие файла — не ошибка, просто {}.
+
+        Дефолты device/compute_type НЕ хардкодим на 'cuda': если backend
+        запущен в CPU-режиме (TWITCH_CUT_CPU=1 — GPU не найден), подставляем
+        cpu/int8, чтобы форма NewJob не предлагала заведомо падающий cuda.
+        Явно сохранённые пользователем значения не трогаем.
         """
-        return _load_settings()
+        from ..config import default_compute_type, default_device
+
+        data = _load_settings()
+        data.setdefault("default_device", default_device())
+        data.setdefault("default_compute_type", default_compute_type())
+        return data
 
     @app.put("/settings")
     async def put_settings(payload: dict[str, Any] = Body(...)):
@@ -259,17 +287,9 @@ def create_app(
         первом write в pipeline). UI показывает путь в поле workdir, юзер может
         отредактировать.
         """
-        from datetime import datetime
-        # basename без расширения, только safe-символы. Пробелы/кириллицу
-        # оставляем — файловая система на win/mac/linux их спокойно ест;
-        # вычищаем только слэши/двоеточия и подобное, что ломает пути.
-        raw = Path(stream).stem if stream else "job"
-        safe = "".join(c if c not in '<>:"/\\|?*' else "_" for c in raw).strip() or "job"
-        # Минута — достаточно granularity против коллизий рукой; секунду не
-        # берём чтобы имя было короче и легче читалось.
-        stamp = datetime.now().strftime("%Y%m%d_%H%M")
-        workdir = Path.home() / "twitch_cut" / "projects" / f"{safe}_{stamp}"
-        return {"path": str(workdir)}
+        from .paths import suggested_workdir
+
+        return {"path": str(suggested_workdir(stream or None))}
 
 
     @app.get("/transcript")

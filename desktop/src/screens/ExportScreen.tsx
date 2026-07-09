@@ -16,25 +16,29 @@ import {
 } from "../api";
 import { Button } from "../components/ui/Button";
 import { Card, CardDescription, CardTitle } from "../components/ui/Card";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "../components/ui/Collapsible";
 import { FileField } from "../components/ui/FileField";
 import { Label } from "../components/ui/Input";
 import { toast } from "../components/ui/Toast";
 
 /**
- * ExportScreen — три вида выгрузки для готового проекта:
+ * ExportScreen — выгрузка готового проекта.
  *
- *  1. Vegas .cs — CLI script для Sony Vegas Pro (мут-регионы как takes).
- *  2. NotebookLM package — zip с транскриптом + метаданными для загрузки в
- *     Google NotebookLM (чтобы ИИ ответил «о чём говорил стример»).
- *  3. Import NotebookLM response — забрать ответ NotebookLM (json/txt/md) и
- *     обогатить decisions.json тегами highlight'ов.
+ * Главное действие — сборка скрипта для Sony Vegas Pro (мут-регионы как takes).
+ * Это то, ради чего пользователь сюда пришёл, поэтому карточка Vegas стоит
+ * первой и на всю ширину.
+ *
+ * Остальное спрятано под «Дополнительно» (свёрнуто по умолчанию), т.к. нужно
+ * лишь продвинутым пользователям:
+ *  - NotebookLM package — zip с транскриптом для Google NotebookLM;
+ *  - Import NotebookLM response — забрать ответ ИИ и обогатить проект тегами.
  *
  * Каждая карточка — самодостаточная форма: поля пути, «Запустить», после
  * успешного создания job'а — toast с «Показать» через `showInFolder` IPC.
- *
- * Layout: header + summary bar + 3 карточки в grid'e (xl:3-в-ряд, md:2, sm:1).
- * Summary читает decisions.json один раз и показывает счётчики регионов —
- * пользователь видит, что именно будет экспортировано.
  */
 
 export interface ExportScreenProps {
@@ -86,6 +90,7 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
   const [summary, setSummary] = useState<Summary | null>(null);
   const [loadingSummary, setLoadingSummary] = useState(false);
   const [busy, setBusy] = useState<null | "vegas" | "package" | "import">(null);
+  const [moreOpen, setMoreOpen] = useState(false);
 
   useEffect(() => {
     localStorage.setItem(LS_KEY, JSON.stringify(form));
@@ -215,8 +220,8 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
           Выгрузка проекта
         </h1>
         <p className="max-w-2xl text-sm text-muted">
-          Три способа поделиться результатом: скрипт для Sony Vegas, ZIP-пакет
-          для NotebookLM или обратный импорт ответа ИИ.
+          Соберите скрипт для Sony Vegas Pro — это перенесёт все заглушенные
+          места прямо на таймлайн. Остальные способы выгрузки — под «Дополнительно».
         </p>
       </header>
 
@@ -249,16 +254,21 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
         )}
       </Card>
 
-      <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
-        <Card variant="elevated" padding="md" className="flex flex-col">
+      {/* Главное действие — скрипт для Vegas. На всю ширину, с крупной кнопкой. */}
+      <Card
+        variant="elevated"
+        padding="lg"
+        className="flex flex-col gap-5 border-warn/20 md:flex-row md:items-center"
+      >
+        <div className="flex-1 space-y-3">
           <CardHead
             icon={<FileCode2 className="h-4 w-4" />}
             gradient="from-amber-500/25 to-amber-500/0"
             iconColor="text-warn"
-            title="Vegas .cs"
-            desc="CLI-скрипт для Sony Vegas Pro. Импортирует мут-регионы decisions.json как takes на активной дорожке."
+            title="Скрипт для Sony Vegas"
+            desc="Перенесёт все заглушенные места на таймлайн Vegas. Откройте свой проект в Vegas, запустите скрипт — регионы расставятся сами."
           />
-          <div className="mt-4 flex-1 space-y-3">
+          <div className="space-y-2">
             <Label eyebrow>Куда сохранить</Label>
             <FileField
               kind="save"
@@ -269,17 +279,28 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
               placeholder="…/vegas.cs"
             />
           </div>
-          <Button
-            className="mt-5"
-            onClick={runVegas}
-            disabled={!form.vegasPath}
-            loading={busy === "vegas"}
-          >
-            <Download className="h-4 w-4" /> Собрать Vegas-скрипт
-          </Button>
-        </Card>
+        </div>
+        <Button
+          size="lg"
+          className="shrink-0 md:self-end"
+          onClick={runVegas}
+          disabled={!form.vegasPath}
+          loading={busy === "vegas"}
+        >
+          <Download className="h-4 w-4" /> Собрать скрипт для Vegas
+        </Button>
+      </Card>
 
-        <Card variant="elevated" padding="md" className="flex flex-col">
+      {/* Всё остальное — только продвинутым, свёрнуто по умолчанию. */}
+      <Collapsible open={moreOpen} onOpenChange={setMoreOpen}>
+        <CollapsibleTrigger>
+          <span className="flex items-center gap-2">
+            <Sparkles className="h-4 w-4" /> Дополнительно — NotebookLM
+          </span>
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <div className="grid gap-5 pt-4 md:grid-cols-2">
+            <Card variant="elevated" padding="md" className="flex flex-col">
           <CardHead
             icon={<Package className="h-4 w-4" />}
             gradient="from-violet-500/25 to-violet-500/0"
@@ -349,7 +370,9 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
             <Upload className="h-4 w-4" /> Импортировать
           </Button>
         </Card>
-      </div>
+          </div>
+        </CollapsibleContent>
+      </Collapsible>
     </div>
   );
 }

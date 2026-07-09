@@ -21,25 +21,36 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class ProcessJobRequest(BaseModel):
-    """Запрос на полный прогон Фазы 1: stream → transcript → mutes → decisions."""
+    """Запрос на полный прогон Фазы 1: stream → transcript → mutes → decisions.
+
+    Обязателен только `stream`. Всё остальное (словарь мата, рабочая папка,
+    пути выходных файлов, оригинал реакции) бэкенд подставляет сам — это
+    «простой режим» UI: пользователь выбирает одну запись и жмёт «Обработать».
+    «Расширенный режим» присылает эти поля явно.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     stream: str = Field(..., description="Путь к исходному stream.mp4")
-    original: str = Field(..., description="Путь к оригинальному видео реакции")
-    banwords: str = Field(..., description="Путь к словарю мата/банвордов")
-    workdir: str = Field(..., description="Рабочая папка cache/checkpoints")
-    decisions: str = Field(..., description="Куда записать decisions.json")
-    vegas: str = Field(..., description="Куда записать Vegas C# script")
+    original: Optional[str] = Field(None, description="Путь к оригинальному видео реакции")
+    banwords: Optional[str] = Field(None, description="Путь к словарю мата; None → встроенный")
+    workdir: Optional[str] = Field(None, description="Рабочая папка cache/checkpoints; None → авто")
+    decisions: Optional[str] = Field(None, description="Куда записать decisions.json; None → в workdir")
+    vegas: Optional[str] = Field(None, description="Куда записать Vegas C# script; None → в workdir")
 
     range_in: Optional[str] = Field(None, description="Timecode начала (HH:MM:SS.mmm)")
     range_out: Optional[str] = Field(None, description="Timecode конца")
 
-    # Опциональные overrides — если не заданы, берутся дефолты PipelineConfig.
+    # Опциональные overrides — если не заданы, берутся дефолты PipelineConfig
+    # (device/compute_type — из окружения: CPU-режим на машине без NVIDIA).
+    # Движок по умолчанию — GigaAM v3 (точнее по русскому мату, не тянет
+    # CTranslate2/cuDNN). 'model' относится к WhisperX; для GigaAM — gigaam_model.
+    transcriber: str = "gigaam"
+    gigaam_model: str = "v3_ctc"
     model: str = "large-v3"
     language: str = "ru"
-    device: str = "cuda"
-    compute_type: str = "float16"
+    device: Optional[str] = None
+    compute_type: Optional[str] = None
     batch_size: int = Field(16, ge=1)
     vad_filter: bool = True
     vad_method: str = "pyannote"

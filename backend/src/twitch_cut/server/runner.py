@@ -27,6 +27,7 @@ from ..cache import file_content_hash, read_json, stable_hash, write_json
 from ..config import DEFAULT_ASR_OPTIONS, PipelineConfig
 from ..decisions import build_decisions, write_decisions
 from ..ffmpeg_tools import extract_audio_range, probe_media_duration
+from ..gigaam_asr import transcribe_with_gigaam
 from ..llm.exporter import build_notebooklm_package
 from ..llm.importer import MergeError, merge_into_decisions, parse_response
 from ..profanity import ProfanityMatch, RussianNormalizer, detect_profanity, load_banwords
@@ -114,21 +115,41 @@ def _finalize(store: JobStore, state: JobState, status: JobStatus, *, error: str
 
 
 def _run_process_sync(req: ProcessJobRequest, progress: Progress) -> dict[str, Any]:
-    """Синхронная реализация. Гоняется в to_thread. Отсюда нельзя await."""
+    """Синхронная реализация. Гоняется в to_thread. Отсюда нельзя await.
+
+    Пустые пути (простой режим UI) заполняются дефолтами: workdir — уникальная
+    папка в ~/twitch_cut/projects, decisions/vegas — внутри неё, banwords —
+    встроенный словарь, original — сам stream (реакция == запись, если второго
+    видео нет).
+    """
+    from ..config import (
+        default_banwords_path,
+        default_compute_type,
+        default_device,
+    )
+    from .paths import suggested_workdir
+
     stream = Path(req.stream)
-    original = Path(req.original)
-    banwords = Path(req.banwords)
-    workdir = Path(req.workdir)
-    decisions_out = Path(req.decisions)
-    vegas_out = Path(req.vegas)
+    workdir = Path(req.workdir) if req.workdir else suggested_workdir(req.stream)
+    banwords = Path(req.banwords) if req.banwords else default_banwords_path()
+    # Оригинал (второе видео реакции) опционален. Если не задан — используем
+    # сам stream: build_decisions просто пропишет его в метаданные, пайплайн
+    # мьютов от этого не меняется.
+    original = Path(req.original) if req.original else stream
+    decisions_out = Path(req.decisions) if req.decisions else (workdir / "decisions.json")
+    vegas_out = Path(req.vegas) if req.vegas else (workdir / "mutes.cs")
+
+    device = req.device or default_device()
+    compute_type = req.compute_type or default_compute_type()
 
     workdir.mkdir(parents=True, exist_ok=True)
 
     config = PipelineConfig(
+        transcriber=req.transcriber,
         language=req.language,
         model=req.model,
-        device=req.device,
-        compute_type=req.compute_type,
+        device=device,
+        compute_type=compute_type,
         batch_size=req.batch_size,
         vad_filter=req.vad_filter,
         vad_method=req.vad_method,
@@ -153,20 +174,32 @@ def _run_process_sync(req: ProcessJobRequest, progress: Progress) -> dict[str, A
         )
         progress.emit("extract_audio", 10.0, f"audio ready: {audio_path.name}")
 
-        progress.emit("transcribe", 12.0, f"whisperx model={req.model}")
-        transcript, transcript_key, transcript_cache = transcribe_audio(
-            audio_path=audio_path,
-            workdir=workdir,
-            model_name=req.model,
-            language=req.language,
-            device=req.device,
-            compute_type=req.compute_type,
-            batch_size=req.batch_size,
-            vad_filter=req.vad_filter,
-            vad_method=req.vad_method,
-            asr_options=config.asr_options,
-            force=req.force_transcribe,
-        )
+        # Дефолтный движок — GigaAM v3 (точнее по русскому мату, не требует
+        # CTranslate2/cuDNN). WhisperX остаётся как альтернатива.
+        if config.transcriber == "gigaam":
+            progress.emit("transcribe", 12.0, f"gigaam model={req.gigaam_model}")
+            transcript, transcript_key, transcript_cache = transcribe_with_gigaam(
+                audio_path=audio_path,
+                workdir=workdir,
+                model_name=req.gigaam_model,
+                device=device,
+                force=req.force_transcribe,
+            )
+        else:
+            progress.emit("transcribe", 12.0, f"whisperx model={req.model}")
+            transcript, transcript_key, transcript_cache = transcribe_audio(
+                audio_path=audio_path,
+                workdir=workdir,
+                model_name=req.model,
+                language=req.language,
+                device=device,
+                compute_type=compute_type,
+                batch_size=req.batch_size,
+                vad_filter=req.vad_filter,
+                vad_method=req.vad_method,
+                asr_options=config.asr_options,
+                force=req.force_transcribe,
+            )
         progress.emit("transcribe", 75.0, f"transcript ready ({len(transcript.get('segments', []))} segments)")
     else:
         progress.emit("mock_transcript", 40.0, f"reading {req.mock_transcript}")
@@ -242,8 +275,9 @@ async def run_process_job(store: JobStore, state: JobState, req: ProcessJobReque
         result = await asyncio.to_thread(_run_process_sync, req, progress)
         # Регистрируем в реестре Recent Projects — best-effort, ошибку глотает
         # сама register_project. Делаем это ПОСЛЕ успешного write_decisions,
-        # чтобы битые/незавершённые пути в Dashboard не всплывали.
-        register_project(req.decisions)
+        # чтобы битые/незавершённые пути в Dashboard не всплывали. Берём путь
+        # из результата (req.decisions мог быть None — простой режим).
+        register_project(result["decisions_path"])
         _finalize(store, state, JobStatus.DONE, result=result)
     except asyncio.CancelledError:
         _finalize(store, state, JobStatus.CANCELLED, error="cancelled by user")

@@ -18,29 +18,106 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { spawn, ChildProcessWithoutNullStreams } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
+import {
+  runBootstrap,
+  isBootstrapped,
+  BootstrapError,
+  type Paths,
+  type BootstrapProgress,
+} from "./bootstrap";
+
+// --- paths ------------------------------------------------------------------
+
+/**
+ * Writable корень данных. В упакованном приложении сам код read-only
+ * (внутри установки), поэтому venv/models/логи живут отдельно:
+ *   - portable: папка <exe_dir>/TwitchCutter-Data, если она писабельна;
+ *   - обычная установка: app.getPath("userData") (%APPDATA%\Twitch Cutter).
+ * В dev (не упаковано) — тоже userData, чтобы отделить от исходников.
+ */
+function resolveDataDir(): string {
+  if (app.isPackaged) {
+    const exeDir = path.dirname(app.getPath("exe"));
+    const portable = path.join(exeDir, "TwitchCutter-Data");
+    try {
+      fs.mkdirSync(portable, { recursive: true });
+      fs.accessSync(exeDir, fs.constants.W_OK);
+      return portable;
+    } catch {
+      /* Program Files не писабелен — уходим в userData */
+    }
+  }
+  return app.getPath("userData");
+}
+
+/** Каталог backend: в prod — resources/backend (extraResources), в dev — <repo>/backend. */
+function resolveBackendDir(): string {
+  if (app.isPackaged) return path.join(process.resourcesPath, "backend");
+  return path.resolve(__dirname, "..", "..", "..", "backend");
+}
+
+/** Каталог статики фронта (desktop/dist). В prod лежит рядом с main.js внутри app. */
+function resolveStaticDir(): string {
+  if (app.isPackaged) return path.join(app.getAppPath(), "dist");
+  return path.resolve(__dirname, "..", "..", "dist");
+}
+
+/**
+ * Собрать все пути окружения.
+ *
+ * В prod venv живёт в writable dataDir/env (его создаёт bootstrap).
+ * В dev, если у разработчика уже есть рабочий backend/.venv — используем его
+ * напрямую и пропускаем bootstrap (иначе `npm run dev` качал бы Python и 4 ГБ
+ * моделей заново в userData, игнорируя готовое окружение).
+ */
+function resolvePaths(): Paths {
+  const dataDir = resolveDataDir();
+
+  // dev: предпочитаем существующий backend/.venv.
+  if (!app.isPackaged) {
+    const devVenv = path.join(resolveBackendDir(), ".venv");
+    const devPython =
+      process.platform === "win32"
+        ? path.join(devVenv, "Scripts", "python.exe")
+        : path.join(devVenv, "bin", "python");
+    if (fs.existsSync(devPython)) {
+      return {
+        dataDir,
+        envDir: devVenv,
+        binDir: path.join(dataDir, "bin"),
+        logsDir: path.join(dataDir, "logs"),
+        backendDir: resolveBackendDir(),
+        venvPython: devPython,
+      };
+    }
+  }
+
+  const envDir = path.join(dataDir, "env");
+  const venvPython =
+    process.platform === "win32"
+      ? path.join(envDir, "Scripts", "python.exe")
+      : path.join(envDir, "bin", "python");
+  return {
+    dataDir,
+    envDir,
+    binDir: path.join(dataDir, "bin"),
+    logsDir: path.join(dataDir, "logs"),
+    backendDir: resolveBackendDir(),
+    venvPython,
+  };
+}
+
+let PATHS: Paths;
+let GPU_MODE = true; // уточняется после bootstrap; показываем бейдж в UI.
 
 // --- helpers ----------------------------------------------------------------
 
-/** Ищем python в backend/.venv, fallback на `python` из PATH. */
+/** Python из bootstrap-окружения (dataDir/env), fallback на `python` из PATH. */
 function findPython(): { cmd: string; args: string[]; venvRoot: string | null } {
-  const repoRoot = path.resolve(__dirname, "..", "..", "..");
-  const winPy = path.join(repoRoot, "backend", ".venv", "Scripts", "python.exe");
-  const nixPy = path.join(repoRoot, "backend", ".venv", "bin", "python");
-  if (process.platform === "win32" && fs.existsSync(winPy)) {
-    return {
-      cmd: winPy,
-      args: ["-m", "twitch_cut.cli"],
-      venvRoot: path.join(repoRoot, "backend", ".venv"),
-    };
+  if (fs.existsSync(PATHS.venvPython)) {
+    return { cmd: PATHS.venvPython, args: ["-m", "twitch_cut.cli"], venvRoot: PATHS.envDir };
   }
-  if (fs.existsSync(nixPy)) {
-    return {
-      cmd: nixPy,
-      args: ["-m", "twitch_cut.cli"],
-      venvRoot: path.join(repoRoot, "backend", ".venv"),
-    };
-  }
-  // Fallback — polагаемся на PATH. Пользователю подскажет doctor.
+  // Fallback — полагаемся на PATH. Пользователю подскажет doctor.
   return { cmd: "python", args: ["-m", "twitch_cut.cli"], venvRoot: null };
 }
 
@@ -58,7 +135,15 @@ function findPython(): { cmd: string; args: string[]; venvRoot: string | null } 
  * no-op: путей не существует, `existsSync` вернёт false, ничего не добавится.
  */
 function buildBackendEnv(venvRoot: string | null): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, PYTHONUNBUFFERED: "1" };
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PYTHONUNBUFFERED: "1",
+    // Backend пишет модели/кэш в writable дата-каталог, а не рядом с кодом.
+    TWITCH_CUT_DATA_DIR: PATHS.dataDir,
+  };
+  // Если GPU не найден при bootstrap — сообщаем backend, чтобы doctor не ругался
+  // FAIL'ом на отсутствие CUDA и pipeline знал, что работает в CPU-режиме.
+  if (!GPU_MODE) env.TWITCH_CUT_CPU = "1";
   if (!venvRoot) return env;
 
   const sitePkgs = process.platform === "win32"
@@ -97,8 +182,7 @@ const portListeners: Array<(p: number) => void> = [];
 function startBackend(): Promise<number> {
   return new Promise((resolve, reject) => {
     const { cmd, args, venvRoot } = findPython();
-    const repoRoot = path.resolve(__dirname, "..", "..", "..");
-    const staticDir = path.join(repoRoot, "desktop", "dist");
+    const staticDir = resolveStaticDir();
     const fullArgs = [
       ...args,
       "serve",
@@ -109,7 +193,7 @@ function startBackend(): Promise<number> {
     console.log("[backend] spawn:", cmd, fullArgs.join(" "));
 
     const proc = spawn(cmd, fullArgs, {
-      cwd: repoRoot,
+      cwd: PATHS.backendDir,
       env: buildBackendEnv(venvRoot),
       windowsHide: true,
     });
@@ -188,7 +272,88 @@ function createWindow() {
     win.loadURL("http://localhost:5173");
     win.webContents.openDevTools({ mode: "detach" });
   } else {
-    win.loadFile(path.join(__dirname, "..", "..", "dist", "index.html"));
+    win.loadFile(path.join(resolveStaticDir(), "index.html"));
+  }
+}
+
+// --- splash + bootstrap -----------------------------------------------------
+
+let splashWin: BrowserWindow | null = null;
+
+/** Небольшое окно первого запуска с прогрессом установки. */
+function createSplash(): BrowserWindow {
+  const iconPath = path.resolve(__dirname, "..", "..", "build", "icon.ico");
+  const win = new BrowserWindow({
+    width: 520,
+    height: 340,
+    frame: false,
+    resizable: false,
+    show: true,
+    center: true,
+    icon: fs.existsSync(iconPath) ? iconPath : undefined,
+    backgroundColor: "#0b0b0f",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+    },
+  });
+  if (process.env.NODE_ENV === "development") {
+    win.loadURL("http://localhost:5173/splash.html");
+  } else {
+    win.loadFile(path.join(resolveStaticDir(), "splash.html"));
+  }
+  return win;
+}
+
+/**
+ * Прогнать bootstrap, показывая прогресс в splash. Возвращает true при успехе.
+ * При ошибке оставляет splash открытым (там кнопки «Показать лог» / «Повторить»)
+ * и резолвится false.
+ */
+async function ensureEnvironment(): Promise<boolean> {
+  // dev: если рабочий backend/.venv уже есть — считаем окружение готовым и НЕ
+  // запускаем bootstrap (не качаем Python/модели поверх готового venv).
+  const devVenvReady = !app.isPackaged && fs.existsSync(PATHS.venvPython);
+
+  if (devVenvReady || isBootstrapped(PATHS)) {
+    // Окружение уже есть — GPU-режим определяем по наличию флага .cpu-mode.
+    GPU_MODE = !fs.existsSync(path.join(PATHS.dataDir, ".cpu-mode"));
+    return true;
+  }
+
+  splashWin = createSplash();
+  // Дожидаемся готовности renderer, чтобы первые события прогресса не потерялись.
+  await new Promise<void>((res) => {
+    if (!splashWin) return res();
+    splashWin.webContents.once("did-finish-load", () => res());
+  });
+
+  const send = (p: BootstrapProgress) => {
+    splashWin?.webContents.send("bootstrap:progress", p);
+  };
+
+  try {
+    const { gpu } = await runBootstrap(PATHS, send);
+    GPU_MODE = gpu;
+    // Запоминаем режим, чтобы при следующих запусках знать без повторного детекта.
+    try {
+      if (gpu) fs.rmSync(path.join(PATHS.dataDir, ".cpu-mode"), { force: true });
+      else fs.writeFileSync(path.join(PATHS.dataDir, ".cpu-mode"), "1", "utf-8");
+    } catch {
+      /* best-effort */
+    }
+    return true;
+  } catch (err) {
+    const logPath = err instanceof BootstrapError ? err.logPath : "";
+    send({
+      stage: "error",
+      label: err instanceof Error ? err.message : String(err),
+      percent: 0,
+      detail: logPath ? `Лог: ${logPath}` : undefined,
+    });
+    return false;
   }
 }
 
@@ -197,6 +362,36 @@ function createWindow() {
 ipcMain.handle("get-backend-port", async () => {
   if (backendPort !== null) return backendPort;
   return new Promise<number>((resolve) => portListeners.push(resolve));
+});
+
+/** Режим GPU/CPU — renderer показывает бейдж «CPU mode». */
+ipcMain.handle("get-gpu-mode", async () => GPU_MODE);
+
+/** Открыть лог bootstrap в системном редакторе (кнопка в сплэше). */
+ipcMain.handle("bootstrap:openLog", async () => {
+  const logPath = path.join(PATHS.logsDir, "bootstrap.log");
+  if (fs.existsSync(logPath)) {
+    await shell.openPath(logPath);
+    return true;
+  }
+  return false;
+});
+
+/** Повторить bootstrap (кнопка «Повторить» после ошибки). */
+ipcMain.handle("bootstrap:retry", async () => {
+  const ok = await ensureEnvironment();
+  if (ok) {
+    try {
+      await startBackend();
+      createWindow();
+      splashWin?.close();
+      splashWin = null;
+    } catch (err) {
+      dialog.showErrorBox("Backend не запустился", String(err));
+      return false;
+    }
+  }
+  return ok;
 });
 
 ipcMain.handle("dialog:openFile", async (_e, opts?: Electron.OpenDialogOptions) => {
@@ -291,18 +486,35 @@ ipcMain.handle("shell:openExternal", async (_e, url: string) => {
 // --- app lifecycle ----------------------------------------------------------
 
 app.whenReady().then(async () => {
+  PATHS = resolvePaths();
+
+  // 1. Первый запуск: подготовить Python-окружение и модели (со сплэшем).
+  const ready = await ensureEnvironment();
+  if (!ready) {
+    // Splash остался открытым с ошибкой и кнопками «Показать лог»/«Повторить».
+    // Не выходим — пользователь может нажать «Повторить» (bootstrap:retry).
+    return;
+  }
+
+  // 2. Backend.
   try {
     await startBackend();
   } catch (err) {
     console.error("failed to start backend:", err);
     dialog.showErrorBox(
       "Backend не запустился",
-      String(err) + "\n\nПроверь, что установлен twitch-cut (см. install.ps1) и запусти `twitch-cut doctor`."
+      String(err) +
+        "\n\nПопробуй перезапустить приложение. Лог: " +
+        path.join(PATHS.logsDir, "bootstrap.log")
     );
     app.quit();
     return;
   }
+
+  // 3. Главное окно, splash закрываем.
   createWindow();
+  splashWin?.close();
+  splashWin = null;
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

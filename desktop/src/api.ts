@@ -99,17 +99,21 @@ export function cancelJob(id: string): Promise<{ cancelled: boolean }> {
 
 export interface ProcessJobRequest {
   stream: string;
-  original: string;
-  banwords: string;
-  workdir: string;
-  decisions: string;
-  vegas: string;
+  original?: string | null;
+  banwords?: string | null;
+  workdir?: string | null;
+  decisions?: string | null;
+  vegas?: string | null;
   range_in?: string | null;
   range_out?: string | null;
+  // Движок ASR. По умолчанию (не передаём) бэкенд берёт GigaAM v3. Расширенный
+  // режим шлёт 'whisperx', т.к. настраивает именно его параметры.
+  transcriber?: string;
+  gigaam_model?: string;
   model?: string;
   language?: string;
-  device?: string;
-  compute_type?: string;
+  device?: string | null;
+  compute_type?: string | null;
   batch_size?: number;
   vad_filter?: boolean;
   vad_method?: string;
@@ -212,6 +216,18 @@ export interface ProjectMeta {
 
 export function listProjects(): Promise<ProjectMeta[]> {
   return request("/projects");
+}
+
+/**
+ * Удалить проект из реестра недавних. По умолчанию убирает только запись
+ * (файлы остаются); deleteFiles=true — ещё и удаляет папку проекта с диска.
+ */
+export function deleteProject(
+  decisionsPath: string,
+  deleteFiles = false
+): Promise<{ unregistered: boolean; deleted_dir: string | null; error: string | null }> {
+  const qs = `?path=${encodeURIComponent(decisionsPath)}&delete_files=${deleteFiles}`;
+  return request(`/projects${qs}`, { method: "DELETE" });
 }
 
 // --- settings ---------------------------------------------------------------
@@ -332,12 +348,19 @@ export async function subscribeJob(
   const wsUrl = base.replace(/^http/, "ws") + `/jobs/${id}/events`;
 
   let closedByUser = false;
+  let receivedFinal = false;
   let currentWs: WebSocket | null = null;
   let reconnectTimer: number | null = null;
   let attempt = 0;
 
+  const isTerminal = (ev: JobEvent): boolean =>
+    ev.type === "final" ||
+    ev.state?.status === "done" ||
+    ev.state?.status === "failed" ||
+    ev.state?.status === "cancelled";
+
   const connect = () => {
-    if (closedByUser) return;
+    if (closedByUser || receivedFinal) return;
     const ws = new WebSocket(wsUrl);
     currentWs = ws;
     ws.onopen = () => {
@@ -347,6 +370,13 @@ export async function subscribeJob(
     ws.onmessage = (msg) => {
       try {
         const parsed = JSON.parse(msg.data) as JobEvent;
+        // Джоба уже терминальна: бэкенд отдаёт финальный snapshot и закрывает
+        // сокет. Больше событий не будет — глушим авто-reconnect, иначе клиент
+        // в бесконечном цикле пере-подключается к завершённой джобе (open/close
+        // спам в логах backend'а).
+        if (isTerminal(parsed)) {
+          receivedFinal = true;
+        }
         onEvent(parsed);
       } catch (err) {
         onError?.(err as Error);
@@ -355,7 +385,7 @@ export async function subscribeJob(
     ws.onerror = (e) => onError?.(e);
     ws.onclose = () => {
       currentWs = null;
-      if (closedByUser) return;
+      if (closedByUser || receivedFinal) return;
       // Backoff: 100 * 2^attempt, capped at 3000ms. attempt++ ДО расчёта,
       // чтобы первый reconnect подождал 100ms (а не 0).
       attempt = Math.min(attempt + 1, 6);

@@ -7,12 +7,46 @@
  * src/types/preload.d.ts, чтобы React мог их видеть.
  */
 
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
 
 const api = {
   /** Порт FastAPI backend'а (выбран uvicorn'ом при старте). */
   getBackendPort(): Promise<number> {
     return ipcRenderer.invoke("get-backend-port");
+  },
+
+  /**
+   * Абсолютный путь перетащенного (drag&drop) файла.
+   *
+   * В Electron 32+ `File.path` удалён — путь получаем только через
+   * webUtils.getPathForFile(file) в preload'е. Renderer передаёт сам File
+   * (contextBridge проксирует его), получает строку-путь. Для drop-зоны
+   * «простого режима» — пользователь бросает запись стрима в окно.
+   */
+  getPathForFile(file: File): string {
+    return webUtils.getPathForFile(file);
+  },
+
+  /** Режим вычислений: true = GPU (CUDA), false = CPU (медленно). */
+  getGpuMode(): Promise<boolean> {
+    return ipcRenderer.invoke("get-gpu-mode");
+  },
+
+  /** Подписаться на прогресс первого запуска (bootstrap). Только для splash.html. */
+  onBootstrapProgress(cb: (p: unknown) => void): () => void {
+    const listener = (_e: unknown, payload: unknown) => cb(payload);
+    ipcRenderer.on("bootstrap:progress", listener);
+    return () => ipcRenderer.removeListener("bootstrap:progress", listener);
+  },
+
+  /** Открыть лог установки (кнопка в сплэше при ошибке). */
+  openBootstrapLog(): Promise<boolean> {
+    return ipcRenderer.invoke("bootstrap:openLog");
+  },
+
+  /** Повторить установку после ошибки. */
+  retryBootstrap(): Promise<boolean> {
+    return ipcRenderer.invoke("bootstrap:retry");
   },
 
   /** Native OS dialog: выбрать файл. */

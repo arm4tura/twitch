@@ -386,14 +386,25 @@ def doctor() -> None:
                 _fmt_ok(f"torch {torch_ver}, CUDA {cuda_ver}, GPU: {gpu_name} ({vram_gb:.1f} GB)")
             )
         else:
-            console.print(
-                _fmt_fail(
-                    f"torch {torch_ver}, но CUDA НЕ доступна. "
-                    "Скорее всего установлена CPU-версия torch. "
-                    "Переустановите:  pip install -r requirements-gpu.txt"
+            # Осознанный CPU-режим (нет NVIDIA GPU): bootstrap выставляет
+            # TWITCH_CUT_CPU=1. Тогда отсутствие CUDA — не ошибка, а ожидаемо:
+            # WARN вместо FAIL, чтобы doctor не считал это проблемой.
+            if os.environ.get("TWITCH_CUT_CPU") == "1":
+                console.print(
+                    _fmt_warn(
+                        f"torch {torch_ver} — CPU-режим (NVIDIA GPU не найден). "
+                        "Работает, но медленнее. Это ожидаемо для CPU-установки."
+                    )
                 )
-            )
-            problems += 1
+            else:
+                console.print(
+                    _fmt_fail(
+                        f"torch {torch_ver}, но CUDA НЕ доступна. "
+                        "Скорее всего установлена CPU-версия torch. "
+                        "Переустановите:  pip install -r requirements-gpu.txt"
+                    )
+                )
+                problems += 1
     except ImportError:
         console.print(_fmt_fail("torch не установлен"))
         problems += 1

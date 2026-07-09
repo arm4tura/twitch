@@ -1,5 +1,5 @@
-import { type ReactNode } from "react";
-import { LayoutDashboard, Plus, Activity, Film, Send, Settings } from "lucide-react";
+import { type ReactNode, useEffect, useState } from "react";
+import { LayoutDashboard, Activity, Film, Send, Settings } from "lucide-react";
 import { cn } from "./lib/cn";
 import { Kbd } from "./components/ui/Kbd";
 import type { Screen } from "./App";
@@ -43,9 +43,11 @@ export function AppShell({
   hasDecisions,
   children,
 }: AppShellProps) {
+  // Пока идёт обработка — правку и экспорт блокируем: результата ещё нет,
+  // а старый decisions.json может перезаписаться на середине.
+  const busy = runningJobs > 0;
   const items: NavItem[] = [
     { id: "dashboard", label: "Проекты", icon: <LayoutDashboard className="h-4 w-4" />, shortcut: "⌘1" },
-    { id: "new", label: "Новый job", icon: <Plus className="h-4 w-4" />, shortcut: "⌘2" },
     {
       id: "job",
       label: "Прогресс",
@@ -56,16 +58,16 @@ export function AppShell({
     },
     {
       id: "timeline",
-      label: "Таймлайн",
+      label: "Правка",
       icon: <Film className="h-4 w-4" />,
-      disabled: !hasDecisions,
+      disabled: !hasDecisions || busy,
       shortcut: "⌘4",
     },
     {
       id: "export",
       label: "Экспорт",
       icon: <Send className="h-4 w-4" />,
-      disabled: !hasDecisions,
+      disabled: !hasDecisions || busy,
       shortcut: "⌘5",
     },
   ];
@@ -97,6 +99,7 @@ export function AppShell({
               <div className="text-sm font-semibold text-fg leading-tight">Twitch Cut</div>
               <div className="text-[10px] text-subtle uppercase tracking-wider">Desktop</div>
             </div>
+            <CpuBadge />
           </div>
         </div>
 
@@ -145,6 +148,30 @@ export function AppShell({
         <div className="flex-1 overflow-y-auto">{children}</div>
       </main>
     </div>
+  );
+}
+
+/**
+ * Бейдж режима вычислений. Виден только когда backend работает на CPU
+ * (GPU не найден при первом запуске) — предупреждает, что обработка медленнее.
+ * В GPU-режиме ничего не рисуем, чтобы не засорять сайдбар.
+ */
+function CpuBadge() {
+  const [cpu, setCpu] = useState(false);
+  useEffect(() => {
+    window.twitchCut
+      ?.getGpuMode?.()
+      .then((gpu) => setCpu(!gpu))
+      .catch(() => {});
+  }, []);
+  if (!cpu) return null;
+  return (
+    <span
+      title="Видеокарта NVIDIA не найдена — обработка идёт на CPU (медленнее)"
+      className="ml-auto rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-400"
+    >
+      CPU
+    </span>
   );
 }
 

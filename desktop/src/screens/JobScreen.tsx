@@ -95,9 +95,6 @@ export function JobScreen({
         <Card variant="surface" padding="lg">
           <div className="mb-4 flex items-center justify-between">
             <CardTitle>Стадии</CardTitle>
-            <span className="text-xs text-subtle">
-              runner.py · <span className="font-mono-tabular">process</span>
-            </span>
           </div>
           <Stepper
             steps={PROCESS_STEPS}
@@ -155,7 +152,7 @@ export function JobScreen({
           variant="surface"
           className="border-err/30 bg-err/5 text-sm text-err"
         >
-          <div className="font-medium">Не удалось подключиться к job'у</div>
+          <div className="font-medium">Не удалось подключиться к обработке</div>
           <div className="mt-1 break-all font-mono-tabular text-[11px] text-err/90">
             {error}
           </div>
@@ -166,7 +163,7 @@ export function JobScreen({
       <Dialog open={cancelOpen} onOpenChange={setCancelOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Отменить джобу?</DialogTitle>
+            <DialogTitle>Отменить обработку?</DialogTitle>
             <DialogDescription>
               Текущая стадия будет прервана. Кэш уже посчитанных стадий сохранится —
               следующий запуск с теми же параметрами продолжит с чекпоинта.
@@ -191,10 +188,11 @@ export function JobScreen({
         <DialogContent className="max-w-2xl">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2 text-err">
-              <AlertCircle className="h-5 w-5" /> Job упал
+              <AlertCircle className="h-5 w-5" /> Обработка прервалась
             </DialogTitle>
             <DialogDescription>
-              Traceback ниже. Полный лог тоже сохранён — скопируйте через кнопку «Копировать».
+              Ниже — технические детали ошибки. Их можно скопировать кнопкой
+              «Копировать» и приложить к обращению в поддержку.
             </DialogDescription>
           </DialogHeader>
           <ScrollArea className="max-h-[400px] rounded-lg border border-white/5 bg-black/40 p-3">
@@ -209,7 +207,7 @@ export function JobScreen({
                 if (state?.error) void navigator.clipboard.writeText(state.error);
               }}
             >
-              <Copy className="h-4 w-4" /> Копировать traceback
+              <Copy className="h-4 w-4" /> Копировать детали
             </Button>
             <Button onClick={() => setErrorOpen(false)}>Закрыть</Button>
           </DialogFooter>
@@ -243,7 +241,7 @@ function Header({
         </div>
         <div className="mt-1 flex flex-wrap items-center gap-3 text-xs text-subtle">
           <span>
-            job <span className="font-mono-tabular text-muted">{state?.id.slice(0, 8) ?? "…"}</span>
+            обработка <span className="font-mono-tabular text-muted">{state?.id.slice(0, 8) ?? "…"}</span>
           </span>
           {createdMs != null && <span>создан {fmtRelativeMs(createdMs)}</span>}
           {!wsReady && state?.status !== "done" && state?.status !== "failed" && (
@@ -335,7 +333,7 @@ function FooterBar({
       className="flex flex-wrap items-center justify-between gap-3"
     >
       <div className="text-sm text-muted">
-        Можно закрыть окно — job продолжит выполняться на backend'е. Живой лог
+        Можно закрыть окно — обработка продолжится в фоне. Живой лог
         подхватится при возврате.
       </div>
       <Button
@@ -371,11 +369,11 @@ function LogRow({ entry }: { entry: JobLogEntry }) {
 }
 
 function stageLabel(stage: string | undefined) {
-  if (!stage) return "Прогресс job'a";
+  if (!stage) return "Обработка";
   const step = PROCESS_STEPS.find(
     (s) => s.key === stage || s.aliases?.includes(stage)
   );
-  return step?.title ?? "Прогресс job'a";
+  return step?.title ?? "Обработка";
 }
 
 function firstLine(s: string | null | undefined) {
