@@ -63,6 +63,16 @@ function resolveStaticDir(): string {
 }
 
 /**
+ * Иконка окна/taskbar. В prod — реальный файл resources/icon.ico (кладётся
+ * через extraResources): грузить .ico для taskbar из-под asar на Windows
+ * ненадёжно, поэтому держим на диске рядом, как backend. В dev — desktop/build.
+ */
+function resolveIconPath(): string {
+  if (app.isPackaged) return path.join(process.resourcesPath, "icon.ico");
+  return path.resolve(__dirname, "..", "..", "build", "icon.ico");
+}
+
+/**
  * Собрать все пути окружения.
  *
  * В prod venv живёт в writable dataDir/env (его создаёт bootstrap).
@@ -138,6 +148,12 @@ function buildBackendEnv(venvRoot: string | null): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     PYTHONUNBUFFERED: "1",
+    // UTF-8 mode: без него дочерний Python берёт stdout в системной локали
+    // (на русской Windows — cp1251), и первый же rich-print с символом типа
+    // «→» валит процесс UnicodeEncodeError'ом. Electron читает stdout как
+    // utf-8 (chunk.toString("utf-8")), так что форсируем ту же кодировку.
+    PYTHONUTF8: "1",
+    PYTHONIOENCODING: "utf-8",
     // Backend пишет модели/кэш в writable дата-каталог, а не рядом с кодом.
     TWITCH_CUT_DATA_DIR: PATHS.dataDir,
   };
@@ -248,11 +264,9 @@ function stopBackend() {
 // --- window -----------------------------------------------------------------
 
 function createWindow() {
-  // Иконка окна и taskbar. Файл лежит в desktop/build/icon.ico — это же
-  // multi-size ICO пойдёт в electron-builder-конфиг в Фазе 6.
-  // Путь: dist из tsc — desktop/electron/dist/main.js, отсюда build/ — на два
-  // уровня вверх от __dirname (electron/dist → electron → desktop → build).
-  const iconPath = path.resolve(__dirname, "..", "..", "build", "icon.ico");
+  // Иконка окна и taskbar (см. resolveIconPath): в prod — resources/icon.ico,
+  // в dev — desktop/build/icon.ico.
+  const iconPath = resolveIconPath();
   const win = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -282,7 +296,7 @@ let splashWin: BrowserWindow | null = null;
 
 /** Небольшое окно первого запуска с прогрессом установки. */
 function createSplash(): BrowserWindow {
-  const iconPath = path.resolve(__dirname, "..", "..", "build", "icon.ico");
+  const iconPath = resolveIconPath();
   const win = new BrowserWindow({
     width: 520,
     height: 340,
@@ -487,6 +501,11 @@ ipcMain.handle("shell:openExternal", async (_e, url: string) => {
 
 app.whenReady().then(async () => {
   PATHS = resolvePaths();
+
+  // Windows: без явного AppUserModelID система не связывает окна процесса с
+  // иконкой/ярлыком приложения и показывает дефолтную иконку Electron в
+  // панели задач. Должен совпадать с build.appId в package.json.
+  if (process.platform === "win32") app.setAppUserModelId("com.arm4tura.twitchcut");
 
   // 1. Первый запуск: подготовить Python-окружение и модели (со сплэшем).
   const ready = await ensureEnvironment();

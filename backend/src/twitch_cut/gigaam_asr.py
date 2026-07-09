@@ -198,7 +198,7 @@ def transcribe_with_gigaam(
     try:
         result = model.transcribe_longform(str(audio_path), word_timestamps=True)
     except TypeError as exc:
-        # PyPI-релиз 0.1.0 без word-timestamps: transcribe(wav) -> str.
+        # PyPI-релиз 0.2.0 без word-timestamps: transcribe(wav) -> str.
         raise RuntimeError(
             "Установленная версия GigaAM не поддерживает пословные тайминги "
             "(нужна git-версия). Переставьте: pip install --no-deps "

@@ -110,6 +110,11 @@ scikit-learn==1.9.0
 scipy==1.17.1
 semver==3.0.4
 sentencepiece==0.2.1
+# ctranslate2 4.4.0 делает `import pkg_resources` при импорте (ctranslate2/__init__.py).
+# setuptools>=81 больше НЕ поставляет pkg_resources → ModuleNotFoundError и падение
+# whisperx на первом же prefetch/serve. Пинним setuptools ниже границы удаления.
+# Не убирать, пока ctranslate2 не перестанет зависеть от pkg_resources.
+setuptools==80.9.0
 shellingham==1.5.4
 six==1.17.0
 sortedcontainers==2.4.0

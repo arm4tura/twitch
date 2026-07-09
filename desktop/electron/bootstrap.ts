@@ -78,7 +78,7 @@ const UV_WIN_URL =
   "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip";
 
 /** Версия схемы bootstrap — если поменяем шаги, бампаем и sentinel протухает. */
-const BOOTSTRAP_VERSION = "1";
+const BOOTSTRAP_VERSION = "2";
 
 // Грубые веса стадий для общего прогресс-бара (сумма ≈ 100).
 const STAGE_BASE: Record<BootstrapProgress["stage"], number> = {
@@ -243,9 +243,10 @@ export async function runBootstrap(paths: Paths, onProgress: ProgressCb): Promis
 
     // 3. venv
     emit({ stage: "venv", label: "Создаю виртуальное окружение…", percent: STAGE_BASE.venv });
+    // --clear: повторный bootstrap не должен падать на «venv уже существует».
     await run(
       uv,
-      ["venv", paths.envDir, "--python", "3.12"],
+      ["venv", paths.envDir, "--python", "3.12", "--clear"],
       { logPath, env: uvEnv },
       (l) => emit({ stage: "venv", label: "Создаю окружение…", percent: STAGE_BASE.venv, detail: l })
     );
@@ -261,7 +262,20 @@ export async function runBootstrap(paths: Paths, onProgress: ProgressCb): Promis
     });
 
     // uv pip работает в контексте созданного venv через --python.
-    const pipBase = ["pip", "install", "--python", paths.venvPython];
+    // --index-strategy unsafe-best-match: lock-файл — это `pip freeze` с
+    // --extra-index-url на pytorch. uv по умолчанию берёт версии только с
+    // первого индекса, где нашёлся пакет (first-index), и падает на пакетах,
+    // которые pytorch зеркалит другой версией (certifi, idna, ...). pip так не
+    // делает — ищет лучшую версию по всем индексам. Возвращаем это поведение;
+    // безопасно, т.к. оба индекса (PyPI + официальный pytorch.org) доверенные.
+    const pipBase = [
+      "pip",
+      "install",
+      "--python",
+      paths.venvPython,
+      "--index-strategy",
+      "unsafe-best-match",
+    ];
 
     // 5. Зависимости (torch+cu126 для GPU, CPU-torch иначе)
     const reqFile = path.join(
@@ -280,11 +294,27 @@ export async function runBootstrap(paths: Paths, onProgress: ProgressCb): Promis
       emit({ stage: "deps", label: "Устанавливаю зависимости…", percent: STAGE_BASE.deps, detail: l, gpu })
     );
 
-    // 6. Сам пакет (editable, --no-deps чтобы не откатить torch — см. install.ps1).
+    // 6. Делаем пакет twitch_cut импортируемым.
+    //
+    // РАНЬШЕ тут был `uv pip install -e backend --no-deps`. Он не работает для
+    // упакованного приложения: backend лежит в read-only `Program Files`, а
+    // setuptools (и uv, собирающий локальные пакеты ПРЯМО в папке-источнике)
+    // пытается создать `src\*.egg-info` рядом с исходниками → «Отказано в
+    // доступе». Копировать backend в writable-каталог ради editable-install —
+    // лишнее: приложение зовёт backend только как `python -m twitch_cut.cli`
+    // (см. main.ts serve и prefetch ниже), console-script и dist-метаданные не
+    // используются. Поэтому просто кладём .pth с путём к src в site-packages —
+    // ничего не собираем и не пишем в Program Files.
     emit({ stage: "package", label: "Устанавливаю twitch-cut…", percent: STAGE_BASE.package, gpu });
+    const srcDir = path.join(paths.backendDir, "src");
+    const writePthScript =
+      "import sysconfig, os, sys\n" +
+      "sp = sysconfig.get_paths()['purelib']\n" +
+      "open(os.path.join(sp, 'twitch_cut.pth'), 'w', encoding='utf-8').write(sys.argv[1] + '\\n')\n" +
+      "print('twitch_cut.pth ->', sp)\n";
     await run(
-      uv,
-      [...pipBase, "-e", paths.backendDir, "--no-deps"],
+      paths.venvPython,
+      ["-c", writePthScript, srcDir],
       { logPath, env: uvEnv },
       (l) => emit({ stage: "package", label: "Устанавливаю twitch-cut…", percent: STAGE_BASE.package, detail: l, gpu })
     );
@@ -295,6 +325,10 @@ export async function runBootstrap(paths: Paths, onProgress: ProgressCb): Promis
       ...process.env,
       TWITCH_CUT_DATA_DIR: paths.dataDir,
       PYTHONUNBUFFERED: "1",
+      // См. main.ts buildBackendEnv: на русской Windows дочерний Python иначе
+      // берёт cp1251 и падает UnicodeEncodeError на rich-print «→» в prefetch.
+      PYTHONUTF8: "1",
+      PYTHONIOENCODING: "utf-8",
     };
     await run(
       paths.venvPython,

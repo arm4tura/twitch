@@ -1,0 +1,66 @@
+name: Build desktop (Windows)
+
+# Собирает Windows-установщик Twitch Cut и публикует его в GitHub Releases.
+#
+# Триггеры:
+#   - push тега вида v* (напр. vX.Y.Z) — собирает и публикует релиз;
+#   - ручной запуск (workflow_dispatch) — собирает артефакт БЕЗ публикации,
+#     удобно проверить сборку, не создавая релиз.
+#
+# Публикация идёт через electron-builder --publish, который читает секцию
+# build.publish (github / arm4tura / twitch) из desktop/package.json и заливает
+# `Twitch Cut Setup <version>.exe` + latest.yml (для автообновления) в релиз,
+# соответствующий тегу. Токен — штатный GITHUB_TOKEN, отдельных секретов не надо.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # нужно, чтобы electron-builder мог создать/обновить Release
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop # весь Electron-проект живёт здесь
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Тег push → публикуем в Releases (--publish always).
+      # Ручной запуск → только собираем, не публикуем (--publish never).
+      - name: Build & publish installer (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: npm run build && npx electron-builder --win --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build installer only (manual run)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: npm run build && npx electron-builder --win --publish never
+
+      # Всегда прикладываем установщик как artifact — можно скачать со страницы
+      # запуска даже при ручном прогоне без релиза.
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: twitch-cut-windows-installer
+          path: |
+            desktop/release/*.exe
+            desktop/release/latest.yml
+          if-no-files-found: error

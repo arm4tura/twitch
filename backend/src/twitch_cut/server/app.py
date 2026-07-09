@@ -81,7 +81,7 @@ def create_app(
         и существует — маунтится под `/`. index.html становится корнем.
     :param dev_cors: разрешить CORS с localhost:5173 (для Vite dev).
     """
-    app = FastAPI(title="twitch-cut backend", version="0.1.0")
+    app = FastAPI(title="twitch-cut backend", version="0.2.0")
     app.state.store = store or JobStore()
 
     if dev_cors:
