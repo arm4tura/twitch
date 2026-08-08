@@ -4,6 +4,11 @@
 Дизайн ошибок: одно исключение MergeError со списком человекочитаемых причин.
 CLI печатает их bullet-списком, ничего не роняет по первой ошибке — сразу
 показываем все, чтобы пользователь мог одним заходом поправить.
+
+Толерантный режим: если часть highlights не прошла валидацию, а остальные —
+прошли, НЕ роняем весь импорт. Возвращаем (HighlightSet, warnings), где
+warnings — список проблемных #N; UI показывает «принято 4 из 5, вот битые»,
+чтобы пользователь поправил один элемент, а не переделывал ответ целиком.
 """
 
 from __future__ import annotations
@@ -55,23 +60,24 @@ def _extract_json_blob(raw: str) -> str:
     )
 
 
-def parse_response(
-    path: Path | str,
+def parse_text(
+    raw: str,
     *,
     transcript_range_s: tuple[float, float] | None = None,
     source: str = "notebooklm",
     transcript_hash: str | None = None,
-) -> HighlightSet:
-    """Прочитать JSON-ответ NotebookLM и вернуть валидный HighlightSet.
+) -> tuple[HighlightSet, list[str]]:
+    """Распарсить СЫРОЙ текст ответа (вставленный из NotebookLM) → (set, warnings).
 
-    :param transcript_range_s: (min, max) — секунды начала/конца транскрипта.
-        Если передан, отбрасываем highlights за пределами.
+    Отличие от parse_response: работает с текстом напрямую (не файлом) и
+    ТОЛЕРАНТНА к частичному браку — если хоть один highlight валиден, возвращает
+    его + список warnings по отброшенным. Роняем MergeError только когда парсить
+    вообще нечего (нет JSON / битый JSON / все элементы невалидны).
+
+    :param transcript_range_s: (min, max) секунды транскрипта — отбрасываем
+        highlights за пределами.
+    :returns: (HighlightSet, warnings). warnings пуст, если всё чисто.
     """
-    path = Path(path)
-    if not path.exists():
-        raise MergeError([f"Response file not found: {path}"])
-
-    raw = path.read_text(encoding="utf-8")
     blob = _extract_json_blob(raw)
 
     try:
@@ -113,31 +119,94 @@ def parse_response(
 
         highlights.append(h)
 
-    if reasons and not highlights:
-        raise MergeError(reasons + ["All highlights rejected — aborting merge."])
-
     if not highlights:
-        raise MergeError(["Response contained no highlights."])
+        # Ничего не спасли — это уже жёсткая ошибка (показываем все причины).
+        raise MergeError(
+            (reasons or ["Response contained no highlights."])
+            + (["All highlights rejected — aborting merge."] if reasons else [])
+        )
 
-    if reasons:
-        # Мягкие проблемы — не роняем, но прикрепим к metadata через
-        # transcript_hash null-safe path. Печать делает CLI.
-        pass
-
-    return HighlightSet(
+    hs = HighlightSet(
         highlights=highlights,
         source=source,
         transcript_hash=transcript_hash,
         model=source,
     )
+    # reasons здесь — мягкие: часть прошла, часть отброшена. Возвращаем как
+    # warnings, чтобы UI/CLI показали «принято N, отброшено M».
+    return hs, reasons
 
 
-def merge_into_decisions(decisions: dict[str, Any], highlights: HighlightSet) -> dict[str, Any]:
+def parse_response(
+    path: Path | str,
+    *,
+    transcript_range_s: tuple[float, float] | None = None,
+    source: str = "notebooklm",
+    transcript_hash: str | None = None,
+) -> HighlightSet:
+    """Прочитать JSON-ответ NotebookLM из ФАЙЛА и вернуть валидный HighlightSet.
+
+    Тонкая обёртка над parse_text: читает файл, отбрасывает warnings (CLI/сервер
+    при необходимости зовут parse_text напрямую, чтобы их показать).
+
+    :param transcript_range_s: (min, max) — секунды начала/конца транскрипта.
+        Если передан, отбрасываем highlights за пределами.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise MergeError([f"Response file not found: {path}"])
+
+    raw = path.read_text(encoding="utf-8")
+    hs, _warnings = parse_text(
+        raw,
+        transcript_range_s=transcript_range_s,
+        source=source,
+        transcript_hash=transcript_hash,
+    )
+    return hs
+
+
+def merge_into_decisions(
+    decisions: dict[str, Any],
+    highlights: HighlightSet,
+    *,
+    stream_offset_s: float | None = None,
+) -> dict[str, Any]:
     """Записать highlights в existing decisions.json dict под ключ 'highlights'.
 
     Не in-place: возвращаем новый dict (dict сохраняет порядок вставки; ключ
     'highlights' появится в конце, что удобно для diff).
+
+    :param stream_offset_s: сдвиг ЛОКАЛЬНОГО времени (от начала транскрипта) →
+        АБСОЛЮТНОГО времени исходника. Обычно = range_in в секундах. Если задан,
+        к каждому highlight добавляем `stream_start_s`/`stream_end_s` — их читают
+        рендер клипов и Vegas-маркеры (как mutes читают `stream_start`). None →
+        offset берём из decisions.range_in автоматически; если и его нет — 0.
     """
     merged = dict(decisions)
-    merged["highlights"] = highlights.model_dump(exclude_none=True)
+    bundle = highlights.model_dump(exclude_none=True)
+
+    offset = stream_offset_s
+    if offset is None:
+        offset = _offset_from_decisions(decisions)
+
+    for h in bundle.get("highlights", []):
+        h["stream_start_s"] = round(h["start_s"] + offset, 3)
+        h["stream_end_s"] = round(h["end_s"] + offset, 3)
+
+    merged["highlights"] = bundle
     return merged
+
+
+def _offset_from_decisions(decisions: dict[str, Any]) -> float:
+    """Локальное→stream смещение из decisions.range_in (таймкод/секунды)."""
+    raw = decisions.get("range_in")
+    if raw in (None, "", 0):
+        return 0.0
+    try:
+        # range_in — таймкод "HH:MM:SS.mmm" ИЛИ число секунд.
+        from ..timecode import seconds_float
+
+        return seconds_float(raw)
+    except Exception:  # noqa: BLE001
+        return 0.0

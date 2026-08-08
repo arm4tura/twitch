@@ -14,7 +14,7 @@
  *   4. Гарантированно убить backend при закрытии окна (else zombie uvicorn).
  */
 
-import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeImage, shell } from "electron";
 import { spawn, ChildProcessWithoutNullStreams } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
@@ -63,6 +63,22 @@ function resolveStaticDir(): string {
 }
 
 /**
+ * Каталог с бинарником TwitchDownloaderCLI (скачивание Twitch VOD).
+ *
+ * В prod — resources/tdcli (кладётся через extraResources), внутри —
+ * per-platform подкаталоги win-x64 / osx-arm64 / osx-x64 / linux-x64. Питон
+ * (tdcli.get_tdcli_path) сам добавит нужный подкаталог по своей платформе,
+ * поэтому отдаём родительскую папку. В dev — <repo>/backend/vendor/tdcli, если
+ * она есть (можно положить бинарник вручную для отладки); иначе null — и тогда
+ * бэкенд ищет бинарник в PATH.
+ */
+function resolveTdcliDir(): string | null {
+  if (app.isPackaged) return path.join(process.resourcesPath, "tdcli");
+  const devDir = path.resolve(__dirname, "..", "..", "..", "backend", "vendor", "tdcli");
+  return fs.existsSync(devDir) ? devDir : null;
+}
+
+/**
  * Иконка окна/taskbar. В prod — реальный файл resources/icon.ico (кладётся
  * через extraResources): грузить .ico для taskbar из-под asar на Windows
  * ненадёжно, поэтому держим на диске рядом, как backend. В dev — desktop/build.
@@ -70,6 +86,20 @@ function resolveStaticDir(): string {
 function resolveIconPath(): string {
   if (app.isPackaged) return path.join(process.resourcesPath, "icon.ico");
   return path.resolve(__dirname, "..", "..", "build", "icon.ico");
+}
+
+/**
+ * Иконка курсора для drag-out (webContents.startDrag). ВАЖНО: это НЕ то же, что
+ * resolveIconPath — там .ico для taskbar. Здесь нужен PNG: macOS
+ * nativeImage.createFromPath НЕ декодирует .ico (возвращает пустой image), а
+ * startDrag на macOS с пустой/битой иконкой кидает исключение — из-за чего drag
+ * «даже не тянется». PNG декодируется на всех платформах.
+ *   - prod: resources/icon.png (кладётся через extraResources);
+ *   - dev:  desktop/public/icon.png (есть в репозитории).
+ */
+function resolveDragIconPath(): string {
+  if (app.isPackaged) return path.join(process.resourcesPath, "icon.png");
+  return path.resolve(__dirname, "..", "..", "public", "icon.png");
 }
 
 /**
@@ -157,9 +187,17 @@ function buildBackendEnv(venvRoot: string | null): NodeJS.ProcessEnv {
     // Backend пишет модели/кэш в writable дата-каталог, а не рядом с кодом.
     TWITCH_CUT_DATA_DIR: PATHS.dataDir,
   };
-  // Если GPU не найден при bootstrap — сообщаем backend, чтобы doctor не ругался
-  // FAIL'ом на отсутствие CUDA и pipeline знал, что работает в CPU-режиме.
-  if (!GPU_MODE) env.TWITCH_CUT_CPU = "1";
+  // Путь к бандлу TwitchDownloaderCLI (скачивание VOD). Питон подставит
+  // per-platform подкаталог сам. В dev может быть null — тогда не выставляем,
+  // и бэкенд ищет бинарник в PATH.
+  const tdcliDir = resolveTdcliDir();
+  if (tdcliDir) env.TWITCH_CUT_TDCLI_DIR = tdcliDir;
+  // GPU_MODE отражает наличие NVIDIA (bootstrap.detectGpu грепает nvidia-smi).
+  // На macOS NVIDIA нет по определению, но там есть MPS (Apple Metal) — поэтому
+  // НЕ форсим CPU на darwin: backend сам детектит MPS в default_device() и
+  // ускоряет GigaAM. TWITCH_CUT_CPU=1 ставим только на Win/Linux без CUDA —
+  // там альтернативы CPU нет, и флаг гасит FAIL doctor'а на отсутствие CUDA.
+  if (!GPU_MODE && process.platform !== "darwin") env.TWITCH_CUT_CPU = "1";
   if (!venvRoot) return env;
 
   const sitePkgs = process.platform === "win32"
@@ -261,6 +299,34 @@ function stopBackend() {
   }
 }
 
+/**
+ * Остановить backend и дождаться, пока процесс реально умрёт.
+ *
+ * Нужно перед удалением дата-каталога: на Windows нельзя удалить `python.exe`
+ * и DLL внутри env, пока их держит живой процесс (иначе EBUSY/EPERM). kill()
+ * сам по себе асинхронный — ждём событие exit (или таймаут как страховку).
+ */
+function stopBackendAndWait(timeoutMs = 8000): Promise<void> {
+  return new Promise((resolve) => {
+    const proc = backendProc;
+    if (!proc || proc.killed || proc.exitCode !== null) {
+      backendProc = null;
+      return resolve();
+    }
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      backendProc = null;
+      resolve();
+    };
+    proc.once("exit", finish);
+    const timer = setTimeout(finish, timeoutMs);
+    if (typeof timer.unref === "function") timer.unref();
+    proc.kill();
+  });
+}
+
 // --- window -----------------------------------------------------------------
 
 function createWindow() {
@@ -276,7 +342,7 @@ function createWindow() {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false, // preload использует path/fs через `require` — sandbox их блокирует.
+      sandbox: true,
     },
   });
 
@@ -310,7 +376,7 @@ function createSplash(): BrowserWindow {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
     },
   });
   if (process.env.NODE_ENV === "development") {
@@ -497,8 +563,165 @@ ipcMain.handle("shell:openExternal", async (_e, url: string) => {
   }
 });
 
-// --- app lifecycle ----------------------------------------------------------
+/**
+ * Иконка курсора для drag-out (webContents.startDrag). startDrag на macOS
+ * кидает исключение, если icon пустой/невалидный (тогда drag «даже не тянется»),
+ * а генерировать превью из видео дорого и асинхронно (drag должен стартовать
+ * синхронно в dragstart). Поэтому:
+ *   1. пробуем PNG-файл иконки приложения (resolveDragIconPath — именно PNG,
+ *      т.к. macOS не декодирует .ico);
+ *   2. фолбэк — сгенерированный в рантайме 64×64 непрозрачный bitmap через
+ *      createFromBitmap. Без внешних файлов и base64-констант: гарантированно
+ *      валиден на всех ОС, а 64px — безопасный минимум (16px на Retina macOS
+ *      startDrag отвергает). Кэшируем.
+ */
+let _dragIconCache: Electron.NativeImage | null = null;
+function dragIcon(): Electron.NativeImage {
+  if (_dragIconCache && !_dragIconCache.isEmpty()) return _dragIconCache;
+  // 1. PNG-иконка приложения с диска (prod: resources, dev: public).
+  try {
+    const iconPath = resolveDragIconPath();
+    if (fs.existsSync(iconPath)) {
+      const img = nativeImage.createFromPath(iconPath);
+      if (!img.isEmpty()) {
+        _dragIconCache = img.resize({ width: 64, height: 64 });
+        return _dragIconCache;
+      }
+    }
+  } catch {
+    /* fall through to generated fallback */
+  }
+  // 2. Фолбэк: рисуем 64×64 BGRA-битмап в рантайме (opaque серый). Не зависит
+  //    ни от файла, ни от PNG-декодера — createFromBitmap всегда валиден.
+  const W = 64;
+  const H = 64;
+  const buf = Buffer.alloc(W * H * 4);
+  for (let i = 0; i < W * H; i++) {
+    const o = i * 4;
+    buf[o] = 95; // B
+    buf[o + 1] = 90; // G
+    buf[o + 2] = 90; // R
+    buf[o + 3] = 255; // A (opaque — обязательно, иначе macOS отвергает)
+  }
+  _dragIconCache = nativeImage.createFromBitmap(buf, { width: W, height: H });
+  return _dragIconCache;
+}
 
+/**
+ * Drag-out файла ИЗ приложения в браузер/файловую систему/сайт.
+ *
+ * Renderer в обработчике `dragstart` шлёт сюда абсолютный путь; мы вызываем
+ * webContents.startDrag — дальше ОС ведёт нативный drag (сайт/загрузчик видит
+ * настоящий файл). Используем ipcMain.on (send, не invoke): startDrag обязан
+ * стартовать синхронно в контексте dragstart, promise round-trip его ломает.
+ * Путь проверяем на существование — иначе startDrag на Windows кидает throw.
+ */
+ipcMain.on("shell:startDrag", (event, filePath: string) => {
+  if (typeof filePath !== "string" || !filePath) return;
+  try {
+    if (!fs.existsSync(filePath)) {
+      console.warn("[ipc] startDrag: file not found:", filePath);
+      event.sender.send("shell:startDragError", {
+        path: filePath,
+        reason: "not-found",
+      });
+      return;
+    }
+    event.sender.startDrag({ file: filePath, icon: dragIcon() });
+  } catch (e) {
+    // Раньше ошибка молча гасилась в console.warn — из-за чего плитка «даже не
+    // тянулась» без единого признака в UI. Теперь сообщаем в renderer, чтобы
+    // показать тост, а не оставлять пользователя в неведении.
+    console.warn("[ipc] startDrag failed:", e);
+    event.sender.send("shell:startDragError", {
+      path: filePath,
+      reason: "start-failed",
+      message: e instanceof Error ? e.message : String(e),
+    });
+  }
+});
+
+/**
+ * Полное удаление скачанных данных (~10 ГБ): env (venv), python, models,
+ * uv-cache, bin, logs — всё, что bootstrap докачал ПОСЛЕ установки и что
+ * штатный деинсталлятор не отслеживает.
+ *
+ * Сам код программы (в Program Files / Applications) НЕ трогаем — его удаляет
+ * системный деинсталлятор. После wipe при следующем запуске снова пройдёт
+ * bootstrap. По умолчанию перезапускаем приложение, чтобы сплэш заново поднял
+ * окружение; при quit=true — просто выходим (пользователь дальше деинсталлит).
+ *
+ * Порядок важен: сперва глушим backend и ЖДЁМ его смерти, иначе на Windows
+ * python.exe/DLL заняты и rmSync падает EBUSY.
+ */
+ipcMain.handle("data:wipe", async (_e, opts?: { quit?: boolean }) => {
+  const target = PATHS?.dataDir;
+  if (!target) return { ok: false, error: "dataDir не определён" };
+
+  // В dev backend/.venv лежит внутри репозитория (см. resolvePaths). Стирать
+  // исходники по кнопке нельзя — это данные разработчика, не пользовательские.
+  if (!app.isPackaged) {
+    return {
+      ok: false,
+      error:
+        "Полное удаление доступно только в собранном приложении (в dev данные лежат в репозитории).",
+    };
+  }
+
+  const res = await dialog.showMessageBox({
+    type: "warning",
+    buttons: ["Удалить всё", "Отмена"],
+    defaultId: 1,
+    cancelId: 1,
+    title: "Полное удаление данных",
+    message: "Удалить все скачанные данные Twitch Cut?",
+    detail:
+      "Будут удалены Python, модели распознавания и виртуальное окружение (~10 ГБ) из:\n" +
+      target +
+      "\n\nСама программа останется — удалите её отдельно через системный деинсталлятор. " +
+      "При следующем запуске всё скачается заново.",
+    noLink: true,
+  });
+  if (res.response !== 0) return { ok: false, cancelled: true };
+
+  try {
+    await stopBackendAndWait();
+    backendPort = null;
+    fs.rmSync(target, { recursive: true, force: true });
+    // На macOS дополнительно чистим Logs и Caches — они остаются после удаления .app.
+    // Оба пути app-specific: logs = ~/Library/Logs/<имя>, cache = ~/Library/Caches/<имя>.
+    // Caches строим ЯВНО через имя приложения — app.getPath("cache") вернул бы
+    // КОРЕНЬ ~/Library/Caches (общий для всех программ), его стирать нельзя.
+    if (process.platform === "darwin") {
+      const appName = app.getName();
+      const extras = [
+        app.getPath("logs"),
+        path.join(app.getPath("home"), "Library", "Caches", appName),
+      ];
+      for (const dir of extras) {
+        // страховка: удаляем только каталог, чьё имя == имени приложения
+        if (path.basename(dir) === appName) {
+          fs.rmSync(dir, { recursive: true, force: true });
+        }
+      }
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[ipc] data:wipe failed:", msg);
+    return { ok: false, error: msg };
+  }
+
+  // Перезапуск, чтобы заново пройти bootstrap; либо выходим по запросу.
+  if (opts?.quit) {
+    app.quit();
+  } else {
+    app.relaunch();
+    app.exit(0);
+  }
+  return { ok: true };
+});
+
+// --- app lifecycle ----------------------------------------------------------
 app.whenReady().then(async () => {
   PATHS = resolvePaths();
 

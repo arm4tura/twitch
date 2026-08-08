@@ -1,5 +1,5 @@
 import { type ReactNode, useEffect, useState } from "react";
-import { LayoutDashboard, Activity, Film, Send, Settings } from "lucide-react";
+import { LayoutDashboard, Activity, Film, Send, Sparkles, Settings } from "lucide-react";
 import { cn } from "./lib/cn";
 import { Kbd } from "./components/ui/Kbd";
 import type { Screen } from "./App";
@@ -21,9 +21,13 @@ interface NavItem {
   icon: ReactNode;
   /** Заблокирован пока нет активной джобы / decisions.json. */
   disabled?: boolean;
+  /** Почему пункт заблокирован — показывается как title при наведении. */
+  disabledReason?: string;
   /** Показать бейдж с количеством (running jobs и т.п.). */
   badge?: number;
   shortcut?: string;
+  /** Нарисовать разделитель НАД этим пунктом (визуально отделяет группу). */
+  dividerBefore?: boolean;
 }
 
 export interface AppShellProps {
@@ -53,6 +57,7 @@ export function AppShell({
       label: "Прогресс",
       icon: <Activity className="h-4 w-4" />,
       disabled: !hasActiveJob,
+      disabledReason: "Нет активной обработки — запустите новую в «Проектах»",
       badge: runningJobs || undefined,
       shortcut: "⌘3",
     },
@@ -61,6 +66,9 @@ export function AppShell({
       label: "Правка",
       icon: <Film className="h-4 w-4" />,
       disabled: !hasDecisions || busy,
+      disabledReason: busy
+        ? "Идёт обработка — правка станет доступна после завершения"
+        : "Сначала обработайте запись, чтобы появилась разметка",
       shortcut: "⌘4",
     },
     {
@@ -68,7 +76,19 @@ export function AppShell({
       label: "Экспорт",
       icon: <Send className="h-4 w-4" />,
       disabled: !hasDecisions || busy,
+      disabledReason: busy
+        ? "Идёт обработка — экспорт станет доступен после завершения"
+        : "Сначала обработайте запись, чтобы было что выгружать",
       shortcut: "⌘5",
+    },
+    {
+      id: "clips",
+      label: "AI Tiktok",
+      icon: <Sparkles className="h-4 w-4" />,
+      disabled: !hasDecisions,
+      disabledReason: "Откройте проект — нарезка на клипы доступна после обработки",
+      shortcut: "⌘6",
+      dividerBefore: true,
     },
   ];
 
@@ -109,12 +129,16 @@ export function AppShell({
           </div>
           <nav className="flex flex-col gap-0.5">
             {items.map((item) => (
-              <NavButton
-                key={item.id}
-                item={item}
-                active={screen === item.id}
-                onClick={() => !item.disabled && onNavigate(item.id)}
-              />
+              <div key={item.id}>
+                {item.dividerBefore && (
+                  <div className="my-2 border-t border-white/5" aria-hidden />
+                )}
+                <NavButton
+                  item={item}
+                  active={screen === item.id}
+                  onClick={() => !item.disabled && onNavigate(item.id)}
+                />
+              </div>
             ))}
           </nav>
         </div>
@@ -184,13 +208,13 @@ function NavButton({
   active: boolean;
   onClick: () => void;
 }) {
-  return (
+  const button = (
     <button
       type="button"
       onClick={onClick}
       disabled={item.disabled}
       className={cn(
-        "group relative flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors",
+        "group relative flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors",
         "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-from",
         active
           ? "bg-white/[0.06] text-fg"
@@ -217,4 +241,12 @@ function NavButton({
       )}
     </button>
   );
+
+  // disabled-кнопка в Chromium не всегда показывает native title (не ловит
+  // hover-события), поэтому вешаем подсказку на обёртку — она перехватывает
+  // наведение и объясняет, почему пункт недоступен.
+  if (item.disabled && item.disabledReason) {
+    return <span title={item.disabledReason}>{button}</span>;
+  }
+  return button;
 }

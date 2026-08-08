@@ -1,7 +1,7 @@
 {
   "name": "twitch-cut-desktop",
   "productName": "Twitch Cut",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "description": "Desktop UI for twitch-reaction-cutter (stream → Vegas mutes + highlights).",
   "private": true,
   "main": "electron/dist/main.js",
@@ -16,7 +16,11 @@
     "build:main": "tsc -p electron/tsconfig.json",
     "start": "electron electron/dist/main.js",
     "typecheck": "tsc --noEmit && tsc -p electron/tsconfig.json --noEmit",
+    "prepare-tdcli": "node scripts/prepare-tdcli.js",
+    "prepare-tdcli:all": "node scripts/prepare-tdcli.js --all",
+    "predist": "node scripts/prepare-tdcli.js",
     "dist": "npm run build && electron-builder --publish never",
+    "predist:publish": "node scripts/prepare-tdcli.js --all",
     "dist:publish": "npm run build && electron-builder --publish always"
   },
   "build": {
@@ -36,6 +40,10 @@
         "to": "icon.ico"
       },
       {
+        "from": "public/icon.png",
+        "to": "icon.png"
+      },
+      {
         "from": "../backend",
         "to": "backend",
         "filter": [
@@ -50,13 +58,56 @@
     ],
     "win": {
       "target": "nsis",
-      "icon": "build/icon.ico"
+      "icon": "build/icon.ico",
+      "extraResources": [
+        {
+          "from": "build/tdcli/win-x64",
+          "to": "tdcli/win-x64",
+          "filter": ["**/*"]
+        }
+      ]
+    },
+    "mac": {
+      "target": [
+        { "target": "dmg", "arch": ["arm64", "x64"] },
+        { "target": "zip", "arch": ["arm64", "x64"] }
+      ],
+      "icon": "build/icon.icns",
+      "category": "public.app-category.utilities",
+      "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "notarize": false,
+      "extraResources": [
+        {
+          "from": "build/tdcli/osx-arm64",
+          "to": "tdcli/osx-arm64",
+          "filter": ["**/*"]
+        },
+        {
+          "from": "build/tdcli/osx-x64",
+          "to": "tdcli/osx-x64",
+          "filter": ["**/*"]
+        }
+      ]
+    },
+    "linux": {
+      "target": ["AppImage"],
+      "category": "AudioVideo",
+      "extraResources": [
+        {
+          "from": "build/tdcli/linux-x64",
+          "to": "tdcli/linux-x64",
+          "filter": ["**/*"]
+        }
+      ]
     },
     "nsis": {
       "oneClick": false,
       "perMachine": false,
       "allowElevation": true,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "include": "build/installer.nsh"
     },
     "publish": {
       "provider": "github",

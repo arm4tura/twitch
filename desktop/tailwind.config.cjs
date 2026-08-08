@@ -76,6 +76,7 @@ module.exports = {
         "fade-in": "fade-in 150ms ease-out",
         "fade-out": "fade-out 120ms ease-in",
         "slide-up": "slide-up 200ms cubic-bezier(0.16, 1, 0.3, 1)",
+        "dialog-in": "dialog-in 200ms cubic-bezier(0.16, 1, 0.3, 1)",
         "collapsible-down": "collapsible-down 200ms ease-out",
         "collapsible-up": "collapsible-up 200ms ease-out",
       },
@@ -95,6 +96,21 @@ module.exports = {
         "slide-up": {
           from: { opacity: "0", transform: "translateY(6px)" },
           to: { opacity: "1", transform: "translateY(0)" },
+        },
+        // Для центрированных диалогов: центрирование живёт через
+        // -translate-x-1/2 -translate-y-1/2 на элементе, поэтому keyframe
+        // обязан включать эти -50% в transform — иначе на время анимации
+        // transform перебивает центрирование и окно «прыгает» в центр после
+        // её окончания.
+        "dialog-in": {
+          from: {
+            opacity: "0",
+            transform: "translate(-50%, -50%) translateY(6px) scale(0.98)",
+          },
+          to: {
+            opacity: "1",
+            transform: "translate(-50%, -50%) translateY(0) scale(1)",
+          },
         },
         "collapsible-down": {
           from: { height: "0" },

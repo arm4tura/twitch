@@ -18,15 +18,22 @@ def _group_by_segment(
     matches: list[ProfanityMatch],
     join_gap_ms: int = 600,
 ) -> list[list[ProfanityMatch]]:
-    """Группирует подряд идущие матчи с одинаковым segment_id В ОДИН мьют,
-    но только если они идут плотно — разрыв между концом предыдущего мата
-    и началом следующего не больше join_gap_ms.
+    """Группирует матчи В ОДИН мьют ТОЛЬКО когда они идут словами ВПЛОТНУЮ —
+    между ними нет ни одного чистого (не-матного) слова транскрипта.
 
-    Если в одном whisper-сегменте два мата, а между ними пауза с чистой
-    речью ('блять ... убил школьницу ... блять'), они попадают в РАЗНЫЕ
-    группы — иначе мьют first..last проглотил бы предложение между ними.
+    Критерий соседства — по индексу слова, а не по временно́му разрыву. Раньше
+    склейка шла по join_gap_ms (≤600мс между концом и началом), и это глотало
+    невинное слово, если оно короткое: 'бля какой даун' — 'какой' быстрое,
+    разрыв бля→даун <600мс, мьют бля..даун проглатывал 'какой'. Теперь два
+    мата склеиваются, только если второй начинается на слове сразу за первым
+    (word_start_index == prev.word_end_index + 1). Если между ними есть слово —
+    это разные группы, чистая речь между матами НЕ мьютится.
 
-    Матчи без segment_id остаются каждый в своей группе."""
+    Требования склейки: тот же segment_id И индексы слов идут подряд. Матчи без
+    segment_id или без индексов остаются каждый в своей группе (консервативно).
+    join_gap_ms больше не используется для решения о склейке (оставлен в
+    сигнатуре для обратной совместимости вызова)."""
+    _ = join_gap_ms  # больше не влияет на склейку — критерий сменён на соседство
     groups: list[list[ProfanityMatch]] = []
     for match in matches:
         prev = groups[-1][-1] if groups else None
@@ -35,11 +42,15 @@ def _group_by_segment(
             and match.segment_id is not None
             and prev.segment_id == match.segment_id
         )
-        gap_ok = (
+        # Соседство слов: текущий мат начинается ровно на следующем слове после
+        # последнего слова предыдущего мата. Нет индексов — не склеиваем.
+        adjacent = (
             prev is not None
-            and match.local_start_ms - prev.local_end_ms <= join_gap_ms
+            and prev.word_end_index is not None
+            and match.word_start_index is not None
+            and match.word_start_index == prev.word_end_index + 1
         )
-        if same_segment and gap_ok:
+        if same_segment and adjacent:
             groups[-1].append(match)
         else:
             groups.append([match])
@@ -110,6 +121,19 @@ def _compute_mute_window(
     prev_stream_end = getattr(first, "prev_word_stream_end_ms", None)
     if prev_stream_end is not None and padded_stream_start < prev_stream_end:
         padded_stream_start = min(prev_stream_end, base_stream_start)
+
+    # Симметрично: ограничиваем after-padding началом СЛЕДУЮЩЕГО слова — мьют не
+    # должен залезать на соседнюю чистую речь справа, когда слова идут вплотную
+    # ('бля какой' без паузы — after-padding 'бля' не глотает начало 'какой').
+    # Берём next-слово ПОСЛЕДНЕГО мата группы (padding применяется к хвосту).
+    # В паузах padding сохраняется (следующее слово начинается позже, чем
+    # end + padding), во вплотную идущих словах схлопывается до конца мата.
+    next_local_start = getattr(last, "next_word_local_start_ms", None)
+    if next_local_start is not None and padded_local_end > next_local_start:
+        padded_local_end = max(next_local_start, base_local_end)
+    next_stream_start = getattr(last, "next_word_stream_start_ms", None)
+    if next_stream_start is not None and padded_stream_end > next_stream_start:
+        padded_stream_end = max(next_stream_start, base_stream_end)
 
     # Жёсткий потолок длительности — чтобы аномальный 30-секундный сегмент
     # не превратился в 30-секундный мьют. Считаем от начала первого слова.

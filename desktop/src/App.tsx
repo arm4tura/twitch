@@ -6,8 +6,10 @@ import { NewJobScreen } from "./screens/NewJobScreen";
 import { JobScreen } from "./screens/JobScreen";
 import { TimelineScreen } from "./screens/TimelineScreen";
 import { ExportScreen } from "./screens/ExportScreen";
+import { AiTiktokScreen } from "./screens/AiTiktokScreen";
 import { SettingsScreen } from "./screens/SettingsScreen";
 import { Toaster } from "./components/ui/Toast";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { CommandPalette } from "./components/CommandPalette";
 import { useTimelineActions } from "./lib/timelineActions";
 import { useHotkey } from "./hooks/useHotkey";
@@ -22,7 +24,7 @@ import { listJobs } from "./api";
  * Коммит 5: framer-motion `<AnimatePresence>` для fade-slide между экранами,
  * ⌘K CommandPalette через глобальный TimelineActions-store, sonner Toaster.
  */
-export type Screen = "dashboard" | "new" | "job" | "timeline" | "export" | "settings";
+export type Screen = "dashboard" | "new" | "job" | "timeline" | "export" | "clips" | "settings";
 
 // Единый variant — крошечное движение, никакого «wow»: mac-style crossfade
 // с 4px vertical drift. 180ms — достаточно чтобы взгляд заметил, слишком мало
@@ -80,7 +82,8 @@ export function App() {
     // CommandPalette может позвать экран, для которого нет контекста.
     // Здесь центральный guard: молча игнорируем неготовые переходы.
     if (target === "job" && !activeJobId) return;
-    if ((target === "timeline" || target === "export") && !decisionsPath) return;
+    if ((target === "timeline" || target === "export" || target === "clips") && !decisionsPath)
+      return;
     setScreen(target);
   };
 
@@ -109,6 +112,7 @@ export function App() {
             transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
             className="h-full"
           >
+            <ErrorBoundary label={screen}>
             {screen === "dashboard" && (
               <DashboardScreen
                 onNew={() => setScreen("new")}
@@ -120,6 +124,11 @@ export function App() {
               <JobScreen
                 jobId={activeJobId}
                 onDone={(p) => p && goToTimeline(p)}
+                // Цепочка джоб: download_vod по завершении сам стартует
+                // process-джобу и перецепляет экран на неё (один поток «скачал →
+                // обработал → таймлайн», ноль кликов). goToJob сбрасывает лог и
+                // ETA, т.к. это уже другая джоба.
+                onChainJob={(id) => goToJob(id)}
               />
             )}
             {screen === "timeline" && decisionsPath && (
@@ -131,7 +140,19 @@ export function App() {
                 onJobStarted={(id) => goToJob(id)}
               />
             )}
+            {screen === "clips" && decisionsPath && (
+              <AiTiktokScreen
+                decisionsPath={decisionsPath}
+                // НЕ уводим на экран «Прогресс»: весь результат (плитки для
+                // перетаскивания, список моментов) показывается прямо здесь.
+                // Уход бы размонтировал экран и потерял локальный стейт job'а.
+                // Только регистрируем job — бейдж/таб «Прогресс» подхватят его
+                // (App и так поллит /jobs каждые 3с).
+                onJobStarted={(id) => setActiveJobId(id)}
+              />
+            )}
             {screen === "settings" && <SettingsScreen />}
+            </ErrorBoundary>
           </motion.div>
         </AnimatePresence>
       </AppShell>

@@ -96,6 +96,50 @@ const api = {
   openExternal(url: string): Promise<boolean> {
     return ipcRenderer.invoke("shell:openExternal", url);
   },
+
+  /**
+   * Начать нативный drag файла ИЗ приложения наружу (браузер, проводник, сайт).
+   *
+   * Зовётся в обработчике onDragStart элемента-карточки. Fire-and-forget
+   * (ipcRenderer.send): startDrag в main обязан выполниться синхронно в
+   * контексте dragstart, поэтому ждать промис нельзя. Возвращать нечего —
+   * дальше drag ведёт ОС.
+   */
+  startDrag(filePath: string): void {
+    ipcRenderer.send("shell:startDrag", filePath);
+  },
+
+  /**
+   * Подписаться на ошибку нативного drag-out (файл не найден / startDrag кинул
+   * исключение в main). Раньше такие ошибки гасились молча и плитка «не
+   * тянулась» без признаков — теперь renderer может показать тост.
+   * Возвращает функцию отписки.
+   */
+  onStartDragError(
+    cb: (info: { path: string; reason: string; message?: string }) => void
+  ): () => void {
+    const listener = (_e: unknown, payload: unknown) =>
+      cb(payload as { path: string; reason: string; message?: string });
+    ipcRenderer.on("shell:startDragError", listener);
+    return () => ipcRenderer.removeListener("shell:startDragError", listener);
+  },
+
+  /** Платформа: "darwin" | "win32" | "linux". */
+  platform: process.platform as string,
+
+  /**
+   * Полное удаление скачанных данных (Python, модели, venv — ~10 ГБ).
+   * Показывает нативный диалог подтверждения. По умолчанию после удаления
+   * перезапускает приложение (заново пройдёт bootstrap); с { quit: true }
+   * — просто закрывает. Возвращает { ok } | { ok:false, error|cancelled }.
+   */
+  wipeData(opts?: { quit?: boolean }): Promise<{
+    ok: boolean;
+    error?: string;
+    cancelled?: boolean;
+  }> {
+    return ipcRenderer.invoke("data:wipe", opts);
+  },
 };
 
 contextBridge.exposeInMainWorld("twitchCut", api);

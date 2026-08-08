@@ -47,6 +47,12 @@ OBSCENE_STEMS: tuple[str, ...] = (
     "проеб",
     "поеб",
     "отъеб",
+    "въеб",     # въебать, въебал, въебите, въёбанный (ё→е при нормализации)
+    "вьеб",     # whisper часто пишет въеб через мягкий знак вместо твёрдого
+    "взъеб",    # взъебать, взъебка
+    "разъеб",   # разъебать, разъёбанный
+    "подъеб",   # подъебать, подъёб, подъёбка
+    "объеб",    # объебать, объёбанный
     "охуе",
     "охуи",
     "охуя",
@@ -121,6 +127,19 @@ class ProfanityMatch:
     # чтобы мьют не залезал на соседнюю чистую речь, когда слова идут вплотную).
     prev_word_local_end_ms: int | None = None
     prev_word_stream_end_ms: int | None = None
+    # Начало следующего слова в транскрипте (для ограничения after-padding —
+    # симметрично prev_word_*_end_ms — чтобы after-padding мата не залезал на
+    # следующее чистое слово: 'бля какой' без паузы, after-padding 'бля' не
+    # должен глотать начало 'какой'). См. _compute_mute_window.
+    next_word_local_start_ms: int | None = None
+    next_word_stream_start_ms: int | None = None
+    # Индексы слов транскрипта, которые покрывает матч (позиция в общем списке
+    # iter_words). Обычный матч — одно слово (start==end). Glued-матч склеен из
+    # двух соседних слов (end = start+1). Нужны для склейки соседних матов в один
+    # мьют ТОЛЬКО когда между ними нет чистого слова — иначе 'бля какой даун'
+    # проглотил бы невинное 'какой'. См. _group_by_segment.
+    word_start_index: int | None = None
+    word_end_index: int | None = None
 
 
 class RussianNormalizer:
@@ -201,6 +220,9 @@ def _build_match(
     override_start: float | None = None,
     override_end: float | None = None,
     prev_word_end: float | None = None,
+    next_word_start: float | None = None,
+    word_start_index: int | None = None,
+    word_end_index: int | None = None,
 ) -> ProfanityMatch | None:
     start = override_start if override_start is not None else word_obj.get("start")
     end = override_end if override_end is not None else word_obj.get("end")
@@ -234,6 +256,12 @@ def _build_match(
         pwe = TimeSpan.from_seconds(prev_word_end)
         prev_word_local_end_ms = pwe.ms
         prev_word_stream_end_ms = (range_in + pwe).ms
+    next_word_local_start_ms = None
+    next_word_stream_start_ms = None
+    if next_word_start is not None:
+        nws = TimeSpan.from_seconds(next_word_start)
+        next_word_local_start_ms = nws.ms
+        next_word_stream_start_ms = (range_in + nws).ms
     return ProfanityMatch(
         word=text,
         normalized=normalized,
@@ -255,6 +283,10 @@ def _build_match(
         segment_stream_end_ms=seg_stream_end_ms,
         prev_word_local_end_ms=prev_word_local_end_ms,
         prev_word_stream_end_ms=prev_word_stream_end_ms,
+        next_word_local_start_ms=next_word_local_start_ms,
+        next_word_stream_start_ms=next_word_stream_start_ms,
+        word_start_index=word_start_index,
+        word_end_index=word_end_index if word_end_index is not None else word_start_index,
     )
 
 
@@ -293,11 +325,22 @@ def detect_profanity(
             if prev.get("segment_id") == word.get("segment_id"):
                 prev_word_end = prev.get("end")
 
+        # Начало следующего слова в том же сегменте — симметрично prev_word_end,
+        # ограничивает after-padding, чтобы мьют не залезал на следующее чистое
+        # слово ('бля какой' без паузы — after-padding 'бля' не глотает 'какой').
+        # Для glued-матча (склеен из idx и idx+1) следующее слово — idx+2; его
+        # считаем отдельно в шаге #5.
+        next_word_start = None
+        if idx + 1 < len(words):
+            nxt_w = words[idx + 1]
+            if nxt_w.get("segment_id") == word.get("segment_id"):
+                next_word_start = nxt_w.get("start")
+
         # ---------- 1. exact surface match ----------
         entry = surfaces.get(normalized) if normalized else None
         if entry is not None:
             lemma = normalizer.lemma(normalized)
-            m = _build_match(word, normalized, lemma, entry, "surface", range_in, prev_word_end=prev_word_end)
+            m = _build_match(word, normalized, lemma, entry, "surface", range_in, prev_word_end=prev_word_end, next_word_start=next_word_start, word_start_index=idx)
             if m:
                 matches.append(m)
             continue
@@ -306,7 +349,7 @@ def detect_profanity(
         lemma = normalizer.lemma(normalized) if normalized else ""
         entry = lemmas.get(lemma) if lemma else None
         if entry is not None:
-            m = _build_match(word, normalized, lemma, entry, "lemma", range_in, prev_word_end=prev_word_end)
+            m = _build_match(word, normalized, lemma, entry, "lemma", range_in, prev_word_end=prev_word_end, next_word_start=next_word_start, word_start_index=idx)
             if m:
                 matches.append(m)
             continue
@@ -321,6 +364,8 @@ def detect_profanity(
                         _stem_entry(stem), "censored", range_in,
                         needs_review=False,
                         prev_word_end=prev_word_end,
+                        next_word_start=next_word_start,
+                        word_start_index=idx,
                     )
                     if m:
                         matches.append(m)
@@ -332,6 +377,8 @@ def detect_profanity(
                         _stem_entry("censor"), "censored", range_in,
                         needs_review=True,
                         prev_word_end=prev_word_end,
+                        next_word_start=next_word_start,
+                        word_start_index=idx,
                     )
                     if m:
                         matches.append(m)
@@ -343,6 +390,8 @@ def detect_profanity(
                 needs_review=True,
                 override_text=raw_text.strip(),
                 prev_word_end=prev_word_end,
+                next_word_start=next_word_start,
+                word_start_index=idx,
             )
             if m:
                 matches.append(m)
@@ -356,6 +405,8 @@ def detect_profanity(
                     word, normalized, lemma or normalized,
                     _stem_entry(stem), "stem", range_in,
                     prev_word_end=prev_word_end,
+                    next_word_start=next_word_start,
+                    word_start_index=idx,
                 )
                 if m:
                     matches.append(m)
@@ -378,6 +429,13 @@ def detect_profanity(
                         end = nxt.get("end")
                         if start is not None and end is not None:
                             used_glued.add(idx + 1)
+                            # Для glued следующее чистое слово — idx+2 (idx и
+                            # idx+1 уже съедены склейкой), в том же сегменте.
+                            glued_next_start = None
+                            if idx + 2 < len(words):
+                                nxt2 = words[idx + 2]
+                                if nxt2.get("segment_id") == word.get("segment_id"):
+                                    glued_next_start = nxt2.get("start")
                             m = _build_match(
                                 word, glued, normalizer.lemma(glued),
                                 entry_g if entry_g is not None else _stem_entry(stem_g or ""),
@@ -386,6 +444,9 @@ def detect_profanity(
                                 override_start=start,
                                 override_end=end,
                                 prev_word_end=prev_word_end,
+                                next_word_start=glued_next_start,
+                                word_start_index=idx,
+                                word_end_index=idx + 1,
                             )
                             if m:
                                 matches.append(m)
@@ -404,6 +465,8 @@ def detect_profanity(
                     _stem_entry("short"), "short_fragment", range_in,
                     needs_review=True,
                     prev_word_end=prev_word_end,
+                    next_word_start=next_word_start,
+                    word_start_index=idx,
                 )
                 if m:
                     matches.append(m)

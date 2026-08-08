@@ -8,6 +8,7 @@ import {
   RotateCcw,
   Save,
   SlidersHorizontal,
+  Trash2,
 } from "lucide-react";
 import { Button } from "../components/ui/Button";
 import { Card, CardDescription, CardTitle } from "../components/ui/Card";
@@ -50,9 +51,14 @@ interface KnownSettings {
   default_vad_filter: boolean;
 }
 
+// Платформа хоста — от неё зависит, какой ускоритель по умолчанию имеет смысл:
+// на Mac (Apple Silicon) это Metal/MPS, на Windows/Linux — CUDA.
+const IS_MAC = window.twitchCut.platform === "darwin";
+
 const DEFAULTS: KnownSettings = {
   default_transcriber: "gigaam",
-  default_device: "cuda",
+  // На Mac CUDA нет — по умолчанию Apple Metal (mps). На остальных — cuda.
+  default_device: IS_MAC ? "mps" : "cuda",
   default_compute_type: "float16",
   default_model: "large-v3",
   default_language: "ru",
@@ -64,13 +70,20 @@ const DEFAULTS: KnownSettings = {
 // Списки опций — те же, что в NewJobScreen (держим синхронно вручную; вынесем
 // в constants/, если появится третий потребитель).
 const TRANSCRIBER_OPTIONS = [
-  { value: "gigaam", label: "GigaAM v3 — русский, по умолчанию" },
-  { value: "whisperx", label: "WhisperX — мультиязычный, тонкая настройка" },
+  { value: "gigaam", label: "GigaAM v3 — лучший для русского" },
+  { value: "whisperx", label: "WhisperX — универсальный, все языки" },
 ];
-const DEVICE_OPTIONS = [
-  { value: "cuda", label: "cuda — GPU (NVIDIA)" },
-  { value: "cpu", label: "cpu — работает везде, но медленно" },
-];
+// Ускоритель зависит от платформы: на Mac предлагаем Apple Metal (mps),
+// на Windows/Linux — CUDA. CPU доступен везде как запасной вариант.
+const DEVICE_OPTIONS = IS_MAC
+  ? [
+      { value: "mps", label: "mps — GPU Apple (Metal)" },
+      { value: "cpu", label: "cpu — работает везде, но медленно" },
+    ]
+  : [
+      { value: "cuda", label: "cuda — GPU (NVIDIA)" },
+      { value: "cpu", label: "cpu — работает везде, но медленно" },
+    ];
 const COMPUTE_OPTIONS = [
   { value: "float16", label: "float16 — быстрее, нужно ≥ 8 GB VRAM" },
   { value: "int8", label: "int8 — экономно, годится для 4-6 GB VRAM" },
@@ -193,6 +206,30 @@ export function SettingsScreen() {
     }
   };
 
+  const [wiping, setWiping] = useState<boolean>(false);
+
+  const wipeData = async () => {
+    // Нативный диалог подтверждения показывает main-процесс (dialog:wipe).
+    // При успехе приложение перезапустится само — тост увидеть уже не успеем,
+    // поэтому важна только ветка ошибки/отмены.
+    setWiping(true);
+    try {
+      const res = await window.twitchCut.wipeData();
+      if (res.cancelled) return;
+      if (!res.ok) {
+        toast.error("Не удалось удалить данные", {
+          description: res.error ?? "Неизвестная ошибка",
+        });
+      }
+    } catch (err) {
+      toast.error("Не удалось удалить данные", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setWiping(false);
+    }
+  };
+
   // Версия: vite подставляет через define. См. vite.config.ts.
   const version = (import.meta as any).env?.VITE_APP_VERSION ?? "dev";
 
@@ -247,8 +284,10 @@ export function SettingsScreen() {
               <div>
                 <CardTitle>Движок распознавания</CardTitle>
                 <CardDescription>
-                  На чём распознавать речь по умолчанию. GigaAM v3 — русский, без
-                  CUDA-стека; WhisperX — мультиязычный с тонкой настройкой.
+                  На чём распознавать речь по умолчанию. <b>GigaAM v3</b> заточен
+                  под русский — точнее ловит мат и даёт узкие пословные тайминги.
+                  <b> WhisperX</b> — универсальный, знает все языки, но под
+                  русский настроен слабее.
                 </CardDescription>
               </div>
             </div>
@@ -260,6 +299,11 @@ export function SettingsScreen() {
                   onChange={(e) => set("default_transcriber", e.target.value)}
                   options={TRANSCRIBER_OPTIONS}
                 />
+                <p className="mt-1.5 text-xs text-subtle">
+                  {known.default_transcriber === "gigaam"
+                    ? "GigaAM — рекомендуется для русскоязычных стримов."
+                    : "WhisperX — берите, если в записи не только русский."}
+                </p>
               </div>
             </div>
           </Card>
@@ -273,8 +317,9 @@ export function SettingsScreen() {
               <div>
                 <CardTitle>Вычисления</CardTitle>
                 <CardDescription>
-                  Где считать: GPU (NVIDIA) или CPU. На машине без видеокарты
-                  выбирайте cpu — иначе обработка не запустится.
+                  {IS_MAC
+                    ? "Где считать: GPU Apple (Metal/mps) или CPU. На Apple Silicon mps ускоряет GigaAM в десятки раз — оставляйте его."
+                    : "Где считать: GPU (NVIDIA) или CPU. На машине без видеокарты выбирайте cpu — иначе обработка не запустится."}
                 </CardDescription>
               </div>
             </div>
@@ -283,8 +328,9 @@ export function SettingsScreen() {
                 <div className="mb-1.5 flex items-center gap-1.5">
                   <Label className="mb-0">Device</Label>
                   <HelpTip>
-                    cuda — GPU NVIDIA (нужны драйверы CUDA). cpu — работает
-                    везде, но в 10–30× медленнее.
+                    {IS_MAC
+                      ? "mps — GPU Apple (Metal), быстро на M1–M4. cpu — работает везде, но в разы медленнее."
+                      : "cuda — GPU NVIDIA (нужны драйверы CUDA). cpu — работает везде, но в 10–30× медленнее."}
                   </HelpTip>
                 </div>
                 <Select
@@ -408,6 +454,40 @@ export function SettingsScreen() {
               </dd>
             </dl>
           </Card>
+
+          {/* Опасная зона — полное удаление скачанных данных (только macOS: на Windows есть деинсталлятор) */}
+          {window.twitchCut.platform === "darwin" && <Card variant="surface" className="border-err/40 bg-err/5">
+            <div className="mb-4 flex items-start gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-err/10 text-err">
+                <Trash2 className="h-4 w-4" />
+              </div>
+              <div>
+                <CardTitle>Полное удаление данных</CardTitle>
+                <CardDescription>
+                  Удалит скачанные Python, модели распознавания и виртуальное
+                  окружение (~10 ГБ). Сама программа останется — её удаляют
+                  отдельно через системный деинсталлятор. При следующем запуске
+                  всё скачается заново.
+                </CardDescription>
+              </div>
+            </div>
+            <div className="flex items-center justify-between gap-4">
+              <p className="text-xs text-muted">
+                Пригодится перед удалением программы, чтобы не осталось «хвостов»
+                на диске, или чтобы переустановить окружение с нуля.
+              </p>
+              <Button
+                variant="destructive"
+                size="md"
+                onClick={wipeData}
+                disabled={wiping}
+                loading={wiping}
+                className="shrink-0"
+              >
+                <Trash2 className="h-4 w-4" /> Удалить всё
+              </Button>
+            </div>
+          </Card>}
 
           {/* Unknown keys — сырой JSON, чтобы не потерять фьючерные/скрытые поля */}
           {Object.keys(unknown).length > 0 && (

@@ -28,24 +28,36 @@ from ..cache import read_json, write_json
 from .media import build_media_response, resolve_and_authorize
 from .projects import list_projects as _list_projects_registry
 from .settings import (
+    SettingsValidationError,
     load_settings as _load_settings,
     logs_dir as _logs_dir,
     save_settings as _save_settings,
+    validate_settings as _validate_settings,
 )
 from .waveform import compute_waveform
 from .runner import (
+    run_detect_silence_job,
+    run_download_vod_job,
+    run_export_vegas_highlights_job,
     run_export_vegas_job,
     run_highlights_export_job,
     run_highlights_import_job,
     run_process_job,
+    run_render_highlights_job,
+    run_render_job,
 )
 from .schemas import (
     DecisionsPayload,
+    DetectSilenceRequest,
+    DownloadVodRequest,
+    ExportVegasHighlightsRequest,
     ExportVegasRequest,
     HighlightsExportRequest,
     HighlightsImportRequest,
     JobResponse,
     ProcessJobRequest,
+    RenderHighlightsRequest,
+    RenderRequest,
 )
 from .state import JobKind, JobStore
 
@@ -66,6 +78,70 @@ def _state_to_response(state) -> JobResponse:
         created_at=state.created_at,
         finished_at=state.finished_at,
     )
+
+
+def _authorize_data_path(path_str: str, *, must_exist: bool = True) -> Path:
+    """Авторизация путей data-эндпоинтов (/decisions, /transcript).
+
+    В отличие от /media (whitelist в JobStore), эти эндпоинты работают с
+    JSON-артефактами пайплайна. Легальны только пути, лежащие внутри:
+      - DATA_ROOT (work/ — туда пайплайн пишет прогоны сам), либо
+      - каталога любого зарегистрированного «недавнего» проекта.
+
+    Без этой проверки GET/PUT /decisions и GET /transcript были бы
+    произвольным чтением и записью любого файла на диске: сайт, открытый в
+    браузере пользователя, мог бы дёрнуть 127.0.0.1:PORT/decisions?path=...
+    и вычитать или перезаписать чужой файл (DNS-rebinding обходит loopback).
+
+    must_exist=False — для PUT: файл ещё может не существовать, проверяем
+    только что каталог назначения разрешён.
+    """
+    from ..config import DATA_ROOT
+    from .projects import registered_roots
+
+    p = Path(path_str).expanduser().resolve()
+    if must_exist and not p.exists():
+        raise HTTPException(status_code=404, detail=f"file not found: {p}")
+
+    allowed_roots = {DATA_ROOT.resolve()} | registered_roots()
+    if not any(root in p.parents or root == p for root in allowed_roots):
+        raise HTTPException(status_code=403, detail=f"path not authorized: {p}")
+    return p
+
+
+def _extract_vod_id(raw: str) -> str:
+    """Извлечь числовой Twitch VOD ID из URL или голого ID.
+
+    Дублирует `parseTwitchVodInput` во фронте (desktop/src/lib/twitch.ts), но
+    минимально: фронт уже провалидировал и мог прислать как полный URL, так и
+    голый ID. Клипы/каналы отсекаем — их TwitchDownloaderCLI так не качает.
+
+    Кидает ValueError с человекочитаемым текстом, если ID не извлекается.
+    """
+    import re
+    from urllib.parse import urlparse
+
+    s = (raw or "").strip()
+    if not s:
+        raise ValueError("Пустая ссылка на VOD.")
+
+    # Голый числовой ID.
+    if s.isdigit():
+        return s
+
+    # Пытаемся как URL (добавляем схему, если её нет).
+    parsed = urlparse(s if re.match(r"^https?://", s, re.I) else f"https://{s}")
+    host = (parsed.hostname or "").lower()
+    if not re.search(r"(^|\.)twitch\.tv$", host):
+        raise ValueError("Это не ссылка на Twitch. Ожидается twitch.tv/videos/<id>.")
+
+    m = re.match(r"^/videos/(\d+)/?$", parsed.path)
+    if not m:
+        raise ValueError(
+            "Не похоже на ссылку на VOD. Клипы и трансляции не поддерживаются — "
+            "нужна ссылка вида twitch.tv/videos/<id>."
+        )
+    return m.group(1)
 
 
 def create_app(
@@ -142,6 +218,100 @@ def create_app(
         )
         return _state_to_response(state)
 
+    @app.post("/jobs/render-highlights", response_model=JobResponse)
+    async def create_render_highlights_job(req: RenderHighlightsRequest):
+        # Вход (исходник) разрешаем сразу; выходные клипы whitelist'ит сам
+        # runner по завершении (их имена известны только после рендера).
+        app.state.store.allow_media(req.input_path)
+        state = _spawn(
+            JobKind.RENDER_HIGHLIGHTS,
+            lambda s: run_render_highlights_job(app.state.store, s, req),
+        )
+        return _state_to_response(state)
+
+    @app.post("/jobs/export-vegas-highlights", response_model=JobResponse)
+    async def create_export_vegas_highlights_job(req: ExportVegasHighlightsRequest):
+        state = _spawn(
+            JobKind.EXPORT_VEGAS_HIGHLIGHTS,
+            lambda s: run_export_vegas_highlights_job(app.state.store, s, req),
+        )
+        return _state_to_response(state)
+
+    @app.post("/jobs/detect-silence", response_model=JobResponse)
+    async def create_detect_silence_job(req: DetectSilenceRequest):
+        # Разрешаем читать это медиа через /media (Timeline будет
+        # накладывать найденные сегменты на дорожку).
+        app.state.store.allow_media(req.video_path)
+        state = _spawn(
+            JobKind.DETECT_SILENCE,
+            lambda s: run_detect_silence_job(app.state.store, s, req),
+        )
+        return _state_to_response(state)
+
+    @app.post("/jobs/render", response_model=JobResponse)
+    async def create_render_job(req: RenderRequest):
+        # Whitelist и вход (читаем), и выход (после рендера Timeline/плеер
+        # захочет его проиграть через /media).
+        app.state.store.allow_media(req.input_path, req.output_path)
+        state = _spawn(
+            JobKind.RENDER,
+            lambda s: run_render_job(app.state.store, s, req),
+        )
+        return _state_to_response(state)
+
+    # --- VOD download (Twitch) ----------------------------------------------
+
+    @app.get("/vod/info")
+    async def get_vod_info(url: str = Query(..., description="Twitch VOD URL или ID")):
+        """Метаданные VOD (title/длительность/качества) без скачивания.
+
+        Зовёт `TwitchDownloaderCLI info`. Быстрый вызов для превью-карточки —
+        фронт дебаунсит его на вводе ссылки. Если бинарник не найден или CLI
+        вернул ошибку — 4xx с человекочитаемым detail; фронт деградирует к
+        режиму «метаданные недоступны, скачать всё равно можно».
+        """
+        from ..tdcli import TdcliError, fetch_vod_info
+
+        try:
+            video_id = _extract_vod_id(url)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        try:
+            info = await asyncio.to_thread(fetch_vod_info, video_id)
+        except TdcliError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+        return info
+
+    @app.post("/jobs/download-vod", response_model=JobResponse)
+    async def create_download_vod_job(req: DownloadVodRequest):
+        """Запустить скачивание VOD. Прогресс/финал — через тот же WS, что и
+        остальные джобы. По завершении result.stream — путь к готовому mp4,
+        который можно сразу скормить в /jobs/process.
+        """
+        from .paths import suggested_workdir
+
+        try:
+            video_id = _extract_vod_id(req.url)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        # Резолвим workdir и имя выходного файла ЗДЕСЬ (не в runner'е), чтобы
+        # сразу вернуть предсказуемый путь и добавить его в whitelist. Имя
+        # файла — vod_<id>.mp4 внутри уникальной по минуте подпапки work/.
+        workdir = (
+            Path(req.workdir).expanduser()
+            if req.workdir
+            else suggested_workdir(f"vod_{video_id}")
+        )
+        output = workdir / f"vod_{video_id}.mp4"
+
+        state = _spawn(
+            JobKind.DOWNLOAD_VOD,
+            lambda s: run_download_vod_job(app.state.store, s, req, video_id, output),
+        )
+        return _state_to_response(state)
+
     # --- jobs: query --------------------------------------------------------
 
     @app.get("/jobs", response_model=list[JobResponse])
@@ -187,14 +357,12 @@ def create_app(
 
     @app.get("/decisions")
     async def read_decisions(path: str = Query(...)):
-        p = Path(path)
-        if not p.exists():
-            raise HTTPException(status_code=404, detail=f"decisions file not found: {p}")
+        p = _authorize_data_path(path)
         return JSONResponse(read_json(p))
 
     @app.put("/decisions")
     async def write_decisions_endpoint(path: str = Query(...), payload: DecisionsPayload = Body(...)):
-        p = Path(path)
+        p = _authorize_data_path(path, must_exist=False)
         p.parent.mkdir(parents=True, exist_ok=True)
         write_json(p, payload.decisions)
         # Регистрируем в реестре Recent Projects — покрывает случай, когда
@@ -259,12 +427,18 @@ def create_app(
     async def put_settings(payload: dict[str, Any] = Body(...)):
         """Полная перезапись settings.json тем, что прислал клиент.
 
-        Никакой валидации ключей — фронт сам знает свою схему, backend только
-        хранит. Merge не делаем: клиент присылает полный документ, включая
-        неизвестные ему поля из будущих версий (они приходили в GET и должны
-        уйти обратно as-is для round-trip).
+        Известные ключи валидируются по типу/диапазону (см.
+        `settings.validate_settings`), неизвестные сохраняются as-is для
+        round-trip полей из будущих версий. Валидация защищает от кривого
+        клиента и постороннего POST на localhost, способного записать в
+        settings.json значения не того типа и уронить старт приложения.
+        Merge не делаем: клиент присылает полный документ.
         """
-        _save_settings(payload)
+        try:
+            validated = _validate_settings(payload)
+        except SettingsValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        _save_settings(validated)
         return {"ok": True}
 
     @app.get("/settings/logs_dir")
@@ -294,10 +468,21 @@ def create_app(
 
     @app.get("/transcript")
     async def read_transcript(path: str = Query(...)):
-        p = Path(path)
-        if not p.exists():
-            raise HTTPException(status_code=404, detail=f"transcript file not found: {p}")
+        p = _authorize_data_path(path)
         return JSONResponse(read_json(p))
+
+    @app.get("/prompt")
+    async def get_prompt(n_highlights: int = Query(5, ge=1, le=50)):
+        """Готовый промпт для NotebookLM — фронт даёт кнопку «Скопировать промпт».
+
+        Тот же текст, что exporter кладёт в prompt.md пакета, но получить его
+        можно и без сборки пакета: пользователь копирует промпт, идёт в
+        NotebookLM (или любую другую LLM) и вставляет рядом с транскриптом.
+        n_highlights — сколько моментов просить (дефолт 5, как у экспортёра).
+        """
+        from ..llm.prompt import build_prompt
+
+        return {"prompt": build_prompt(n_highlights), "n_highlights": n_highlights}
 
     # --- waveform / media (Timeline screen) ---------------------------------
 
@@ -348,6 +533,28 @@ def create_app(
         allowed = app.state.store.allowed_media()
         resolved = resolve_and_authorize(path, allowed)
         return build_media_response(resolved, request.headers.get("range"))
+
+    @app.get("/thumbnail")
+    async def get_thumbnail(
+        path: str = Query(..., description="Абсолютный путь к записи стрима"),
+        w: int = Query(640, ge=160, le=1920, description="Ширина превью в px"),
+    ):
+        """JPEG-превью кадра записи для карточки проекта на Dashboard.
+
+        Кадр берётся на 10% обработанного диапазона (после интро) и кэшируется
+        по фингерпринту файла. Авторизация — только пути внутри зарегистрированных
+        проектов. Если исходник удалён/перемещён — 404, и фронт откатывается на
+        Film-плейсхолдер.
+        """
+        from fastapi.responses import FileResponse
+        from .thumbnail import generate_thumbnail
+
+        jpg = await asyncio.to_thread(generate_thumbnail, path, w)
+        return FileResponse(
+            jpg,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "private, max-age=86400"},
+        )
 
     # --- static (prod) ------------------------------------------------------
 

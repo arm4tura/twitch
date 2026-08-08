@@ -101,6 +101,7 @@ export function CommandPalette(props: CommandContext) {
       nav("job", "Прогресс", <Sparkles className="h-4 w-4" />, "⌘3", !props.hasActiveJob),
       nav("timeline", "Правка", <Film className="h-4 w-4" />, "⌘4", !props.hasDecisions),
       nav("export", "Экспорт", <Send className="h-4 w-4" />, "⌘5", !props.hasDecisions),
+      nav("clips", "AI Tiktok — клипы", <Sparkles className="h-4 w-4" />, "⌘6", !props.hasDecisions),
     ];
 
     if (props.onSave) {

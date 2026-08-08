@@ -388,8 +388,10 @@ def transcribe_audio(
         import whisperx  # type: ignore
     except ImportError as exc:
         raise RuntimeError(
-            "WhisperX не установлен. Установите зависимости из requirements.txt "
-            "или используйте --mock-transcript для smoke-теста."
+            "WhisperX не установлен. Установите зависимости из "
+            "requirements-gpu.txt (GPU) или requirements-mac.txt / "
+            "requirements-cpu-win.txt (CPU), либо используйте "
+            "--mock-transcript для smoke-теста."
         ) from exc
 
     logger.info(

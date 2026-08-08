@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -37,15 +38,57 @@ DATA_ROOT: Path = _resolve_data_root()
 MODELS_DIR: Path = (DATA_ROOT / "models").resolve()
 
 
+def _mps_available() -> bool:
+    """Есть ли рабочий Apple Metal (MPS) backend у torch.
+
+    Импорт torch тяжёлый — зовём эту функцию только на darwin и только когда
+    реально выбираем device (не на импорте модуля). Любая ошибка → False:
+    лучше тихо уехать на CPU, чем упасть на детекте.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        import torch
+
+        return bool(torch.backends.mps.is_available())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def default_device() -> str:
-    """Устройство по умолчанию. bootstrap выставляет TWITCH_CUT_CPU=1, если
-    NVIDIA GPU не найден, — тогда весь пайплайн едет на CPU без падений."""
-    return "cpu" if os.environ.get("TWITCH_CUT_CPU") == "1" else "cuda"
+    """Устройство по умолчанию.
+
+    Приоритет:
+      1. TWITCH_CUT_DEVICE — явный оверрайд (cuda|cpu|mps), уважаем как есть;
+      2. TWITCH_CUT_CPU=1 — bootstrap выставляет, если NVIDIA GPU не найден
+         (Windows/Linux без CUDA) → форсим CPU;
+      3. macOS с рабочим MPS → 'mps' (Apple Silicon, ускорение GigaAM);
+      4. иначе — 'cuda' (Windows/Linux с NVIDIA).
+
+    Важно: MPS реально ускоряет только GigaAM (torch-путь). whisperx/whispercpp
+    идут через ctranslate2, который MPS не умеет — для них PipelineConfig.validate
+    запретит mps, а вызывающий код должен откатиться на cpu.
+    """
+    override = os.environ.get("TWITCH_CUT_DEVICE")
+    if override:
+        return override
+    if os.environ.get("TWITCH_CUT_CPU") == "1":
+        return "cpu"
+    if _mps_available():
+        return "mps"
+    return "cuda"
 
 
 def default_compute_type() -> str:
     """compute_type для faster-whisper. На CPU float16 не поддерживается —
-    берём int8 (быстрее и работает); на GPU остаётся float16."""
+    берём int8 (быстрее и работает); на GPU остаётся float16.
+
+    На MPS этот параметр не используется (GigaAM не читает compute_type
+    faster-whisper), но держим валидное значение — float16, как на GPU."""
+    if os.environ.get("TWITCH_CUT_DEVICE") == "mps" or (
+        os.environ.get("TWITCH_CUT_CPU") != "1" and _mps_available()
+    ):
+        return "float16"
     return "int8" if os.environ.get("TWITCH_CUT_CPU") == "1" else "float16"
 
 
@@ -121,8 +164,9 @@ class PipelineConfig:
     transcriber: str = "gigaam"
     language: str = "ru"
     model: str = "large-v3"
-    device: str = "cuda"
-    compute_type: str = "float16"
+    # Авто-детект: cuda (NVIDIA) / mps (Apple Silicon) / cpu — см. default_device.
+    device: str = field(default_factory=default_device)
+    compute_type: str = field(default_factory=default_compute_type)
     batch_size: int = 16
     vad_filter: bool = True
     # 'pyannote' даёт более стабильные границы речи для длинных стримов;
@@ -169,9 +213,44 @@ class PipelineConfig:
     # сам whisper или наша обработка вокруг его таймингов.
     raw_mute: bool = False
 
+    def normalized(self) -> "PipelineConfig":
+        """Вернуть копию с device, приведённым под платформу и движок.
+
+        Вызывать ДО validate(). default_device() на маке возвращает 'mps' не
+        зная транскрайбера; если пользователь при этом выбрал whisperx/whispercpp
+        (которые MPS не умеют), молча откатываемся на 'cpu' с варнингом, а не
+        роняем job валидацией. Явный device='cuda' на маке тоже даунгрейдим —
+        CUDA на darwin нет. Датакласс frozen, поэтому возвращаем новый инстанс.
+        """
+        import dataclasses
+        import logging
+
+        log = logging.getLogger(__name__)
+        device = self.device
+        if device == "mps" and self.transcriber != "gigaam":
+            log.warning(
+                "device=mps не поддерживается транскрайбером %s → откат на cpu",
+                self.transcriber,
+            )
+            device = "cpu"
+        if device == "cuda" and sys.platform == "darwin":
+            log.warning("device=cuda недоступен на macOS → откат на cpu")
+            device = "cpu"
+        if device == self.device:
+            return self
+        return dataclasses.replace(self, device=device)
+
     def validate(self) -> None:
-        if self.device not in {"cuda", "cpu"}:
-            raise ValueError("device must be 'cuda' or 'cpu'")
+        if self.device not in {"cuda", "cpu", "mps"}:
+            raise ValueError("device must be 'cuda', 'cpu', or 'mps'")
+        # MPS (Apple Metal) ускоряет только torch-путь GigaAM. whisperx идёт
+        # через ctranslate2, whispercpp — через whisper-cli; ни тот, ни другой
+        # MPS не понимают. Ловим тут, чтобы не свалиться внутри загрузки модели.
+        if self.device == "mps" and self.transcriber != "gigaam":
+            raise ValueError(
+                f"device 'mps' поддерживается только для transcriber 'gigaam', "
+                f"а не '{self.transcriber}' — используйте 'cpu'"
+            )
         if self.compute_type not in {"float16", "float32", "int8"}:
             raise ValueError("compute_type must be float16, float32, or int8")
         if self.batch_size < 1:

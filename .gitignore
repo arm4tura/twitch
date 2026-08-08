@@ -25,6 +25,12 @@ yarn-error.log*
 !desktop/build/
 !desktop/build/**
 
+# TwitchDownloaderCLI бинарники бандлятся при сборке, но НЕ коммитятся
+# (большие, лицензия отдельная). Держим только структуру папок + README:
+# см. desktop/build/tdcli/README.md — куда класть бинарник под каждую платформу.
+desktop/build/tdcli/**/TwitchDownloaderCLI
+desktop/build/tdcli/**/TwitchDownloaderCLI.exe
+
 # ── Media (large binaries) ────────────────────────────────
 *.mp4
 *.mkv
@@ -50,14 +56,21 @@ backend/banwords.txt
 *.ggml
 
 # ── Job artifacts (keep folders, ignore contents) ─────────
-input/*
-!input/.gitkeep
-output/*
-!output/.gitkeep
 work/*
 !work/.gitkeep
 models/*
 !models/.gitkeep
+
+# Реестр «недавних проектов» (в dev DATA_ROOT = корень репо)
+projects.json
+
+# ── Vendored binaries (скачиваются в dev, не коммитятся) ───
+# TwitchDownloaderCLI + его лицензии кладутся сюда локально для dev-запуска
+# (см. desktop/build/tdcli/README.md). Большие и лицензированы отдельно.
+vendor/
+
+# ── Runtime cache ─────────────────────────────────────────
+cache/
 
 # ── OS / editor ───────────────────────────────────────────
 .DS_Store

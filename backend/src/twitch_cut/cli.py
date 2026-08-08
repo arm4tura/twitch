@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -15,20 +15,17 @@ from .config import DEFAULT_ASR_OPTIONS, PipelineConfig, configure_hf_cache
 
 configure_hf_cache()
 
-from .cache import file_content_hash, read_json, stable_hash, write_json  # noqa: E402
-from .decisions import build_decisions, write_decisions  # noqa: E402
-from .ffmpeg_tools import extract_audio_range, probe_media_duration  # noqa: E402
+from .cache import file_content_hash, read_json, write_json  # noqa: E402
 from .llm.exporter import build_notebooklm_package  # noqa: E402
-from .llm.importer import MergeError, merge_into_decisions, parse_response  # noqa: E402
+from .llm.importer import MergeError, merge_into_decisions, parse_text  # noqa: E402
 from .logging_setup import setup_logging  # noqa: E402
-from .profanity import ProfanityMatch, RussianNormalizer, detect_profanity, load_banwords  # noqa: E402
-from .timecode import TimeSpan, parse_timecode  # noqa: E402
-from .transcription import load_mock_transcript, transcribe_audio  # noqa: E402
+from .pipeline import run_transcription_pipeline  # noqa: E402
+from .silence import add_padding, detect_silence_ffmpeg, merge_close_segments  # noqa: E402
 from .vegas_export import VegasExportError, exportable_mutes, write_vegas_script  # noqa: E402
-from .whisper_cpp import WhisperCppError, transcribe_with_whisper_cpp  # noqa: E402
+from .whisper_cpp import WhisperCppError  # noqa: E402
 
 app = typer.Typer(
-    help="CLI-ядро Фазы 1: stream → WhisperX → мат → decisions.json → Vegas .cs",
+    help="CLI-ядро Фазы 1: stream → ASR → мат → decisions.json → Vegas .cs",
     no_args_is_help=True,
 )
 console = Console()
@@ -39,44 +36,20 @@ def main() -> None:
     """Phase 1 command group."""
 
 
-def _load_detection_cache(path: Path) -> list[ProfanityMatch]:
-    payload = read_json(path)
-    return [ProfanityMatch(**item) for item in payload["matches"]]
-
-
-def _write_detection_cache(path: Path, key: str, matches: list[ProfanityMatch]) -> None:
-    write_json(
-        path,
-        {
-            "stage": "profanity_detection",
-            "key": key,
-            "matches": [asdict(match) for match in matches],
-        },
-    )
-
-
-def _resolve_range(stream: Path, range_in: Optional[str], range_out: Optional[str]) -> tuple[TimeSpan, TimeSpan]:
-    start = parse_timecode(range_in) if range_in else TimeSpan(0)
-    end = parse_timecode(range_out) if range_out else probe_media_duration(stream)
-    if end <= start:
-        raise typer.BadParameter("--range-out должен быть больше --range-in")
-    return start, end
-
-
 @app.command()
 def process(
     stream: Path = typer.Option(..., exists=True, file_okay=True, dir_okay=False, help="Исходный stream.mp4"),
-    original: Path = typer.Option(..., exists=True, file_okay=True, dir_okay=False, help="Оригинальное видео реакции"),
+    original: Optional[Path] = typer.Option(None, exists=True, file_okay=True, dir_okay=False, help="Оригинальное видео реакции; если не указано — сам stream"),
     range_in: Optional[str] = typer.Option(None, "--range-in", help="Начало обработки в исходном stream.mp4; если не указано, 00:00:00"),
     range_out: Optional[str] = typer.Option(None, "--range-out", help="Конец обработки в исходном stream.mp4; если не указано, конец видео"),
-    banwords: Path = typer.Option(..., exists=True, file_okay=True, dir_okay=False, help="Словарь мата/банвордов"),
-    workdir: Path = typer.Option(Path("work/job_001"), help="Рабочая папка cache/checkpoints"),
-    decisions: Path = typer.Option(Path("output/decisions.json"), help="Куда записать decisions.json"),
-    vegas: Path = typer.Option(Path("output/vegas_build.cs"), help="Куда записать Vegas C# script"),
+    banwords: Optional[Path] = typer.Option(None, exists=True, file_okay=True, dir_okay=False, help="Словарь мата/банвордов; если не указано — встроенный словарь"),
+    workdir: Optional[Path] = typer.Option(None, help="Рабочая папка cache/checkpoints; если не указано — уникальная папка в work/"),
+    decisions: Optional[Path] = typer.Option(None, help="Куда записать decisions.json; если не указано — в workdir"),
+    vegas: Optional[Path] = typer.Option(None, help="Куда записать Vegas C# script; если не указано — в workdir"),
     model: str = typer.Option("large-v3", help="WhisperX/faster-whisper model"),
     language: str = typer.Option("ru", help="Язык транскрипции"),
-    device: str = typer.Option("cuda", help="cuda или cpu"),
-    compute_type: str = typer.Option("float16", help="float16, float32 или int8"),
+    device: Optional[str] = typer.Option(None, help="cuda или cpu; если не указано — авто-детект (CPU без NVIDIA)"),
+    compute_type: Optional[str] = typer.Option(None, help="float16, float32 или int8; если не указано — авто (int8 на CPU, float16 на GPU)"),
     batch_size: int = typer.Option(16, min=1, help="WhisperX batch size"),
     vad_filter: bool = typer.Option(True, help="Включить VAD внутри faster-whisper/WhisperX"),
     vad_method: str = typer.Option(
@@ -96,9 +69,18 @@ def process(
         ),
     ),
     transcriber: str = typer.Option(
-        "whisperx",
+        "gigaam",
         "--transcriber",
-        help="Backend транскрипции: 'whisperx' (default, PyTorch+CUDA) или 'whispercpp' (subprocess whisper-cli.exe)",
+        help=(
+            "Backend транскрипции: 'gigaam' (default, GigaAM v3 — точнее по русскому мату, "
+            "не тянет CTranslate2/cuDNN), 'whisperx' (PyTorch+CUDA) или "
+            "'whispercpp' (subprocess whisper-cli.exe)"
+        ),
+    ),
+    gigaam_model: str = typer.Option(
+        "v3_ctc",
+        "--gigaam-model",
+        help="Модель GigaAM при --transcriber gigaam (например 'v3_ctc').",
     ),
     whisper_cpp_bin: Optional[Path] = typer.Option(
         None,
@@ -146,26 +128,93 @@ def process(
         help="Диагностический режим: мьютить СТРОГО по таймингам whisper для каждого банворда (без padding, без склейки, без extend, без cap). Покажет, что выдаёт whisper без нашей обработки.",
     ),
     force_extract: bool = typer.Option(False, help="Пересоздать WAV extraction"),
-    force_transcribe: bool = typer.Option(False, help="Пересоздать WhisperX transcript cache"),
+    force_transcribe: bool = typer.Option(False, help="Пересоздать transcript cache"),
     force_detect: bool = typer.Option(False, help="Пересоздать cache детекции мата"),
+    auto_silence: bool = typer.Option(
+        False,
+        "--auto-silence",
+        help=(
+            "После детекта мата прогнать ffmpeg silencedetect по извлечённому "
+            "аудио и записать найденную тишину в decisions.json (status=accepted). "
+            "Аналог кнопки «Найти тишину» в UI — экономит ручной проход по таймлайну."
+        ),
+    ),
+    silence_threshold_db: float = typer.Option(
+        -30.0,
+        "--silence-threshold-db",
+        help="Порог тишины в dBFS (всё ниже — тишина). Только при --auto-silence.",
+    ),
+    silence_min_duration: float = typer.Option(
+        0.5,
+        "--silence-min-duration",
+        min=0.1,
+        help="Мин. длительность сегмента тишины (сек). Только при --auto-silence.",
+    ),
+    silence_merge_gap: float = typer.Option(
+        0.5,
+        "--silence-merge-gap",
+        min=0.0,
+        help="Склеивать сегменты тишины с зазором ≤ N сек. Только при --auto-silence.",
+    ),
+    silence_padding: float = typer.Option(
+        0.1,
+        "--silence-padding",
+        min=0.0,
+        help="Padding до/после каждого сегмента тишины (сек). Только при --auto-silence.",
+    ),
     mock_transcript: Optional[Path] = typer.Option(None, exists=True, file_okay=True, dir_okay=False, help="JSON transcript для smoke-теста без WhisperX"),
     verbose: bool = typer.Option(False, help="Подробный лог"),
 ) -> None:
     """Run Phase 1 pipeline and generate editable decisions + Vegas audio mutes."""
 
+    # Резолвим дефолты «простого режима» тем же кодом, что и HTTP-runner
+    # (server/paths.py), чтобы CLI и UI не расходились: workdir → уникальная
+    # папка в work/, original → сам stream, banwords → встроенный словарь,
+    # device/compute_type → авто-детект (CPU без NVIDIA).
+    from .server.paths import resolve_job_defaults
+
+    d = resolve_job_defaults(
+        stream=stream,
+        original=original,
+        banwords=banwords,
+        workdir=workdir,
+        decisions=decisions,
+        vegas=vegas,
+        device=device,
+        compute_type=compute_type,
+    )
+    workdir = d.workdir
+    original = d.original
+    banwords = d.banwords
+    decisions = d.decisions
+    vegas = d.vegas
+    device = d.device
+    compute_type = d.compute_type
+
     workdir.mkdir(parents=True, exist_ok=True)
     setup_logging(workdir, verbose=verbose)
+
+    # whispercpp требует явный путь к модели — ловим до старта пайплайна,
+    # чтобы дать понятный param_hint вместо падения в середине.
+    if transcriber == "whispercpp" and whisper_cpp_model is None:
+        raise typer.BadParameter(
+            "--whisper-cpp-model обязателен при --transcriber whispercpp",
+            param_hint="--whisper-cpp-model",
+        )
 
     # Anti-hallucination профиль faster-whisper (см. config.DEFAULT_ASR_OPTIONS).
     # По умолчанию включён — без него Whisper на длинных стримах галлюцинирует
     # и сжимает тайминги на 5+ секунд, теряя целые фразы (regression fix для
     # detection_2b4b1a5c89ffaa3a). Флаг --disable-asr-hardening возвращает
-    # старое поведение для сравнения/отладки.
-    asr_options: dict[str, object] | None = (
-        None if disable_asr_hardening else dict(DEFAULT_ASR_OPTIONS)
+    # старое поведение для сравнения/отладки. Для gigaam/whispercpp профиль
+    # не применяется (это опции faster-whisper), но хранить его в config
+    # безвредно.
+    asr_options: dict[str, object] = (
+        {} if disable_asr_hardening else dict(DEFAULT_ASR_OPTIONS)
     )
 
     config = PipelineConfig(
+        transcriber=transcriber,
         language=language,
         model=model,
         device=device,
@@ -173,133 +222,139 @@ def process(
         batch_size=batch_size,
         vad_filter=vad_filter,
         vad_method=vad_method,
-        asr_options=asr_options or {},
+        asr_options=asr_options,
         mute_padding_before_ms=mute_padding_before_ms,
         mute_padding_after_ms=mute_padding_after_ms,
         mute_extend_mode=mute_extend_mode,
         mute_max_seconds=mute_max_seconds,
         mute_join_gap_ms=mute_join_gap_ms,
-        transcriber=transcriber,
         raw_mute=raw_mute,
     )
-    config.validate()
+    # config.validate() кидает ValueError на неизвестном движке/параметре —
+    # переводим в typer.BadParameter для человекочитаемого CLI-вывода.
+    # normalized() до этого мягко чинит mps/cuda под платформу и движок.
+    config = config.normalized()
+    try:
+        config.validate()
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
-    start, end = _resolve_range(stream, range_in, range_out)
+    console.rule("[bold cyan]Фаза 1: stream -> Vegas audio mutes")
+    console.print(f"Движок: [bold]{transcriber}[/bold]")
 
-    console.rule("[bold cyan]Фаза 1: stream → Vegas audio mutes")
-    console.print(f"Диапазон: [bold]{start.format()} → {end.format()}[/bold]")
+    extra_args = whisper_cpp_extra.split() if whisper_cpp_extra else None
 
-    if transcriber not in {"whisperx", "whispercpp"}:
-        raise typer.BadParameter("--transcriber должен быть 'whisperx' или 'whispercpp'")
-    if transcriber == "whispercpp" and whisper_cpp_model is None:
-        raise typer.BadParameter(
-            "--whisper-cpp-model обязателен при --transcriber whispercpp",
-            param_hint="--whisper-cpp-model",
+    try:
+        result = run_transcription_pipeline(
+            stream=stream,
+            original=original,
+            banwords=banwords,
+            workdir=workdir,
+            decisions_out=decisions,
+            vegas_out=vegas,
+            config=config,
+            range_in=range_in,
+            range_out=range_out,
+            gigaam_model=gigaam_model,
+            whisper_cpp_bin=whisper_cpp_bin,
+            whisper_cpp_model=whisper_cpp_model,
+            whisper_cpp_threads=whisper_cpp_threads or None,
+            whisper_cpp_extra=extra_args,
+            mock_transcript=mock_transcript,
+            force_extract=force_extract,
+            force_transcribe=force_transcribe,
+            force_detect=force_detect,
+            progress=lambda stage, pct, msg="": logger.info("[%s %.0f%%] %s", stage, pct, msg),
         )
+    except WhisperCppError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--transcriber") from exc
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
-    audio_path = None
-    audio_key = "mock"
-    if mock_transcript is None:
-        audio_path, audio_key = extract_audio_range(stream, start, end, workdir, force=force_extract)
-        if transcriber == "whisperx":
-            transcript, transcript_key, transcript_cache = transcribe_audio(
-                audio_path=audio_path,
-                workdir=workdir,
-                model_name=model,
-                language=language,
-                device=device,
-                compute_type=compute_type,
-                batch_size=batch_size,
-                vad_filter=vad_filter,
-                vad_method=vad_method,
-                asr_options=asr_options,
-                force=force_transcribe,
-            )
-        else:
-            extra_args = whisper_cpp_extra.split() if whisper_cpp_extra else []
-            threads_arg: Optional[int] = whisper_cpp_threads or None
-            try:
-                transcript, transcript_key, transcript_cache = transcribe_with_whisper_cpp(
-                    audio_path=audio_path,
-                    workdir=workdir,
-                    binary=whisper_cpp_bin,
-                    model_path=whisper_cpp_model,
-                    language=language,
-                    threads=threads_arg,
-                    extra_args=extra_args,
-                    force=force_transcribe,
-                )
-            except WhisperCppError as exc:
-                raise typer.BadParameter(str(exc), param_hint="--transcriber") from exc
-    else:
-        logger.info("Использую mock transcript: %s", mock_transcript)
-        transcript = load_mock_transcript(mock_transcript)
-        transcript_key = stable_hash(
-            {
-                "stage": "mock_transcript",
-                "path": str(mock_transcript.resolve()),
-                "content": file_content_hash(mock_transcript),
-            }
+    if auto_silence:
+        _run_auto_silence(
+            decisions_path=Path(result["decisions_path"]),
+            threshold_db=silence_threshold_db,
+            min_duration=silence_min_duration,
+            merge_gap=silence_merge_gap,
+            padding=silence_padding,
         )
-        transcript_cache = mock_transcript
-
-    detection_key = stable_hash(
-        {
-            "stage": "profanity_detection",
-            "transcript_key": transcript_key,
-            "banwords": {
-                "path": str(banwords.resolve()),
-                "content": file_content_hash(banwords),
-            },
-            "range_in_ms": start.ms,
-            "range_out_ms": end.ms,
-            "normalization": "lowercase+yo+pymorphy3",
-        }
-    )
-    detection_cache = workdir / "cache" / f"detection_{detection_key}.json"
-
-    if detection_cache.exists() and not force_detect:
-        logger.info("Детекция мата уже есть в cache: %s", detection_cache)
-        matches = _load_detection_cache(detection_cache)
-    else:
-        normalizer = RussianNormalizer()
-        entries = load_banwords(banwords, normalizer=normalizer)
-        logger.info("Загружено banwords: %s", len(entries))
-        matches = detect_profanity(transcript, entries, start, normalizer=normalizer)
-        _write_detection_cache(detection_cache, detection_key, matches)
-
-    logger.info("Найдено mute-маркеров: %s", len(matches))
-
-    decisions_doc = build_decisions(
-        stream_path=stream,
-        original_path=original,
-        range_in=start,
-        range_out=end,
-        matches=matches,
-        config=config,
-        transcript_cache=transcript_cache,
-        audio_cache=audio_path,
-    )
-    decisions_doc["caches"]["audio_key"] = audio_key
-    decisions_doc["caches"]["transcript_key"] = transcript_key
-    decisions_doc["caches"]["detection"] = str(detection_cache)
-    decisions_doc["caches"]["detection_key"] = detection_key
-
-    write_decisions(decisions, decisions_doc)
-    write_vegas_script(vegas, decisions_doc)
 
     console.print("\n[green]Готово.[/green]")
-    console.print(f"decisions.json: [bold]{decisions}[/bold]")
-    console.print(f"Vegas script:    [bold]{vegas}[/bold]")
-    console.print(f"Mute markers:    [bold]{len(matches)}[/bold]")
+    console.print(f"decisions.json: [bold]{result['decisions_path']}[/bold]")
+    console.print(f"Vegas script:    [bold]{result['vegas_path']}[/bold]")
+    console.print(f"Mute markers:    [bold]{result['mutes_count']}[/bold]")
+
+
+def _run_auto_silence(
+    decisions_path: Path,
+    threshold_db: float,
+    min_duration: float,
+    merge_gap: float,
+    padding: float,
+) -> None:
+    """Детект тишины после основного пайплайна и запись в decisions.json.
+
+    Мирроит серверный `_run_detect_silence_sync` и фронтовый контракт
+    SilenceRecord: {id, start, end, status}. Аудио берётся из уже извлечённого
+    кэша (`caches.audio` в decisions.json) — те же audio-секунды, что и waveform,
+    поэтому конвертации координат не нужно. Все найденные сегменты пишутся со
+    status="accepted" (по умолчанию вырезаются; ревьюер снимет лишнее в «Правке»).
+    """
+    doc = read_json(decisions_path)
+    audio_ref = (doc.get("caches") or {}).get("audio")
+    if not audio_ref:
+        console.print(
+            _fmt_warn(
+                "auto-silence пропущен: в decisions.json нет caches.audio "
+                "(извлечённого аудио)."
+            )
+        )
+        return
+
+    audio_path = Path(audio_ref)
+    if not audio_path.exists():
+        console.print(
+            _fmt_warn(f"auto-silence пропущен: аудио не найдено — {audio_path}")
+        )
+        return
+
+    segments = detect_silence_ffmpeg(
+        audio_path,
+        threshold_db=threshold_db,
+        min_duration=min_duration,
+    )
+    if segments:
+        segments = merge_close_segments(segments, gap_threshold=merge_gap)
+        segments = add_padding(segments, padding_before=padding, padding_after=padding)
+
+    doc["silences"] = [
+        {
+            "id": f"silence_auto_{round(s * 1000)}",
+            "start": s,
+            "end": e,
+            "status": "accepted",
+        }
+        for s, e in segments
+    ]
+    write_json(decisions_path, doc)
+
+    console.print(
+        _fmt_ok(f"auto-silence: найдено сегментов тишины — {len(segments)}")
+    )
 
 
 @app.command("export")
 def export_decisions(
     decisions: Path = typer.Option(..., exists=True, file_okay=True, dir_okay=False, help="Отредактированный decisions.json"),
-    vegas: Path = typer.Option(Path("output/vegas_build.cs"), help="Куда записать Vegas C# script"),
+    vegas: Optional[Path] = typer.Option(None, help="Куда записать Vegas C# script; если не указано — mutes.cs рядом с decisions.json"),
 ) -> None:
     """Regenerate a Vegas script from an edited decisions.json."""
+
+    # Дефолт — рядом с decisions.json (это workdir прогона), как в основном
+    # пайплайне (<workdir>/mutes.cs). Не тянем стухший относительный output/.
+    if vegas is None:
+        vegas = decisions.parent / "mutes.cs"
 
     decisions_doc = read_json(decisions)
     try:
@@ -386,10 +441,24 @@ def doctor() -> None:
                 _fmt_ok(f"torch {torch_ver}, CUDA {cuda_ver}, GPU: {gpu_name} ({vram_gb:.1f} GB)")
             )
         else:
+            # macOS с Apple Silicon: CUDA нет, но есть MPS (Metal) — он ускоряет
+            # GigaAM. Показываем OK, а не CPU-WARN: это полноценный ускоритель.
+            mps_avail = False
+            try:
+                mps_avail = bool(torch.backends.mps.is_available())
+            except Exception:  # noqa: BLE001
+                mps_avail = False
+            if mps_avail:
+                console.print(
+                    _fmt_ok(
+                        f"torch {torch_ver}, MPS (Apple Metal) доступен — "
+                        "ускорение GigaAM на Apple Silicon"
+                    )
+                )
             # Осознанный CPU-режим (нет NVIDIA GPU): bootstrap выставляет
             # TWITCH_CUT_CPU=1. Тогда отсутствие CUDA — не ошибка, а ожидаемо:
             # WARN вместо FAIL, чтобы doctor не считал это проблемой.
-            if os.environ.get("TWITCH_CUT_CPU") == "1":
+            elif os.environ.get("TWITCH_CUT_CPU") == "1":
                 console.print(
                     _fmt_warn(
                         f"torch {torch_ver} — CPU-режим (NVIDIA GPU не найден). "
@@ -621,17 +690,60 @@ def prefetch(
         raise typer.Exit(1) from exc
 
     # 2. Alignment (wav2vec2 для нужного языка).
-    try:
-        console.print(f"→ Скачиваю alignment-модель для '{language}' (~1 GB)...")
-        whisperx.load_align_model(language_code=language, device=device)
-        console.print(_fmt_ok(f"alignment ({language})"))
-    except Exception as exc:  # noqa: BLE001
-        console.print(_fmt_fail(f"alignment: {exc}"))
-        raise typer.Exit(1) from exc
+    #
+    # Alignment нужен ТОЛЬКО движку WhisperX (word-level тайминги). Движок по
+    # умолчанию — GigaAM, у него своя выдача, alignment ему не требуется.
+    # Поэтому сбой этой стадии НЕ должен ронять весь первый запуск (bootstrap):
+    # раньше `raise typer.Exit(1)` здесь блокировал установку целиком, даже
+    # пользователям на GigaAM. Делаем 3 попытки (HF временами отдаёт 5xx/таймаут
+    # на больших файлах), а если так и не встало — предупреждаем и продолжаем.
+    align_ok = False
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            suffix = "" if attempt == 1 else f" (попытка {attempt}/3)"
+            console.print(f"→ Скачиваю alignment-модель для '{language}' (~1 GB){suffix}...")
+            whisperx.load_align_model(language_code=language, device=device)
+            console.print(_fmt_ok(f"alignment ({language})"))
+            align_ok = True
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            console.print(_fmt_fail(f"alignment: {exc}"))
+            if attempt < 3:
+                time.sleep(2 * attempt)  # 2s, 4s — простой бэкофф
+
+    if not align_ok:
+        # Не Exit(1): alignment опционален (нужен только WhisperX). GigaAM
+        # (движок по умолчанию) и так закэширован выше — программа запустится.
+        console.print(
+            f"[yellow]![/yellow] alignment-модель ('{language}') не установилась "
+            f"({last_exc}).\n"
+            "  Это нужно только для движка WhisperX — GigaAM (по умолчанию) работает без неё.\n"
+            "  Программа запустится; alignment докачается при первом WhisperX-прогоне."
+        )
 
     # 3. pyannote VAD — грузится внутри whisperx.load_model выше, отдельно
     # предзагружать не нужно. Если бы понадобилось — pyannote.audio.Pipeline
     # требует HF token, а WhisperX использует форк без токена.
+
+    # 4. GigaAM v3 — движок распознавания ПО УМОЛЧАНИЮ. Раньше prefetch качал
+    # только WhisperX, и веса GigaAM (~1 GB) тянулись молча в середине первого
+    # прогона. Грузим модель на cpu (только чтобы скачать чекпоинт в models/),
+    # затем сразу отпускаем. Сбой не роняет установку — как и alignment,
+    # докачается при первом прогоне.
+    try:
+        console.print("→ Скачиваю GigaAM v3 (движок по умолчанию, ~1 GB)...")
+        from .gigaam_asr import _load_gigaam_model
+
+        _load_gigaam_model("v3_ctc", device="cpu")
+        console.print(_fmt_ok("GigaAM v3"))
+    except Exception as exc:  # noqa: BLE001
+        console.print(
+            f"[yellow]![/yellow] GigaAM не предзагрузился ({exc}).\n"
+            "  Веса докачаются при первом прогоне; если GigaAM не установлен — "
+            "переустановите окружение (кнопка «Повторить» в окне первого запуска)."
+        )
 
     console.print()
     console.print("[bold green]Готово.[/bold green] Модели закэшированы, первый прогон не будет скачивать.")
@@ -744,14 +856,21 @@ def highlights_import(
         )
 
     try:
-        hs = parse_response(
-            response, transcript_range_s=range_s, transcript_hash=transcript_hash,
+        hs, warnings = parse_text(
+            response.read_text(encoding="utf-8"),
+            transcript_range_s=range_s,
+            transcript_hash=transcript_hash,
         )
     except MergeError as exc:
         console.print("[red]Не могу смержить highlights:[/red]")
         for r in exc.reasons:
             console.print(f"  • {r}")
         raise typer.Exit(code=1)
+
+    if warnings:
+        console.print(f"[yellow]Отброшено {len(warnings)} highlight(s):[/yellow]")
+        for w in warnings:
+            console.print(f"  • {w}")
 
     merged = merge_into_decisions(decisions_doc, hs)
     write_json(output, merged)

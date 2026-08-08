@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 import sys
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
-PROJECT_ROOT = BACKEND_ROOT.parent
 SRC_ROOT = BACKEND_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
@@ -29,8 +29,10 @@ def main() -> None:
     matches = detect_profanity(transcript, banwords, range_in, normalizer=normalizer)
 
     decisions = build_decisions(
-        stream_path=PROJECT_ROOT / "input" / "stream.mp4",
-        original_path=PROJECT_ROOT / "input" / "original_video.mp4",
+        # Пути стрима — чисто символические: файлы не открываются, только
+        # пишутся в decisions.json. Реальный запуск подставляет настоящие пути.
+        stream_path=Path("stream.mp4"),
+        original_path=Path("original_video.mp4"),
         range_in=range_in,
         range_out=range_out,
         matches=matches,
@@ -39,7 +41,9 @@ def main() -> None:
         audio_cache=None,
     )
 
-    output_dir = PROJECT_ROOT / "output"
+    # Пишем во временную папку — smoke-тест не должен зависеть от наличия
+    # каких-либо каталогов в репо (input/·output/ убраны как фиктивные).
+    output_dir = Path(tempfile.mkdtemp(prefix="twitch_cut_smoke_"))
     write_decisions(output_dir / "smoke_decisions.json", decisions)
     write_vegas_script(output_dir / "smoke_vegas_build.cs", decisions)
 

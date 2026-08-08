@@ -1,16 +1,27 @@
-name: Build desktop (Windows)
+name: Build desktop (Windows + macOS)
 
-# Собирает Windows-установщик Twitch Cut и публикует его в GitHub Releases.
+# Собирает десктоп-сборки Twitch Cut под Windows и macOS и публикует их в один
+# и тот же GitHub Release.
 #
 # Триггеры:
 #   - push тега вида v* (напр. vX.Y.Z) — собирает и публикует релиз;
-#   - ручной запуск (workflow_dispatch) — собирает артефакт БЕЗ публикации,
+#   - ручной запуск (workflow_dispatch) — собирает артефакты БЕЗ публикации,
 #     удобно проверить сборку, не создавая релиз.
 #
 # Публикация идёт через electron-builder --publish, который читает секцию
 # build.publish (github / arm4tura / twitch) из desktop/package.json и заливает
-# `Twitch Cut Setup <version>.exe` + latest.yml (для автообновления) в релиз,
-# соответствующий тегу. Токен — штатный GITHUB_TOKEN, отдельных секретов не надо.
+# артефакты в релиз, соответствующий тегу. Токен — штатный GITHUB_TOKEN,
+# отдельных секретов не надо.
+#   - Windows: `Twitch Cut Setup <version>.exe` + latest.yml
+#   - macOS:   `Twitch Cut-<version>-{arm64,x64}.dmg` + *.zip + latest-mac.yml
+#     (.zip нужен электрон-апдейтеру для автообновления на macOS).
+#
+# ВНИМАНИЕ (macOS): сборка НЕ подписана и НЕ нотаризована (build.mac.notarize
+# = false, сертификатов в secrets нет). DMG соберётся и запустится, но у
+# пользователя будет предупреждение Gatekeeper — первый запуск через
+# ПКМ → «Открыть». Для «чистого» распространения нужен Apple Developer ID
+# (CSC_LINK / CSC_KEY_PASSWORD + APPLE_ID/APPLE_APP_SPECIFIC_PASSWORD/TEAM_ID
+# в secrets и notarize: true). Пока — неподписанный билд.
 
 on:
   push:
@@ -63,4 +74,47 @@ jobs:
           path: |
             desktop/release/*.exe
             desktop/release/latest.yml
+          if-no-files-found: error
+
+  build-macos:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: desktop
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # На теге собираем dmg+zip под обе арки (arm64 + x64) и публикуем в тот же
+      # релиз. electron-builder дописывает файлы к уже существующему релизу тега,
+      # так что windows- и macos-джобы мирно кладут артефакты рядом.
+      - name: Build & publish dmg (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: npm run build && npx electron-builder --mac --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build dmg only (manual run)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: npm run build && npx electron-builder --mac --publish never
+
+      - name: Upload dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: twitch-cut-macos-dmg
+          path: |
+            desktop/release/*.dmg
+            desktop/release/*.zip
+            desktop/release/latest-mac.yml
           if-no-files-found: error

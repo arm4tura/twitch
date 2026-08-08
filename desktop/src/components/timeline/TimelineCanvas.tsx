@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { cn } from "../../lib/cn";
 
 /**
@@ -23,7 +23,8 @@ export interface TimelineBlock {
   id: string;
   start: number; // audio-сек
   end: number; // audio-сек
-  active: boolean; // accepted → красный; иначе приглушённый (оставлен)
+  /** Состояние маркера: 'silence' (красный) | 'keep' (серый) | 'review' (янтарный пунктир) */
+  state: 'silence' | 'keep' | 'review';
   selected: boolean;
 }
 
@@ -37,7 +38,12 @@ export interface TimelineCanvasProps {
   durationS: number;
   blocks: TimelineBlock[];
   view: TimelineView;
-  currentS: number; // playhead, audio-сек
+  /**
+   * Живой плейхед (audio-сек) через ref — читается собственным rAF канваса и
+   * пишется прямо в DOM линии, БЕЗ ре-рендера React. Так волна/блоки не
+   * реконсилятся 60 раз/сек во время воспроизведения (главный источник лагов).
+   */
+  currentRef: React.MutableRefObject<number>;
   onViewChange: (view: TimelineView) => void;
   onSeek: (audioT: number) => void;
   onSelect: (id: string) => void;
@@ -57,7 +63,6 @@ const HANDLE_HIT = 12; // ширина зоны захвата края, vb-ед
 const HANDLE_VIS = 2; // видимая толщина края, vb-единицы
 const CLICK_SLOP = 0.01; // сдвиг меньше (сек) — трактуем как клик, а не драг
 const SCRUB_MS = 140; // порог между скраб-блипами по реальному времени, мс
-const ZOOM_STEP = 1.2; // множитель зума на «щелчок» колеса
 
 type DragMode = "start" | "end" | "body";
 interface DragState {
@@ -69,12 +74,12 @@ interface DragState {
   moved: boolean;
 }
 
-export function TimelineCanvas({
+function TimelineCanvasImpl({
   peaks,
   durationS,
   blocks,
   view,
-  currentS,
+  currentRef,
   onViewChange,
   onSeek,
   onSelect,
@@ -105,56 +110,113 @@ export function TimelineCanvas({
     [vStart, span]
   );
 
-  // Глобальный максимум пиков — нормируем высоту по нему, чтобы амплитуда была
-  // одинаковой на любом зуме (а не «раздувалась» под окно).
-  const maxPeak = useMemo(() => {
+  // Предрасчёт: |peaks| один раз + глобальный максимум. Раньше и то, и другое
+  // считалось на КАЖДОМ кадре зума внутри построения волны (Math.abs по всему
+  // массиву + аллокация slice) — на длинном стриме это и есть главный лаг.
+  // Теперь волна рисуется на <canvas> прямыми fillRect по этому массиву.
+  const { absPeaks, maxPeak } = useMemo(() => {
+    const arr = new Float32Array(peaks.length);
     let m = 0.0001;
-    for (const p of peaks) {
-      const v = Math.abs(p);
+    for (let i = 0; i < peaks.length; i++) {
+      const v = Math.abs(peaks[i]);
+      arr[i] = v;
       if (v > m) m = v;
     }
-    return m;
+    return { absPeaks: arr, maxPeak: m };
   }, [peaks]);
 
-  // Волна видимого окна как один залитый <path>. Ресэмпл до TARGET_BARS:
-  // max-в-bucket на плотных участках, линейная интерполяция на разреженных.
-  const wavePath = useMemo(() => {
-    if (!peaks.length) return "";
-    const i0 = Math.max(0, Math.floor((vStart / dur) * peaks.length));
-    const i1 = Math.min(peaks.length, Math.ceil((vEnd / dur) * peaks.length));
-    const slice: number[] = [];
-    for (let i = i0; i < i1; i++) slice.push(Math.abs(peaks[i]));
-    if (!slice.length) return "";
-    const cy = VBH / 2;
-    const barW = VBW / TARGET_BARS;
-    const half = barW * 0.4; // половина видимой ширины столбика
-    let d = "";
-    for (let i = 0; i < TARGET_BARS; i++) {
-      const p0 = (i / TARGET_BARS) * slice.length;
-      const p1 = ((i + 1) / TARGET_BARS) * slice.length;
+  // --- волна на <canvas> ----------------------------------------------------
+  // fillRect в цикле на порядок дешевле, чем строить ~50 KB SVG <path> и заново
+  // тесселировать его каждый кадр. Canvas 2D одинаков в Chromium на Mac и Windows.
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const canvasBoxRef = useRef<HTMLDivElement | null>(null);
+  const sizeRef = useRef({ w: 0, h: 0, dpr: 1 });
+
+  const drawWave = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const { w, h, dpr } = sizeRef.current;
+    if (w === 0 || h === 0) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    // Центральная ось.
+    ctx.fillStyle = "rgba(255,255,255,0.06)";
+    ctx.fillRect(0, h / 2 - 0.5, w, 1);
+    const n = absPeaks.length;
+    if (!n) return;
+    const ve = vStart + span;
+    const cy = h / 2;
+    const amp = h - 24 * (h / VBH); // тот же запас сверху/снизу, что был в SVG
+    const bars = Math.max(1, Math.min(TARGET_BARS, Math.floor(w)));
+    const barW = w / bars;
+    const barVis = Math.max(barW * 0.8, 1);
+    const off = (barW - barVis) / 2;
+    const i0f = (vStart / dur) * n;
+    const i1f = (ve / dur) * n;
+    const sliceLen = Math.max(i1f - i0f, 1);
+    // Один path из всех столбиков, одна заливка — заметно дешевле, чем fillRect
+    // на каждый бар. Цвет в rgba(): canvas 2D не парсит CSS-Color-4 «/ alpha».
+    ctx.beginPath();
+    for (let i = 0; i < bars; i++) {
+      const p0 = i0f + (i / bars) * sliceLen;
+      const p1 = i0f + ((i + 1) / bars) * sliceLen;
       const a = Math.floor(p0);
       const b = Math.ceil(p1);
       let v: number;
       if (b - a <= 1) {
         const f = p0 - a;
-        const v0 = slice[Math.min(a, slice.length - 1)] ?? 0;
-        const v1 = slice[Math.min(a + 1, slice.length - 1)] ?? v0;
+        const v0 = absPeaks[Math.max(0, Math.min(a, n - 1))] ?? 0;
+        const v1 = absPeaks[Math.max(0, Math.min(a + 1, n - 1))] ?? v0;
         v = v0 + (v1 - v0) * f;
       } else {
         let m = 0;
-        for (let j = a; j < b && j < slice.length; j++) if (slice[j] > m) m = slice[j];
+        for (let j = Math.max(0, a); j < b && j < n; j++) if (absPeaks[j] > m) m = absPeaks[j];
         v = m;
       }
-      const h = Math.max((v / maxPeak) * (VBH - 24), 1.2);
-      const cx = (i + 0.5) * barW;
-      const x0 = cx - half;
-      const x1 = cx + half;
-      const y0 = cy - h / 2;
-      const y1 = cy + h / 2;
-      d += `M${x0.toFixed(2)} ${y0.toFixed(2)}L${x1.toFixed(2)} ${y0.toFixed(2)}L${x1.toFixed(2)} ${y1.toFixed(2)}L${x0.toFixed(2)} ${y1.toFixed(2)}Z`;
+      const bh = Math.max((v / maxPeak) * amp, 1.2);
+      ctx.rect(i * barW + off, cy - bh / 2, barVis, bh);
     }
-    return d;
-  }, [peaks, vStart, vEnd, dur, maxPeak]);
+    ctx.fillStyle = "rgba(148,163,184,0.5)";
+    ctx.fill();
+  }, [absPeaks, maxPeak, dur, vStart, span]);
+
+  // Ресайз canvas под контейнер (DPR-aware) + перерисовка. RO создаём один раз:
+  // измерение и перерисовку зовём через ref, иначе смена drawWave на каждый
+  // зум-кадр пересоздавала бы ResizeObserver.
+  const measureAndDrawRef = useRef<() => void>(() => {});
+  measureAndDrawRef.current = () => {
+    const box = canvasBoxRef.current;
+    const canvas = canvasRef.current;
+    if (!box || !canvas) return;
+    const r = box.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = Math.max(1, Math.round(r.width));
+    const h = Math.max(1, Math.round(r.height));
+    const pxW = Math.round(w * dpr);
+    const pxH = Math.round(h * dpr);
+    if (canvas.width !== pxW || canvas.height !== pxH) {
+      canvas.width = pxW;
+      canvas.height = pxH;
+    }
+    sizeRef.current = { w, h, dpr };
+    drawWave();
+  };
+
+  useLayoutEffect(() => {
+    const box = canvasBoxRef.current;
+    if (!box) return;
+    measureAndDrawRef.current();
+    const ro = new ResizeObserver(() => measureAndDrawRef.current());
+    ro.observe(box);
+    return () => ro.disconnect();
+  }, []);
+
+  // Перерисовка при смене окна/данных (размер не трогаем — он уже верный).
+  useEffect(() => {
+    drawWave();
+  }, [drawWave]);
 
   // --- зум/пан колесом (native listener: React onWheel пассивный, не даёт
   // preventDefault). Читаем актуальные view/handler через refs. ---
@@ -208,19 +270,32 @@ export function TimelineCanvas({
       const ce = Math.max(cs + 0.001, Math.min(cur.end, durRef.current));
       const curSpan = ce - cs;
       const rect = el.getBoundingClientRect();
-      const isPan = e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY);
+      // Нормируем deltaY: в line-mode (обычная мышь) шаг ~3 строки, домножаем до
+      // пикселей, чтобы у мыши и тачпада была общая шкала «щелчка».
+      const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? rect.height || 400 : 1;
+      const dy = e.deltaY * unit;
+      const dx = e.deltaX * unit;
+      // macOS pinch-to-zoom на тачпаде приходит как wheel с ctrlKey=true.
+      const isPinch = e.ctrlKey;
+      const isPan = !isPinch && (e.shiftKey || Math.abs(dx) > Math.abs(dy));
       if (isPan) {
-        const raw = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+        const raw = Math.abs(dx) > Math.abs(dy) ? dx : dy;
         const delta = (raw / (rect.width || 1)) * curSpan;
         commitView(clampView(cs + delta, ce + delta));
-      } else {
-        const frac = rect.width ? Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) : 0.5;
-        const cursorT = cs + frac * curSpan;
-        const factor = e.deltaY > 0 ? ZOOM_STEP : 1 / ZOOM_STEP;
-        const newSpan = Math.max(MIN_SPAN, Math.min(curSpan * factor, durRef.current));
-        const ns = cursorT - frac * newSpan;
-        commitView(clampView(ns, ns + newSpan));
+        return;
       }
+      // Зум вокруг курсора. Величина ПРОПОРЦИОНАЛЬНА жесту (экспонента от dy),
+      // поэтому щипок/скролл тачпада плавные, а не прыгают фиксированным шагом.
+      // Для пинча коэффициент круче (жест короче), для колеса — мягче и
+      // ограничен по модулю, чтобы один щелчок мыши не проскакивал пол-стрима.
+      const frac = rect.width ? Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) : 0.5;
+      const cursorT = cs + frac * curSpan;
+      const k = isPinch ? 0.01 : 0.0025;
+      const exponent = Math.max(-0.7, Math.min(0.7, dy * k));
+      const factor = Math.exp(exponent);
+      const newSpan = Math.max(MIN_SPAN, Math.min(curSpan * factor, durRef.current));
+      const ns = cursorT - frac * newSpan;
+      commitView(clampView(ns, ns + newSpan));
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
@@ -306,39 +381,72 @@ export function TimelineCanvas({
     onSeek(eventTime(ev.clientX));
   };
 
-  const cy = VBH / 2;
-  const playheadX = timeToX(currentS);
-  const playheadVisible = currentS >= vStart && currentS <= vEnd;
+  // Самоанимирующийся плейхед: собственный rAF читает currentRef и пишет x/opacity
+  // прямо в DOM линии. React не участвует — волна и блоки не перерисовываются во
+  // время воспроизведения. vStart/span берём из свежего view через ref.
+  const playheadLineRef = useRef<SVGLineElement | null>(null);
+  const geomRef = useRef({ vStart, span });
+  geomRef.current = { vStart, span };
+  useEffect(() => {
+    let raf = 0;
+    let lastX = NaN;
+    let lastVis = -1;
+    const tick = () => {
+      const line = playheadLineRef.current;
+      if (line) {
+        const { vStart: gs, span: gsp } = geomRef.current;
+        const t = currentRef.current;
+        const x = ((t - gs) / gsp) * VBW;
+        const vis = t >= gs && t <= gs + gsp ? 1 : 0;
+        if (x !== lastX) {
+          line.setAttribute("x1", String(x));
+          line.setAttribute("x2", String(x));
+          lastX = x;
+        }
+        if (vis !== lastVis) {
+          line.style.opacity = vis ? "1" : "0";
+          lastVis = vis;
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [currentRef]);
 
   return (
-    <svg
-      ref={svgRef}
+    <div
+      ref={canvasBoxRef}
       className={cn(
-        "block h-full w-full touch-none select-none rounded-lg border border-white/8 bg-black/30",
+        "relative block h-full w-full overflow-hidden rounded-lg border border-white/8 bg-black/30",
         className
       )}
-      viewBox={`0 0 ${VBW} ${VBH}`}
-      preserveAspectRatio="none"
-      onPointerMove={onPointerMove}
-      onPointerUp={endDrag}
-      onPointerCancel={endDrag}
     >
-      {/* Фон для клика-перемотки (позади всего) */}
-      <rect
-        x={0}
-        y={0}
-        width={VBW}
-        height={VBH}
-        fill="transparent"
-        style={{ cursor: "text" }}
-        onClick={onBackgroundClick}
+      {/* Волна на canvas — под SVG-слоем взаимодействия */}
+      <canvas
+        ref={canvasRef}
+        className="pointer-events-none absolute inset-0 h-full w-full"
       />
-
-      {/* Центральная ось */}
-      <line x1={0} y1={cy} x2={VBW} y2={cy} stroke="rgb(255 255 255 / 0.06)" strokeWidth={1} />
-
-      {/* Волна одним path */}
-      {wavePath && <path d={wavePath} fill="rgb(148 163 184 / 0.5)" pointerEvents="none" />}
+      <svg
+        ref={svgRef}
+        data-timeline-surface
+        className="absolute inset-0 block h-full w-full touch-none select-none"
+        viewBox={`0 0 ${VBW} ${VBH}`}
+        preserveAspectRatio="none"
+        onPointerMove={onPointerMove}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+      >
+        {/* Фон для клика-перемотки (позади всего) */}
+        <rect
+          x={0}
+          y={0}
+          width={VBW}
+          height={VBH}
+          fill="transparent"
+          style={{ cursor: "text" }}
+          onClick={onBackgroundClick}
+        />
 
       {/* Блоки заглушек */}
       {blocks.map((b) => {
@@ -349,8 +457,24 @@ export function TimelineCanvas({
         const xs = timeToX(s);
         const xe = timeToX(e);
         const w = Math.max(xe - xs, 1);
-        const color = b.active ? "rgb(244 63 94)" : "rgb(148 163 184)";
-        const bodyOpacity = b.selected ? 0.28 : b.active ? 0.16 : 0.1;
+        // Три состояния маркера: silence=красный (заглушим), keep=серый
+        // (оставим), review=янтарный пунктир (ещё не проверено).
+        const color =
+          b.state === "silence"
+            ? "rgb(244 63 94)"
+            : b.state === "review"
+            ? "rgb(251 191 36)"
+            : "rgb(148 163 184)";
+        const bodyOpacity = b.selected
+          ? 0.28
+          : b.state === "silence"
+          ? 0.16
+          : b.state === "review"
+          ? 0.14
+          : 0.1;
+        // review рисуем пунктиром, чтобы «непроверенное» читалось даже на цвет-
+        // слепом мониторе; принятые/отклонённые — сплошной обводкой.
+        const dashed = b.state === "review";
         return (
           <g key={b.id}>
             {/* тело — тянуть целиком / клик выбрать */}
@@ -364,6 +488,7 @@ export function TimelineCanvas({
               stroke={color}
               strokeOpacity={b.selected ? 0.9 : 0.5}
               strokeWidth={b.selected ? 1.5 : 0.75}
+              strokeDasharray={dashed ? "4 3" : undefined}
               style={{ cursor: "grab" }}
               onPointerDown={(ev) => beginDrag(b, "body", ev)}
             />
@@ -381,18 +506,27 @@ export function TimelineCanvas({
         );
       })}
 
-      {/* Playhead */}
-      {playheadVisible && (
-        <line
-          x1={playheadX}
-          y1={0}
-          x2={playheadX}
-          y2={VBH}
-          stroke="rgb(244 244 245)"
-          strokeWidth={1.2}
-          pointerEvents="none"
-        />
-      )}
-    </svg>
+      {/* Playhead — координаты пишет rAF-цикл прямо в DOM (без ре-рендера) */}
+      <line
+        ref={playheadLineRef}
+        x1={0}
+        y1={0}
+        x2={0}
+        y2={VBH}
+        stroke="rgb(244 244 245)"
+        strokeWidth={1.2}
+        pointerEvents="none"
+        style={{ opacity: 0 }}
+      />
+      </svg>
+    </div>
   );
 }
+
+/**
+ * memo: экран правки перерисовывается на throttle-тик таймкода (~15 Гц) и на
+ * каждый setView. Волна/блоки зависят только от peaks/view/blocks — плейхед
+ * анимируется сам через ref. Мемо отсекает ре-рендеры, где сменился лишь
+ * currentAudioS у родителя.
+ */
+export const TimelineCanvas = memo(TimelineCanvasImpl);

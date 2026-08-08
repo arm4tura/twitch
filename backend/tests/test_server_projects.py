@@ -82,6 +82,33 @@ def test_list_projects_skips_missing(registry: Path, tmp_path: Path) -> None:
     assert out[0]["duration_ms"] == 60000
 
 
+def test_duration_ms_from_schema_1_1_timecodes(registry: Path, tmp_path: Path) -> None:
+    """Регрессия: реальный decisions.json (schema 1.1) хранит границы как
+    таймкоды-строки (range_in/range_out/local_duration), а НЕ как числовые
+    range_*_ms. Раньше _project_meta читал только *_ms → duration_ms всегда
+    был None для настоящих проектов в Dashboard."""
+    real = tmp_path / "real.json"
+    real.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.1",
+                "source": str(tmp_path / "stream.mp4"),
+                "range_in": "00:00:10.000",
+                "range_out": "00:05:10.000",
+                "local_duration": "00:05:00.000",
+                "mutes": [{"stream_start": 1.0, "stream_end": 1.5}],
+                "cuts": [],
+                "caches": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry.write_text(json.dumps({"paths": [str(real)]}), encoding="utf-8")
+    out = pj.list_projects()
+    assert len(out) == 1
+    assert out[0]["duration_ms"] == 300_000  # 5 минут
+
+
 def test_list_projects_empty_when_no_file(registry: Path) -> None:
     assert not registry.exists()
     assert pj.list_projects() == []
@@ -123,10 +150,12 @@ def test_list_projects_via_http(registry: Path, tmp_path: Path) -> None:
     assert item["highlights_count"] == 1
 
 
-def test_put_decisions_registers_project(registry: Path, tmp_path: Path) -> None:
+def test_put_decisions_registers_project(registry: Path, tmp_path: Path, monkeypatch) -> None:
     from fastapi.testclient import TestClient
     from twitch_cut.server.app import create_app
 
+    # PUT /decisions авторизует пути внутри DATA_ROOT; в тесте DATA_ROOT = tmp_path.
+    monkeypatch.setattr("twitch_cut.config.DATA_ROOT", tmp_path)
     p = tmp_path / "edited.json"
     client = TestClient(create_app())
     r = client.put(
@@ -136,3 +165,114 @@ def test_put_decisions_registers_project(registry: Path, tmp_path: Path) -> None
     assert r.status_code == 200
     data = json.loads(registry.read_text(encoding="utf-8"))
     assert data["paths"] == [str(p.resolve())]
+
+
+# --- deletion ----------------------------------------------------------------
+
+
+def test_unregister_only_keeps_files(registry: Path, tmp_path: Path) -> None:
+    """delete_files=False: запись уходит из реестра, файлы на диске остаются."""
+    proj = tmp_path / "work" / "stream_20260101_1200"
+    proj.mkdir(parents=True)
+    d = proj / "decisions.json"
+    _make_decisions(d)
+    pj.register_project(d)
+
+    res = pj.unregister_project(d, delete_files=False)
+    assert res["unregistered"] is True
+    assert res["deleted_dir"] is None
+    assert res["error"] is None
+    # Файл и папка на месте.
+    assert d.exists()
+    assert proj.exists()
+    # Реестр пуст.
+    assert pj.list_projects() == []
+
+
+def test_unregister_with_files_removes_dir(registry: Path, tmp_path: Path) -> None:
+    """delete_files=True: папка проекта (родитель decisions.json) удаляется."""
+    proj = tmp_path / "work" / "stream_20260101_1200"
+    (proj / "cache").mkdir(parents=True)
+    d = proj / "decisions.json"
+    _make_decisions(d)
+    (proj / "cache" / "audio.wav").write_bytes(b"\x00\x01")
+    pj.register_project(d)
+
+    res = pj.unregister_project(d, delete_files=True)
+    assert res["unregistered"] is True
+    assert res["deleted_dir"] == str(proj)
+    assert res["error"] is None
+    assert not proj.exists()
+    assert pj.list_projects() == []
+
+
+def test_unregister_missing_is_idempotent(registry: Path, tmp_path: Path) -> None:
+    """Удаление незарегистрированного пути не падает: unregistered=False."""
+    d = tmp_path / "never_registered.json"
+    _make_decisions(d)
+    res = pj.unregister_project(d, delete_files=False)
+    assert res["unregistered"] is False
+    assert res["deleted_dir"] is None
+    # Файл не трогали (delete_files=False).
+    assert d.exists()
+
+
+def test_unregister_refuses_home_dir(registry: Path, tmp_path: Path, monkeypatch) -> None:
+    """Защита: не rmtree'им домашний каталог, даже если decisions.json лежит
+    прямо в нём. Реестр всё равно чистим, но deleted_dir=None + error."""
+    # Прикидываем home = tmp_path, decisions.json лежит прямо в home.
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    d = tmp_path / "decisions.json"
+    _make_decisions(d)
+    pj.register_project(d)
+
+    res = pj.unregister_project(d, delete_files=True)
+    assert res["unregistered"] is True
+    assert res["deleted_dir"] is None
+    assert res["error"] is not None
+    # Домашний каталог и файл целы.
+    assert d.exists()
+
+
+def test_delete_project_via_http(registry: Path, tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+    from twitch_cut.server.app import create_app
+
+    proj = tmp_path / "work" / "stream_20260101_1200"
+    proj.mkdir(parents=True)
+    d = proj / "decisions.json"
+    _make_decisions(d)
+    pj.register_project(d)
+
+    client = TestClient(create_app())
+    r = client.delete(f"/projects?path={d}&delete_files=true")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["unregistered"] is True
+    assert body["deleted_dir"] == str(proj)
+    assert body["error"] is None
+    assert not proj.exists()
+    # Список после удаления пуст.
+    assert client.get("/projects").json() == []
+
+
+def test_delete_project_via_http_unregister_only(registry: Path, tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+    from twitch_cut.server.app import create_app
+
+    proj = tmp_path / "work" / "stream_20260101_1200"
+    proj.mkdir(parents=True)
+    d = proj / "decisions.json"
+    _make_decisions(d)
+    pj.register_project(d)
+
+    client = TestClient(create_app())
+    # delete_files по умолчанию False — не передаём флаг.
+    r = client.delete(f"/projects?path={d}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["unregistered"] is True
+    assert body["deleted_dir"] is None
+    assert d.exists()
+    assert proj.exists()
+    assert client.get("/projects").json() == []

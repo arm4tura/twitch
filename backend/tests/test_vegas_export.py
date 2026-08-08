@@ -1,10 +1,6 @@
 import pytest
 
-from twitch_cut.vegas_export import VegasExportError, csharp_string, exportable_mutes, generate_vegas_script
-
-
-def test_csharp_string_escapes_label():
-    assert csharp_string(r'a "quote" \ path') == r'"a \"quote\" \\ path"'
+from twitch_cut.vegas_export import VegasExportError, exportable_mutes, generate_vegas_script
 
 
 def test_generate_vegas_script_splits_and_zero_gains_and_groups():
@@ -29,28 +25,27 @@ def test_generate_vegas_script_splits_and_zero_gains_and_groups():
     assert "SilenceAudioRange(vegas, 64.220, 64.820);" in script
     # splitting is preserved (это и есть \"нарезать момент\")
     assert "Split(Timecode.FromSeconds" in script
-    # ключевое: gain=0, а не Mute=true. Проверяем что нет активного statement'а
-    # вида `<что-то>.Mute = true;` (комментарии с этим текстом допустимы —
-    # контр-пример в докстринге).
-    assert "audioEvent.Gain = 0f;" in script
-    assert "target.Mute = true;" not in script
+    # ключевое: тишина через FadeIn.Gain = 0 на среднем кусочке, а НЕ через
+    # TrackEvent.Mute = true (тот флаг мьютит весь клип). Проверяем, что нет
+    # активного statement'а `<что-то>.Mute = true;` (комментарии допустимы).
+    assert "ae.FadeIn.Gain = 0f;" in script
     for line in script.splitlines():
         code = line.split("//", 1)[0]
         assert ".Mute = true" not in code, f"unexpected Mute=true in code line: {line!r}"
-    # группировка треков после всех разрезов
-    assert "GroupAllTracks(vegas);" in script
-    assert "new TrackGroup()" in script
-    assert "vegas.Project.Groups.Add(group);" in script
-    assert "track.Group = group;" in script
+    # перегруппировка парных (аудио+видео) событий после всех разрезов
+    assert "RegroupPairs(vegas);" in script
+    assert "new TrackEventGroup()" in script
+    assert "vegas.Project.Groups.Add(g);" in script
 
 
 def test_generate_vegas_script_calls_group_even_with_no_mutes():
     # Пустой список мутов — всё равно грузим GroupAllTracks, иначе после
     # ре-запуска скрипта на уже-обработанном проекте группировка не восстановится.
     script = generate_vegas_script({"mutes": []})
-    # Определение хелпера в скрипте есть всегда; важно, что нет ВЫЗОВОВ.
+    # Определение хелпера в скрипте есть всегда; важно, что нет ВЫЗОВОВ
+    # SilenceAudioRange (нечего глушить), но RegroupPairs всё равно зовётся.
     assert "SilenceAudioRange(vegas," not in script
-    assert "GroupAllTracks(vegas);" in script
+    assert "RegroupPairs(vegas);" in script
 
 
 def test_exportable_mutes_skips_rejected_and_non_mute():

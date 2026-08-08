@@ -13,7 +13,11 @@ interface Progress {
   percent: number;
   detail?: string;
   gpu?: boolean;
+  accel?: "cuda" | "mps" | "cpu";
 }
+
+/** Последний известный ускоритель — чтобы стадии без accel не сбрасывали бейдж. */
+let lastAccel: "cuda" | "mps" | "cpu" | null = null;
 
 const $ = (id: string) => document.getElementById(id)!;
 const stageEl = $("stage");
@@ -23,17 +27,31 @@ const badgeEl = $("badge");
 const actionsEl = $("actions");
 const appEl = $("app");
 
+/** Убрать ANSI escape-коды (rich/tqdm) — иначе в detail видны хвосты `[2m…[0m`. */
+function stripAnsi(text: string): string {
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "");
+}
+
 function render(p: Progress): void {
   stageEl.textContent = p.label;
   barEl.style.width = `${Math.max(0, Math.min(100, p.percent))}%`;
-  detailEl.textContent = p.detail ?? "";
+  detailEl.textContent = p.detail ? stripAnsi(p.detail) : "";
 
-  // Бейдж GPU/CPU появляется после стадии детекта.
-  if (typeof p.gpu === "boolean") {
+  // Бейдж ускорителя. accel (cuda|mps|cpu) точнее булева gpu; для обратной
+  // совместимости выводим gpu→cuda/cpu, если accel не прислали. Бейдж «липкий»:
+  // раз показанный ускоритель не сбрасывается на стадиях без accel/gpu.
+  const accel: "cuda" | "mps" | "cpu" | null =
+    p.accel ?? (typeof p.gpu === "boolean" ? (p.gpu ? "cuda" : "cpu") : null);
+  if (accel) lastAccel = accel;
+
+  if (lastAccel) {
     badgeEl.style.display = "inline-block";
-    if (p.gpu) {
+    badgeEl.classList.remove("cpu");
+    if (lastAccel === "cuda") {
       badgeEl.textContent = "GPU (CUDA)";
-      badgeEl.classList.remove("cpu");
+    } else if (lastAccel === "mps") {
+      badgeEl.textContent = "GPU (Apple Metal)";
     } else {
       badgeEl.textContent = "CPU — медленнее";
       badgeEl.classList.add("cpu");

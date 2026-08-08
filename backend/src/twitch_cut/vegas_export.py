@@ -8,8 +8,6 @@ class VegasExportError(ValueError):
     """Raised when decisions.json cannot be exported to Vegas script."""
 
 
-def csharp_string(value: str) -> str:
-    return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n') + '"'
 
 
 def exportable_mutes(decisions: dict[str, Any]) -> list[dict[str, Any]]:
@@ -118,27 +116,20 @@ def generate_vegas_script(decisions: dict[str, Any]) -> str:
             "    private void RegroupPairs(Vegas vegas)",
             "    {",
             "        vegas.Project.Groups.Clear();",
-            "        foreach (Track t1 in vegas.Project.Tracks)",
+            "        var evs = new List<TrackEvent>();",
+            "        foreach (Track t in vegas.Project.Tracks)",
+            "            foreach (TrackEvent e in t.Events) evs.Add(e);",
+            "        evs.Sort((a, b) => a.Start.CompareTo(b.Start));",
+            "        for (int i = 0; i < evs.Count; i++)",
             "        {",
-            "            foreach (TrackEvent e1 in t1.Events)",
+            "            for (int j = i + 1; j < evs.Count; j++)",
             "            {",
-            "                foreach (Track t2 in vegas.Project.Tracks)",
-            "                {",
-            "                    if (t1 == t2) continue;",
-            "                    foreach (TrackEvent e2 in t2.Events)",
-            "                    {",
-            "                        // Если ивенты перекрываются более чем на 90%, считаем их парой",
-            "                        // Это спасает от ошибок округления времени",
-            "                        double startDiff = Math.Abs(e1.Start.ToMilliseconds() - e2.Start.ToMilliseconds());",
-            "                        if (startDiff < 10) ",
-            "                        {",
-            "                            TrackEventGroup g = new TrackEventGroup();",
-            "                            vegas.Project.Groups.Add(g);",
-            "                            g.Add(e1);",
-            "                            g.Add(e2);",
-            "                        }",
-            "                    }",
-            "                }",
+            "                if (evs[j].Start.ToMilliseconds() - evs[i].Start.ToMilliseconds() >= 10) break;",
+            "                if (evs[i].Track == evs[j].Track) continue;",
+            "                TrackEventGroup g = new TrackEventGroup();",
+            "                vegas.Project.Groups.Add(g);",
+            "                g.Add(evs[i]);",
+            "                g.Add(evs[j]);",
             "            }",
             "        }",
             "    }",
@@ -152,3 +143,100 @@ def generate_vegas_script(decisions: dict[str, Any]) -> str:
 def write_vegas_script(path: Path, decisions: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(generate_vegas_script(decisions), encoding="utf-8")
+
+
+# --- highlights markers ------------------------------------------------------
+#
+# Отдельный скрипт от mute-скрипта: тот сознательно НЕ ставит маркеры («чистый
+# timeline»). Здесь наоборот — highlights это навигация по ярким моментам, и
+# маркеры/регионы Vegas ровно для этого. Не мешаем два в одном: пользователь
+# запускает нужный скрипт под задачу.
+
+
+def exportable_highlights(decisions: dict[str, Any]) -> list[dict[str, Any]]:
+    """Вернуть highlights, пригодные для маркеров Vegas (в stream-секундах).
+
+    Highlights лежат под ключом 'highlights' как bundle {highlights: [...]}.
+    Берём каждый с stream_start_s/stream_end_s (их проставляет merge_into_
+    decisions). Фолбэк на start_s/end_s (локальные) — если merge был старой
+    версии; лучше сдвинутый маркер, чем пустой экспорт.
+    """
+    bundle = decisions.get("highlights") or {}
+    items = bundle.get("highlights") if isinstance(bundle, dict) else None
+    if not items:
+        raise VegasExportError("decisions.json не содержит highlights для экспорта")
+
+    result: list[dict[str, Any]] = []
+    for index, h in enumerate(items):
+        if not isinstance(h, dict):
+            raise VegasExportError(f"highlights[{index}] must be an object")
+        start = h.get("stream_start_s", h.get("start_s"))
+        end = h.get("stream_end_s", h.get("end_s"))
+        if start is None or end is None:
+            raise VegasExportError(f"highlights[{index}] missing start/end")
+        if float(end) <= float(start):
+            raise VegasExportError(f"highlights[{index}] has end <= start")
+        result.append(h)
+    return result
+
+
+def _escape_cs(text: str) -> str:
+    """Экранировать строку для C# literal (кавычки/бэкслеши/переносы)."""
+    return (
+        text.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\r", " ")
+        .replace("\n", " ")
+    )
+
+
+def generate_vegas_highlights_script(decisions: dict[str, Any]) -> str:
+    """C#-скрипт для Vegas: ставит Region на каждый highlight (нарезка моментов).
+
+    В отличие от mute-скрипта, здесь только Regions — они видны на таймлайне и в
+    списке регионов Vegas, по ним удобно прыгать и рендерить куски (Render
+    Regions). Имя региона = "★ score title".
+    """
+    highlights = exportable_highlights(decisions)
+
+    lines = [
+        "// Generated by twitch_cut — highlights markers.",
+        "// Adds one Region per highlight for quick navigation / region render.",
+        "using System;",
+        "using ScriptPortal.Vegas;",
+        "",
+        "public class EntryPoint",
+        "{",
+        "    public void FromVegas(Vegas vegas)",
+        "    {",
+    ]
+    for h in highlights:
+        start = float(h.get("stream_start_s", h.get("start_s")))
+        end = float(h.get("stream_end_s", h.get("end_s")))
+        score = h.get("score")
+        title = str(h.get("title", "highlight"))
+        label = f"★ {score:.2f} {title}" if isinstance(score, (int, float)) else f"★ {title}"
+        label = _escape_cs(label)[:120]
+        lines.append(
+            f"        AddRegion(vegas, {start:.3f}, {end - start:.3f}, \"{label}\");"
+        )
+    lines.extend(
+        [
+            "    }",
+            "",
+            "    private void AddRegion(Vegas vegas, double start, double length, string label)",
+            "    {",
+            "        Timecode s = Timecode.FromSeconds(start);",
+            "        Timecode len = Timecode.FromSeconds(length);",
+            "        vegas.Project.Regions.Add(new Region(s, len, label));",
+            "    }",
+            "}",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def write_vegas_highlights_script(path: Path, decisions: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(generate_vegas_highlights_script(decisions), encoding="utf-8")

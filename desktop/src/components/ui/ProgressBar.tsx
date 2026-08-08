@@ -28,7 +28,14 @@ export function ProgressBar({
           )}
         </div>
       )}
-      <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-white/5">
+      <div
+        className="relative h-1.5 w-full overflow-hidden rounded-full bg-white/5"
+        role="progressbar"
+        aria-valuenow={Math.round(clamped)}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-label={label}
+      >
         <div
           className="h-full rounded-full bg-brand transition-[width] duration-300 ease-out"
           style={{ width: `${clamped}%` }}
@@ -63,8 +70,14 @@ export function ProgressRing({
   const c = 2 * Math.PI * r;
   const offset = c * (1 - clamped / 100);
   return (
-    <div className={cn("relative inline-flex items-center justify-center", className)}>
-      <svg width={size} height={size} className="-rotate-90">
+    <div
+      className={cn("relative inline-flex items-center justify-center", className)}
+      role="progressbar"
+      aria-valuenow={Math.round(clamped)}
+      aria-valuemin={0}
+      aria-valuemax={100}
+    >
+      <svg width={size} height={size} className="-rotate-90" aria-hidden="true">
         <defs>
           <linearGradient id="ring-brand" x1="0" y1="0" x2="1" y2="1">
             <stop offset="0%" stopColor="rgb(var(--brand-from))" />

@@ -1,12 +1,13 @@
 /**
  * First-run bootstrap: готовит Python-окружение БЕЗ участия пользователя.
  *
- * Раньше это делал install.ps1 руками (нужен системный Python + Node + ручной
- * prefetch). Теперь всё это происходит при первом запуске приложения:
+ * Раньше это делал отдельный install-скрипт руками (нужен системный Python +
+ * Node + ручной prefetch). Теперь всё это происходит при первом запуске:
  *   1. Скачиваем standalone `uv` (один бинарь) — менеджер Python/venv/пакетов.
  *   2. `uv python install 3.12` — uv сам качает нужный CPython.
  *   3. `uv venv <envDir>` — создаём venv в writable дата-каталоге.
- *   4. GPU-детект (nvidia-smi): выбираем requirements-gpu.txt vs requirements.txt.
+ *   4. GPU/OS-детект: выбираем requirements-mac.txt (macOS), requirements-gpu.txt
+ *      (Windows + NVIDIA) или requirements-cpu-win.txt (Windows без GPU).
  *   5. `uv pip install -r ...` + `uv pip install -e backend --no-deps`.
  *   6. `python -m twitch_cut.cli prefetch` — скачиваем модели (~4 GB).
  *   7. Пишем sentinel `<envDir>/.bootstrap-ok`, чтобы больше не повторять.
@@ -48,6 +49,7 @@ export interface BootstrapProgress {
     | "venv"
     | "gpu"
     | "deps"
+    | "asr"
     | "package"
     | "models"
     | "done"
@@ -58,8 +60,10 @@ export interface BootstrapProgress {
   percent: number;
   /** Последняя строка лога/детали (хвост процесса). */
   detail?: string;
-  /** Определён ли GPU (заполняется после стадии gpu). */
+  /** Определён ли GPU (заполняется после стадии gpu). NVIDIA/CUDA. */
   gpu?: boolean;
+  /** Тип ускорителя для бейджа: cuda (NVIDIA) | mps (Apple Metal) | cpu. */
+  accel?: "cuda" | "mps" | "cpu";
 }
 
 export type ProgressCb = (p: BootstrapProgress) => void;
@@ -73,12 +77,15 @@ export class BootstrapError extends Error {
 
 // --- константы --------------------------------------------------------------
 
-/** Standalone uv для Windows x64 (zip с uv.exe + uvx.exe). */
+/** Standalone uv — URL по платформе/архитектуре. */
 const UV_WIN_URL =
   "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip";
+const UV_MAC_URL = `https://github.com/astral-sh/uv/releases/latest/download/uv-${
+  process.arch === "arm64" ? "aarch64" : "x86_64"
+}-apple-darwin.tar.gz`;
 
 /** Версия схемы bootstrap — если поменяем шаги, бампаем и sentinel протухает. */
-const BOOTSTRAP_VERSION = "2";
+const BOOTSTRAP_VERSION = "3";
 
 // Грубые веса стадий для общего прогресс-бара (сумма ≈ 100).
 const STAGE_BASE: Record<BootstrapProgress["stage"], number> = {
@@ -88,6 +95,7 @@ const STAGE_BASE: Record<BootstrapProgress["stage"], number> = {
   venv: 15,
   gpu: 18,
   deps: 25, // самая долгая — torch+cu126 ~2-3 GB
+  asr: 65, // GigaAM из git (+ базовые зависимости), быстро
   package: 70,
   models: 75, // ~4 GB, тоже долгая
   done: 100,
@@ -98,6 +106,16 @@ const STAGE_BASE: Record<BootstrapProgress["stage"], number> = {
 
 function isWindows(): boolean {
   return process.platform === "win32";
+}
+
+/**
+ * Убрать ANSI escape-последовательности (цвет/стиль от rich и tqdm) из строки.
+ * В лог пишем сырой текст, а в UI (splash detail) отдаём уже очищенный — иначе
+ * пользователь видит хвосты вида `[2m…[0m` (сам ESC-байт невидим, коды остаются).
+ */
+function stripAnsi(text: string): string {
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "");
 }
 
 function appendLog(logPath: string, text: string): void {
@@ -132,7 +150,7 @@ function run(
       appendLog(opts.logPath, (toErr ? "[err] " : "") + text);
       const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
       const last = lines[lines.length - 1];
-      if (last && onLine) onLine(last.slice(0, 160));
+      if (last && onLine) onLine(stripAnsi(last).slice(0, 160));
     };
     child.stdout.on("data", (c) => handle(c, false));
     child.stderr.on("data", (c) => handle(c, true));
@@ -179,32 +197,47 @@ async function detectGpu(logPath: string): Promise<boolean> {
 
 // --- получение uv -----------------------------------------------------------
 
-/** Вернуть путь к uv.exe, скачав его при необходимости. */
+/** Вернуть путь к uv, скачав его при необходимости. */
 async function ensureUv(paths: Paths, logPath: string, emit: ProgressCb): Promise<string> {
   const uvExe = path.join(paths.binDir, isWindows() ? "uv.exe" : "uv");
   if (fs.existsSync(uvExe)) return uvExe;
 
-  if (!isWindows()) {
-    // На не-Windows полагаемся на системный uv (dev-сценарий).
-    return "uv";
-  }
-
   fs.mkdirSync(paths.binDir, { recursive: true });
-  const zip = path.join(paths.binDir, "uv.zip");
   emit({ stage: "uv", label: "Скачиваю установщик uv…", percent: STAGE_BASE.uv });
 
-  // Скачивание + распаковка средствами Windows PowerShell (без сторонних зависимостей).
-  await pwsh(
-    `$ProgressPreference='SilentlyContinue';` +
-      `Invoke-WebRequest -Uri '${UV_WIN_URL}' -OutFile '${zip}';` +
-      `Expand-Archive -Path '${zip}' -DestinationPath '${paths.binDir}' -Force;` +
-      `Remove-Item '${zip}' -Force`,
-    logPath,
-    (l) => emit({ stage: "uv", label: "Скачиваю uv…", percent: STAGE_BASE.uv, detail: l })
-  );
+  if (isWindows()) {
+    // Windows: скачиваем zip, распаковываем через PowerShell.
+    const zip = path.join(paths.binDir, "uv.zip");
+    await pwsh(
+      `$ProgressPreference='SilentlyContinue';` +
+        `Invoke-WebRequest -Uri '${UV_WIN_URL}' -OutFile '${zip}';` +
+        `Expand-Archive -Path '${zip}' -DestinationPath '${paths.binDir}' -Force;` +
+        `Remove-Item '${zip}' -Force`,
+      logPath,
+      (l) => emit({ stage: "uv", label: "Скачиваю uv…", percent: STAGE_BASE.uv, detail: l })
+    );
+  } else {
+    // macOS: скачиваем tar.gz, распаковываем через tar.
+    const tgz = path.join(paths.binDir, "uv.tar.gz");
+    await run(
+      "curl",
+      ["-fsSL", UV_MAC_URL, "-o", tgz],
+      { logPath },
+      (l) => emit({ stage: "uv", label: "Скачиваю uv…", percent: STAGE_BASE.uv, detail: l })
+    );
+    await run(
+      "tar",
+      ["xzf", tgz, "--strip-components=1", "-C", paths.binDir],
+      { logPath },
+      (l) => emit({ stage: "uv", label: "Распаковываю uv…", percent: STAGE_BASE.uv, detail: l })
+    );
+    fs.unlinkSync(tgz);
+    // Убедиться что бинарь исполняемый.
+    fs.chmodSync(uvExe, 0o755);
+  }
 
   if (!fs.existsSync(uvExe)) {
-    throw new BootstrapError("uv.exe не найден после распаковки", logPath);
+    throw new BootstrapError("uv не найден после распаковки", logPath);
   }
   return uvExe;
 }
@@ -251,14 +284,27 @@ export async function runBootstrap(paths: Paths, onProgress: ProgressCb): Promis
       (l) => emit({ stage: "venv", label: "Создаю окружение…", percent: STAGE_BASE.venv, detail: l })
     );
 
-    // 4. GPU-детект
-    emit({ stage: "gpu", label: "Проверяю видеокарту…", percent: STAGE_BASE.gpu });
+    // 4. GPU-детект. На macOS NVIDIA нет, но Apple Silicon даёт MPS (Metal) —
+    //    это полноценный ускоритель для GigaAM, не «медленный CPU».
+    emit({ stage: "gpu", label: "Проверяю ускоритель…", percent: STAGE_BASE.gpu });
     const gpu = await detectGpu(logPath);
+    const isAppleSilicon = process.platform === "darwin" && process.arch === "arm64";
+    const accel: BootstrapProgress["accel"] = gpu
+      ? "cuda"
+      : isAppleSilicon
+      ? "mps"
+      : "cpu";
     emit({
       stage: "gpu",
-      label: gpu ? "NVIDIA GPU найден" : "GPU не найден — режим CPU (медленнее)",
+      label:
+        accel === "cuda"
+          ? "NVIDIA GPU найден"
+          : accel === "mps"
+          ? "Apple Silicon — ускорение MPS (Metal)"
+          : "GPU не найден — режим CPU (медленнее)",
       percent: STAGE_BASE.gpu,
       gpu,
+      accel,
     });
 
     // uv pip работает в контексте созданного venv через --python.
@@ -277,14 +323,17 @@ export async function runBootstrap(paths: Paths, onProgress: ProgressCb): Promis
       "unsafe-best-match",
     ];
 
-    // 5. Зависимости (torch+cu126 для GPU, CPU-torch иначе)
+    // 5. Зависимости: на macOS всегда CPU-lock (нет CUDA-колёс под mac);
+    //    на Windows — GPU-lock если есть NVIDIA, иначе CPU-lock.
     const reqFile = path.join(
       paths.backendDir,
-      gpu ? "requirements-gpu.txt" : "requirements.txt"
+      !isWindows() ? "requirements-mac.txt" : gpu ? "requirements-gpu.txt" : "requirements-cpu-win.txt"
     );
     emit({
       stage: "deps",
-      label: gpu
+      label: !isWindows()
+        ? "Устанавливаю зависимости (CPU, ~1–2 ГБ)…"
+        : gpu
         ? "Устанавливаю зависимости (torch+CUDA, ~2–3 ГБ)…"
         : "Устанавливаю зависимости (CPU-версия)…",
       percent: STAGE_BASE.deps,
@@ -317,6 +366,37 @@ export async function runBootstrap(paths: Paths, onProgress: ProgressCb): Promis
       ["-c", writePthScript, srcDir],
       { logPath, env: uvEnv },
       (l) => emit({ stage: "package", label: "Устанавливаю twitch-cut…", percent: STAGE_BASE.package, detail: l, gpu })
+    );
+
+    // 6.5. GigaAM (движок распознавания по умолчанию). Ставим ОТДЕЛЬНО, а не
+    // из requirements-lock, по двум причинам:
+    //   1. Нужна git-версия — только она умеет пословные тайминги
+    //      (transcribe_longform word_timestamps=True). PyPI-релиз 0.2.0 их не
+    //      даёт, и pipeline падает на TypeError.
+    //   2. У gigaam extra 'longform' пинит torch==2.10 / pyannote==4.0, что
+    //      конфликтует с нашим torch 2.6 / pyannote 3.4. Поэтому ставим
+    //      --no-deps (веса тянет через torchaudio+pyannote, которые уже стоят),
+    //      а недостающие ЛЁГКИЕ базовые зависимости (hydra-core, onnx) —
+    //      отдельной строкой. Тяжёлые (torch/pyannote/…) уже в lock'е.
+    emit({ stage: "asr", label: "Устанавливаю движок распознавания (GigaAM)…", percent: STAGE_BASE.asr, gpu });
+    await run(
+      uv,
+      [...pipBase, "hydra-core==1.3.*", "onnx==1.19.*"],
+      { logPath, env: uvEnv },
+      (l) => emit({ stage: "asr", label: "Устанавливаю GigaAM…", percent: STAGE_BASE.asr, detail: l, gpu })
+    );
+    await run(
+      uv,
+      [
+        "pip",
+        "install",
+        "--python",
+        paths.venvPython,
+        "--no-deps",
+        "git+https://github.com/salute-developers/GigaAM.git",
+      ],
+      { logPath, env: uvEnv },
+      (l) => emit({ stage: "asr", label: "Устанавливаю GigaAM…", percent: STAGE_BASE.asr, detail: l, gpu })
     );
 
     // 7. Модели (~4 GB). Прогресс идёт из tqdm в stderr — прокидываем как detail.

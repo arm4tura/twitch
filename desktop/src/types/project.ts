@@ -37,6 +37,20 @@ export interface MuteRecord {
   [k: string]: unknown;
 }
 
+/**
+ * Один silence-сегмент из decisions.json. Пишется после ревью тишины на
+ * таймлайне: `accepted` → вырежется при рендере, `rejected` → останется.
+ * Времена — audio-секунды исходника (те же координаты, что и waveform/media).
+ */
+export interface SilenceRecord {
+  id: string;
+  start: number;
+  end: number;
+  status: "accepted" | "rejected";
+  /** Всё, что не перечислено выше, переживает round-trip без потерь. */
+  [k: string]: unknown;
+}
+
 /** Кэши путей (аудио-извлечение диапазона + транскрипт). */
 export interface DecisionsCaches {
   audio?: string | null;
@@ -55,6 +69,8 @@ export interface DecisionsDoc {
   range_in?: string;
   range_out?: string;
   mutes?: MuteRecord[];
+  /** Обнаруженная тишина после ревью (audio-секунды). Пишет TimelineScreen. */
+  silences?: SilenceRecord[];
   cuts?: unknown[];
   highlights?: unknown;
   caches?: DecisionsCaches;

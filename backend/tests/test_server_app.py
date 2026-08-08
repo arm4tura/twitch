@@ -46,7 +46,9 @@ def test_cancel_missing_job_404():
     assert r.status_code == 404
 
 
-def test_decisions_read_write_roundtrip(tmp_path: Path):
+def test_decisions_read_write_roundtrip(tmp_path: Path, monkeypatch):
+    # /decisions авторизует пути внутри DATA_ROOT; в тесте DATA_ROOT = tmp_path.
+    monkeypatch.setattr("twitch_cut.config.DATA_ROOT", tmp_path)
     client = TestClient(create_app())
     p = tmp_path / "decisions.json"
     payload = {"mutes": [{"start_ms": 0, "end_ms": 100}], "cuts": [], "caches": {}}
@@ -75,7 +77,8 @@ def test_decisions_put_rejects_extra_fields(tmp_path: Path):
     assert r.status_code == 422
 
 
-def test_transcript_read(tmp_path: Path):
+def test_transcript_read(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("twitch_cut.config.DATA_ROOT", tmp_path)
     client = TestClient(create_app())
     p = tmp_path / "t.json"
     p.write_text(json.dumps({"segments": []}), encoding="utf-8")
@@ -131,3 +134,33 @@ def test_cancel_terminal_job_returns_false():
     state = store.create(JobKind.PROCESS)
     state.status = JobStatus.DONE
     assert store.cancel(state.id) is False
+
+
+def test_decisions_rejects_unauthorized_path(tmp_path: Path, monkeypatch):
+    """GET/PUT /decisions и GET /transcript должны отклонять пути вне
+    DATA_ROOT и вне зарегистрированных проектов (защита от чтения/записи
+    произвольного файла через localhost)."""
+    # DATA_ROOT указывает в отдельный каталог; secret лежит СНАРУЖИ него.
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    monkeypatch.setattr("twitch_cut.config.DATA_ROOT", data_root)
+
+    secret = tmp_path / "secret.json"
+    secret.write_text('{"token": "leak"}', encoding="utf-8")
+
+    client = TestClient(create_app())
+
+    # чтение чужого файла — 403, а не 200 с содержимым
+    r = client.get(f"/decisions?path={secret}")
+    assert r.status_code == 403, r.text
+
+    r = client.get(f"/transcript?path={secret}")
+    assert r.status_code == 403, r.text
+
+    # запись поверх чужого файла — 403, файл не тронут
+    r = client.put(
+        f"/decisions?path={secret}",
+        json={"decisions": {"mutes": [], "cuts": [], "caches": {}}},
+    )
+    assert r.status_code == 403, r.text
+    assert secret.read_text(encoding="utf-8") == '{"token": "leak"}'

@@ -9,23 +9,30 @@ import {
   RotateCcw,
   RotateCw,
   Save,
+  Scissors,
+  Settings2,
+  Trash2,
   VolumeX,
+  Wand2,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
 import { Card } from "../components/ui/Card";
+import { cn } from "../lib/cn";
 import { EmptyState } from "../components/ui/EmptyState";
 import { Button } from "../components/ui/Button";
 import { Kbd } from "../components/ui/Kbd";
 import { OverviewStrip, type OverviewMarker } from "../components/timeline/OverviewStrip";
 import {
   TimelineCanvas,
-  type TimelineBlock,
   type TimelineView,
 } from "../components/timeline/TimelineCanvas";
 import { MuteInspector } from "../components/timeline/MuteInspector";
-import { useUndoable } from "../hooks/useUndoable";
+import { SilenceOverlay, type SilenceBlock } from "../components/timeline/SilenceOverlay";
+import { useUndoable, sliceUndoable } from "../hooks/useUndoable";
 import { useHotkey } from "../hooks/useHotkey";
+import { useTimelineCoords } from "../hooks/useTimelineCoords";
+import { useTimelinePlayback } from "../hooks/useTimelinePlayback";
 import { usePublishTimelineActions } from "../lib/timelineActions";
 import { toast } from "../components/ui/Toast";
 import { platformizeShortcut } from "../lib/platform";
@@ -34,20 +41,27 @@ import {
   buildWordIndex,
   contextWords,
   playWindow,
-  snapToWordBoundary,
   wordsInRange,
   type WordIndex,
 } from "../lib/transcript";
 import {
   allowMediaPaths,
+  createDetectSilenceJob,
   getWaveform,
   mediaUrl,
   readDecisions,
   readTranscript,
   writeDecisions,
+  type DetectSilenceResult,
+  type JobState,
   type WaveformData,
 } from "../api";
+import { useJobEvents } from "../hooks/useJobEvents";
 import type { DecisionsDoc, MuteRecord, TranscriptDoc } from "../types/project";
+import { useMuteEditing } from "../hooks/useMuteEditing";
+import { adaptiveTrim, useSilenceEditing, type SilenceSegment } from "../hooks/useSilenceEditing";
+import { SILENCED, toUiMute, type UiMute } from "../lib/mutes";
+import type { SilenceRecord } from "../types/project";
 
 /**
  * TimelineScreen — экран «Правка» = РЕВЬЮ ЗАГЛУШЕК на DAW-таймлайне.
@@ -74,35 +88,18 @@ import type { DecisionsDoc, MuteRecord, TranscriptDoc } from "../types/project";
  * stream_start/stream_end — их читает Vegas-экспорт.
  */
 
-/** UI-модель мьюта: локальные секунды + судьба. Исходную запись храним для round-trip. */
-interface UiMute {
-  id: string;
-  start: number;
-  end: number;
-  word: string;
-  status: string;
-  review: boolean;
-  raw: MuteRecord;
-}
-
-const SILENCED = "accepted"; // статус, который Vegas реально глушит
-const KEPT = "rejected"; // «оставить» — Vegas пропускает
-const MIN_MUTE_S = 0.03; // единый минимум длины мьюта (волна/кнопки/клик) — чтобы не схлопнуть в ноль
 const VIEW_MIN_SPAN = 0.4; // минимальная ширина окна зума таймлайна, сек
 const ZOOM_IN = 1 / 1.6; // множитель span при «приблизить»
 const ZOOM_OUT = 1.6; // множитель span при «отдалить»
+// Стабильная пустая ссылка: в режиме «Тишина» на волну не кладём редактируемые
+// блоки матов, но проп у мемо-канваса должен сохранять идентичность между
+// рендерами, иначе TimelineCanvas реконсилится зря.
+const EMPTY_BLOCKS: OverviewMarker[] = [];
 
-function toUiMute(m: MuteRecord): UiMute {
-  const status = typeof m.status === "string" ? m.status : SILENCED;
-  return {
-    id: m.id,
-    start: Number(m.start) || 0,
-    end: Number(m.end) || 0,
-    word: typeof m.word === "string" ? m.word : "",
-    status,
-    review: status === "review" || !!m.needs_review,
-    raw: m,
-  };
+/** Комбинированное undoable-состояние экрана: заглушки + тишина в одной истории. */
+interface EditState {
+  mutes: UiMute[];
+  silences: SilenceSegment[];
 }
 
 export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
@@ -113,40 +110,69 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
 
   // Источник аудио + система координат.
   const [audioPath, setAudioPath] = useState<string | null>(null);
-  const localCoordsRef = useRef(true); // true → audio == локальное пространство
-  const offsetRef = useRef(0); // source-space: audioTime = localTime + offset
+  const coords = useTimelineCoords();
+  const { toAudio, toLocal, offsetRef } = coords;
   const docRef = useRef<DecisionsDoc | null>(null);
   const wordIndexRef = useRef<WordIndex>({ words: [] });
 
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const playUntilRef = useRef<number | null>(null); // audio-секунда, на которой стоп
-  const stopTimerRef = useRef<number | null>(null); // setTimeout-страховка стопа
-  // Реалтайм-глушение при превью «как в экспорте»: во время playMute бегает rAF
-  // и глушит <audio> ровно над заглушёнными участками. Скраб/«прослушать
-  // выделение» — наоборот, играют оригинал (нужно услышать мат, чтобы поймать
-  // границы), поэтому applyMutesRef там false.
-  const rafRef = useRef<number | null>(null);
-  const applyMutesRef = useRef(false);
-  const muteRegionsRef = useRef<Array<[number, number]>>([]);
-
-  // Undoable-список мьютов.
-  const store = useUndoable<UiMute[]>([]);
+  // Undoable-стор всего экрана: mutes + silences в ОДНОЙ истории — ⌘Z/⌘⇧Z
+  // ходят по единому стеку поверх обоих списков. Редакторы работают со срезами
+  // через sliceUndoable (см. muteStore/silenceStore ниже).
+  const store = useUndoable<EditState>({ mutes: [], silences: [] });
+  const muteStore = sliceUndoable(store, "mutes");
+  const silenceStore = sliceUndoable(store, "silences");
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [currentAudioS, setCurrentAudioS] = useState(0);
-  const [playingMuteId, setPlayingMuteId] = useState<string | null>(null);
+  const [selectedSilenceId, setSelectedSilenceId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  // Режим «Правки»: маты или тишина. Каждый режим показывает только свой
+  // инструментарий (тулбар, блоки на волне, инспектор) — вдвое меньше шума.
+  const [mode, setMode] = useState<"mutes" | "silence">("mutes");
+  // Авто-детект тишины: id job'а бэка. null = не запускали / завершилось.
+  const [silenceJobId, setSilenceJobId] = useState<string | null>(null);
+  // Адаптивность: сколько «дыхания» тишины оставлять (сек). Паузы короче —
+  // не трогаем; длиннее — режем только излишек сверх maxPause. 0 = под чистую.
+  const [maxPause, setMaxPause] = useState(2);
+  // Порог тишины (dBFS): всё тише = тишина. Ниже (−40) → строже, тихие хвосты
+  // речи считаются звуком; выше (−25) → агрессивнее. −38 — консервативный дефолт.
+  const [thresholdDb, setThresholdDb] = useState(-38);
+  // Параметры поиска (пауза/порог) свёрнуты за шестерёнкой — по умолчанию скрыты,
+  // чтобы основной тулбар тишины оставался одной кнопкой.
+  const [showSilenceParams, setShowSilenceParams] = useState(false);
   // Окно зума главного таймлайна (АУДИО-секунды). null до загрузки волны.
   const [view, setView] = useState<TimelineView | null>(null);
 
-  // --- координатные хелперы -------------------------------------------------
-  const toAudio = useCallback(
-    (localT: number) => (localCoordsRef.current ? localT : localT + offsetRef.current),
-    []
+  // Аудио-плейбек: скрытый <audio>, точная остановка, реалтайм-глушение, rAF.
+  // Заглушённые участки для превью «как в экспорте» отдаём в audio-координатах.
+  const playback = useTimelinePlayback(
+    useCallback(
+      () =>
+        muteStore.present
+          .filter((m) => m.status === SILENCED)
+          .map((m) => [toAudio(m.start), toAudio(m.end)] as [number, number]),
+      [muteStore, toAudio]
+    ),
+    // Вырезаемые при рендере участки (accepted silence, audio-сек): непрерывное
+    // превью (пробел) перепрыгивает их, чтобы звучало как финальный рендер.
+    useCallback(
+      () =>
+        silenceStore.present
+          .filter((s) => s.status === "accepted")
+          .map((s) => [s.start, s.end] as [number, number]),
+      [silenceStore]
+    )
   );
-  const toLocal = useCallback(
-    (audioT: number) => (localCoordsRef.current ? audioT : audioT - offsetRef.current),
-    []
-  );
+  const {
+    audioRef,
+    currentAudioS,
+    currentAudioRef,
+    playingMuteId,
+    setPlayingMuteId,
+    stopPlayback,
+    playAudioRange,
+    playFrom,
+    seekAudio,
+    audioProps,
+  } = playback;
 
   // --- загрузка -------------------------------------------------------------
   useEffect(() => {
@@ -163,11 +189,25 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
         const rawMutes = Array.isArray(doc.mutes) ? doc.mutes : [];
         const ui = rawMutes.map(toUiMute).sort((a, b) => a.start - b.start);
 
+        // Silence-сегменты (audio-секунды) — уже отревьюенные из прошлой сессии.
+        const rawSilences = Array.isArray(doc.silences) ? doc.silences : [];
+        const uiSilences: SilenceSegment[] = rawSilences
+          .filter(
+            (s) => Number.isFinite(s.start) && Number.isFinite(s.end) && s.end > s.start
+          )
+          .map((s) => ({
+            id: String(s.id ?? `silence_${Math.round(Number(s.start) * 1000)}`),
+            start: Number(s.start),
+            end: Number(s.end),
+            status: (s.status === "rejected" ? "rejected" : "accepted") as SilenceSegment["status"],
+          }))
+          .sort((a, b) => a.start - b.start);
+
         // Offset (range_in в секундах) — из первого мьюта, где есть stream_start.
         const withStream = rawMutes.find(
           (m) => Number.isFinite(m.stream_start) && Number.isFinite(m.start)
         );
-        offsetRef.current = withStream
+        const offset = withStream
           ? Number(withStream.stream_start) - Number(withStream.start)
           : 0;
 
@@ -184,7 +224,7 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
             "Не нашли аудио для проигрывания. Проверьте caches.audio или source в decisions.json."
           );
         }
-        localCoordsRef.current = !!cacheAudio;
+        coords.configure({ localCoords: !!cacheAudio, offset });
         setAudioPath(media);
 
         await allowMediaPaths([media]).catch(() => {
@@ -210,7 +250,7 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
         if (!alive) return;
         setWave(w);
         setView({ start: 0, end: w.duration_s }); // старт — весь стрим
-        store.reset(ui);
+        store.reset({ mutes: ui, silences: uiSilences });
       } catch (err) {
         if (!alive) return;
         setError(err instanceof Error ? err.message : String(err));
@@ -224,11 +264,20 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [decisionsPath]);
 
-  const mutes = store.present;
+  const mutes = muteStore.present;
+  const silences = silenceStore.present;
 
   // --- производные ----------------------------------------------------------
   const silencedCount = useMemo(
     () => mutes.filter((m) => m.status === SILENCED).length,
+    [mutes]
+  );
+
+  // Сколько матов ещё не проверено (review) — единственный «действенный» счётчик
+  // в заголовке. Раскладка по статусам (заглушим/оставим/тишина) — в правой
+  // сводке тулбара, счётчик списка — в табе режима.
+  const reviewCount = useMemo(
+    () => mutes.filter((m) => m.review).length,
     [mutes]
   );
 
@@ -238,10 +287,37 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
         id: m.id,
         start: toAudio(m.start),
         end: toAudio(m.end),
-        active: m.status === SILENCED,
+        // Три состояния маркера: silence=красный (заглушим), keep=серый (оставим),
+        // review=янтарный (не проверено). Данные уже трёхстатусные — чисто отрисовка.
+        state: m.review ? "review" : m.status === SILENCED ? "silence" : "keep",
         selected: m.id === selectedId,
       })),
     [mutes, selectedId, toAudio]
+  );
+
+  // Silence-блоки для оверлея. Координаты уже audio-секунды (как хранит
+  // SilenceSegment и ждёт SilenceOverlay) — конвертация не нужна. active =
+  // «будет вырезан» (accepted).
+  const silenceBlocks = useMemo<SilenceBlock[]>(
+    () =>
+      silences.map((s) => ({
+        id: s.id,
+        start: s.start,
+        end: s.end,
+        active: s.status === "accepted",
+        selected: s.id === selectedSilenceId,
+      })),
+    [silences, selectedSilenceId]
+  );
+
+  const acceptedSilenceCount = useMemo(
+    () => silences.filter((s) => s.status === "accepted").length,
+    [silences]
+  );
+
+  const selectedSilence = useMemo(
+    () => silences.find((s) => s.id === selectedSilenceId) ?? null,
+    [silences, selectedSilenceId]
   );
 
   const selected = useMemo(
@@ -262,127 +338,9 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
   const currentLocalS = toLocal(currentAudioS);
 
   // --- аудио-плейбек --------------------------------------------------------
-  // Единая точка остановки. Дёргается из двух источников: браузерного
-  // `timeupdate` (редкий, ~4 раза/сек, может проскочить границу) и из точного
-  // setTimeout-таймера, заведённого при старте (см. playAudioRange). Любой,
-  // кто сработал первым, глушит воспроизведение — второй становится no-op.
-  const stopPlayback = useCallback(() => {
-    const el = audioRef.current;
-    if (stopTimerRef.current != null) {
-      window.clearTimeout(stopTimerRef.current);
-      stopTimerRef.current = null;
-    }
-    if (rafRef.current != null) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
-    }
-    applyMutesRef.current = false;
-    playUntilRef.current = null;
-    if (el) {
-      if (!el.paused) el.pause();
-      el.muted = false; // снять реалтайм-глушение
-    }
-    setPlayingMuteId(null);
-  }, []);
-
-  /**
-   * rAF-скан во время превью «как в экспорте»: чаще, чем timeupdate (~4 Гц),
-   * поэтому граница мьюта не «протекает». Глушит <audio>.muted, когда
-   * currentTime попадает в заглушённый участок, и снимает глушение вне их.
-   * Также двигает плейхед плавно и ловит стоп по playUntil.
-   */
-  const scanMutes = useCallback(() => {
-    const el = audioRef.current;
-    if (!el) return;
-    const t = el.currentTime;
-    setCurrentAudioS(t);
-    if (applyMutesRef.current) {
-      let inMute = false;
-      for (const [a, b] of muteRegionsRef.current) {
-        if (t >= a && t < b) {
-          inMute = true;
-          break;
-        }
-      }
-      if (el.muted !== inMute) el.muted = inMute;
-    }
-    if (playUntilRef.current != null && t >= playUntilRef.current) {
-      stopPlayback();
-      return;
-    }
-    rafRef.current = requestAnimationFrame(scanMutes);
-  }, [stopPlayback]);
-
-  // Обработчики вешаются как пропсы на сам <audio> (см. render), а не через
-  // addEventListener в useEffect: элемент монтируется только когда готовы и
-  // wave, и audioPath, и раньше слушатель успевал привязаться до монтирования
-  // и больше не перепривязывался — стоп не срабатывал вовсе.
-  const onAudioTime = useCallback(() => {
-    const el = audioRef.current;
-    if (!el) return;
-    setCurrentAudioS(el.currentTime);
-    if (playUntilRef.current != null && el.currentTime >= playUntilRef.current) {
-      stopPlayback();
-    }
-  }, [stopPlayback]);
-
-  const onAudioPause = useCallback(() => {
-    // Ручная пауза (не наша граница) — снять подсветку играющей строки.
-    if (playUntilRef.current == null) setPlayingMuteId(null);
-  }, []);
-
-  // Снять таймер/rAF при размонтировании экрана.
-  useEffect(
-    () => () => {
-      if (stopTimerRef.current != null) window.clearTimeout(stopTimerRef.current);
-      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
-    },
-    []
-  );
-
-  /**
-   * Проиграть аудио-отрезок [aStart, aEnd] (в audio-координатах).
-   * `pad` — сколько добавить с каждого края (контекст). Для превью мьюта — 0.25с,
-   * для «слышно край» (скраб) — почти ноль, чтобы получился короткий блип.
-   * `applyMutes` — глушить ли заглушённые участки в реальном времени (превью
-   * «как в экспорте»). Для скраба/поиска границ — false (нужен оригинал).
-   */
-  const playAudioRange = useCallback(
-    (aStart: number, aEnd: number, pad = 0.25, applyMutes = false) => {
-      const el = audioRef.current;
-      if (!el) return;
-      const from = Math.max(0, aStart - pad);
-      const until = aEnd + pad;
-      el.currentTime = from;
-      playUntilRef.current = until;
-      // Реалтайм-глушение: список заглушённых участков в audio-координатах.
-      applyMutesRef.current = applyMutes;
-      el.muted = false;
-      if (applyMutes) {
-        muteRegionsRef.current = store.present
-          .filter((m) => m.status === SILENCED)
-          .map((m) => [toAudio(m.start), toAudio(m.end)] as [number, number]);
-      } else {
-        muteRegionsRef.current = [];
-      }
-      // Точная страховка: timeupdate/rAF могут не совпасть с концом окна —
-      // дублируем стоп таймером на длину окна (playbackRate = 1).
-      if (stopTimerRef.current != null) window.clearTimeout(stopTimerRef.current);
-      const ms = Math.max(0, (until - from) * 1000);
-      stopTimerRef.current = window.setTimeout(() => {
-        stopTimerRef.current = null;
-        stopPlayback();
-      }, ms);
-      // Плавный плейхед + точное глушение через rAF (частит, в отличие от timeupdate).
-      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
-      rafRef.current = requestAnimationFrame(scanMutes);
-      void el.play().catch(() => {
-        /* автоплей может быть заблокирован до первого жеста — игнор */
-      });
-    },
-    [stopPlayback, scanMutes, store, toAudio]
-  );
-
+  // stopPlayback / playAudioRange / seekAudio / currentAudioS и обработчики
+  // <audio> живут в useTimelinePlayback (см. выше). Здесь остаются только
+  // callbacks, которым нужны транскрипт/store: playMute и scrubAtAudio.
   const playMute = useCallback(
     (m: UiMute) => {
       const el = audioRef.current;
@@ -400,24 +358,6 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
     },
     [playingMuteId, playAudioRange, stopPlayback, toAudio]
   );
-
-  const seekAudio = useCallback((audioT: number) => {
-    const el = audioRef.current;
-    if (!el) return;
-    if (stopTimerRef.current != null) {
-      window.clearTimeout(stopTimerRef.current);
-      stopTimerRef.current = null;
-    }
-    if (rafRef.current != null) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
-    }
-    applyMutesRef.current = false;
-    playUntilRef.current = null;
-    el.muted = false;
-    el.currentTime = Math.max(0, audioT);
-    setCurrentAudioS(el.currentTime);
-  }, []);
 
   /** Скраб в АУДИО-координатах (драг края блока на таймлайне) — короткий блип. */
   const scrubAtAudio = useCallback(
@@ -493,19 +433,33 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
   /** Выбрать мат: подсветить, опц. центрировать окно и/или проиграть. */
   const selectMute = useCallback(
     (id: string, opts?: { play?: boolean; center?: boolean }) => {
-      const m = store.present.find((x) => x.id === id);
+      const m = muteStore.present.find((x) => x.id === id);
       setSelectedId(id);
+      setSelectedSilenceId(null); // выбор мата снимает выбор тишины — инспектор один
       if (!m) return;
       if (opts?.center) centerViewOn(toAudio(m.start), toAudio(m.end));
       if (opts?.play) playMute(m);
     },
-    [store, centerViewOn, toAudio, playMute]
+    [muteStore, centerViewOn, toAudio, playMute]
   );
+
+  /** Выбрать тишину: подсветить, снять выбор мата (инспектор один на двоих). */
+  const selectSilence = useCallback((id: string) => {
+    setSelectedSilenceId(id);
+    setSelectedId(null);
+  }, []);
+
+  /** Сменить режим (маты/тишина) — снимаем выбор, чтобы чужой инспектор не висел. */
+  const switchMode = useCallback((next: "mutes" | "silence") => {
+    setMode(next);
+    setSelectedId(null);
+    setSelectedSilenceId(null);
+  }, []);
 
   /** Прыжок к пред/след мату по времени (список отсортирован по start). */
   const goToMute = useCallback(
     (dir: 1 | -1) => {
-      const list = store.present;
+      const list = muteStore.present;
       if (!list.length) return;
       const i = list.findIndex((m) => m.id === selectedId);
       const next =
@@ -516,97 +470,94 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
           : Math.max(0, Math.min(list.length - 1, i + dir));
       selectMute(list[next].id, { center: true });
     },
-    [store, selectedId, selectMute]
+    [muteStore, selectedId, selectMute]
   );
 
   // --- редактирование мьютов ------------------------------------------------
-  const updateMute = useCallback(
-    (id: string, patch: Partial<UiMute>) => {
-      store.set((prev) =>
-        prev.map((m) => (m.id === id ? { ...m, ...patch } : m))
-      );
-    },
-    [store]
+  // Чистые правки границ/статуса/слова живут в useMuteEditing. UI-побочки
+  // (выделение, центрирование, тосты, добавление/удаление, сохранение) —
+  // остаются здесь, потому что дёргают view/selection/doc.
+  const { toggleMuted, adjustMute, nudgeMute, adjustMuteFree } = useMuteEditing(
+    muteStore,
+    wordIndexRef
   );
 
-  const toggleMuted = useCallback(
-    (m: UiMute) => {
-      updateMute(m.id, { status: m.status === SILENCED ? KEPT : SILENCED, review: false });
-    },
-    [updateMute]
-  );
+  // Правки silence-сегментов — тот же undoable-стор (общая история с мьютами).
+  const silenceEdit = useSilenceEditing(silenceStore);
 
-  /** Клик по слову в транскрипте: снап границ к словам + пересчёт слова-подписи. */
-  const adjustMute = useCallback(
-    (id: string, start: number, end: number) => {
-      const idx = wordIndexRef.current;
-      const s = snapToWordBoundary(idx, start);
-      const e = snapToWordBoundary(idx, end);
-      if (e - s < MIN_MUTE_S) return; // защита от схлопывания
-      const covered = wordsInRange(idx, s, e)
-        .map((w) => w.word)
-        .join(" ")
-        .trim();
-      updateMute(id, { start: s, end: e, word: covered || undefined });
-    },
-    [updateMute]
-  );
-
-  /**
-   * Точный сдвиг границ на дельту (секунды), БЕЗ снапа к словам — для кнопок
-   * −0.1/+0.1с. Клэмпим минимальную длину и переисчисляем слово-подпись.
-   */
-  const nudgeMute = useCallback(
-    (id: string, dStart: number, dEnd: number) => {
-      const m = store.present.find((x) => x.id === id);
-      if (!m) return;
-      const idx = wordIndexRef.current;
-      let s = Math.max(0, m.start + dStart);
-      let e = m.end + dEnd;
-      if (e - s < MIN_MUTE_S) {
-        // не даём краю перескочить через противоположный: упираем в MIN.
-        if (dEnd !== 0) e = s + MIN_MUTE_S;
-        else s = e - MIN_MUTE_S;
+  // Авто-детект тишины прямо в «Правке»: гоним ffmpeg-silencedetect по ТОМУ ЖЕ
+  // audioPath, что играет таймлайн. Поэтому сегменты приходят уже в audio-
+  // секундах (0-based для извлечённого cache-audio) — ровно как ждёт оверлей,
+  // конвертация не нужна. Результат кладём в silenceStore (общая undo-история:
+  // ⌘Z уберёт весь набор). keepManual — не затираем ранее правленные вручную.
+  const silenceEditRef = useRef(silenceEdit);
+  silenceEditRef.current = silenceEdit;
+  // maxPause читаем через ref — onFinal мемоизирован с [], а значение может
+  // смениться между запуском job'а и его завершением.
+  const maxPauseRef = useRef(maxPause);
+  maxPauseRef.current = maxPause;
+  const silenceJob = useJobEvents(
+    silenceJobId,
+    useCallback((state: JobState) => {
+      if (state.status === "done" && state.result) {
+        const r = state.result as unknown as DetectSilenceResult;
+        // Адаптив: из каждой найденной паузы вырезаем только излишек сверх
+        // maxPause (короткие паузы не трогаем вовсе). Так речь не звучит
+        // «пулемётом» — остаётся естественное дыхание.
+        const trimmed = adaptiveTrim(
+          r.segments.map(([start, end]) => ({ start, end })),
+          maxPauseRef.current
+        );
+        silenceEditRef.current.replaceAll(
+          trimmed.map(({ start, end }) => ({ start, end, status: "accepted" as const })),
+          { keepManual: true }
+        );
+        setSilenceJobId(null);
+        toast.success(
+          trimmed.length > 0
+            ? `Тишина: ${trimmed.length} участков к вырезу (пауза >${maxPauseRef.current}с) — проверьте и сохраните`
+            : `Длинных пауз (>${maxPauseRef.current}с) не найдено`
+        );
+      } else if (state.status === "failed") {
+        setSilenceJobId(null);
+        toast.error("Детект тишины упал", { description: state.error ?? undefined });
       }
-      const covered = wordsInRange(idx, s, e)
-        .map((w) => w.word)
-        .join(" ")
-        .trim();
-      updateMute(id, { start: s, end: e, word: covered || undefined });
-    },
-    [store, updateMute]
+    }, [])
   );
+  const detectingSilence =
+    silenceJob.state?.status === "running" || silenceJob.state?.status === "pending";
 
-  /**
-   * Свободная правка границ ТОЧНО как задал пользователь (драг по волне), БЕЗ
-   * снапа к словам. Волна обещает покадровую точность — снап бы отбрасывал
-   * подрезку назад к краю слова. Снап к словам оставлен только для клика по
-   * слову в транскрипте (adjustMute).
-   */
-  const adjustMuteFree = useCallback(
-    (id: string, start: number, end: number) => {
-      const idx = wordIndexRef.current;
-      let s = Math.max(0, start);
-      let e = end;
-      if (e - s < MIN_MUTE_S) e = s + MIN_MUTE_S;
-      const covered = wordsInRange(idx, s, e)
-        .map((w) => w.word)
-        .join(" ")
-        .trim();
-      updateMute(id, { start: s, end: e, word: covered || undefined });
-    },
-    [updateMute]
-  );
+  /** Запустить авто-детект тишины по текущему аудио таймлайна. */
+  const runDetectSilence = useCallback(async () => {
+    if (!audioPath || detectingSilence) return;
+    try {
+      // min_duration ловим паузы уже от maxPause (короче — резать нечего, их
+      // отсеет и adaptiveTrim). padding=0 и merge_gap=0: адаптивную обрезку и
+      // «дыхание» считаем на клиенте по сырым границам, чтобы не сдвигать край.
+      const job = await createDetectSilenceJob({
+        video_path: audioPath,
+        threshold_db: thresholdDb,
+        min_duration: Math.max(0.3, maxPause + 0.05),
+        merge_gap: 0,
+        padding_before: 0,
+        padding_after: 0,
+      });
+      setSilenceJobId(job.id);
+      toast("Ищу тишину…", { description: `паузы длиннее ${maxPause}с · порог ${thresholdDb}dB` });
+    } catch (e) {
+      toast.error("Не удалось запустить детект тишины", { description: String(e) });
+    }
+  }, [audioPath, detectingSilence, maxPause, thresholdDb]);
 
   const deleteMute = useCallback(
     (id: string) => {
-      store.set((prev) => prev.filter((m) => m.id !== id));
+      muteStore.set((prev) => prev.filter((m) => m.id !== id));
       if (selectedId === id) setSelectedId(null);
       toast.success("Заглушка удалена", {
         description: `${platformizeShortcut("⌘Z")} чтобы вернуть`,
       });
     },
-    [store, selectedId]
+    [muteStore, selectedId]
   );
 
   const addMuteHere = useCallback(() => {
@@ -638,13 +589,14 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
         source: "manual",
       },
     };
-    store.set((prev) =>
+    muteStore.set((prev) =>
       [...prev, created].sort((a, b) => a.start - b.start)
     );
     setSelectedId(id);
+    setSelectedSilenceId(null);
     centerViewOn(toAudio(start), toAudio(end));
     toast.success("Заглушка добавлена", { description: fmtMs(start * 1000) });
-  }, [currentLocalS, store, centerViewOn, toAudio]);
+  }, [currentLocalS, muteStore, centerViewOn, toAudio]);
 
   // --- сохранение -----------------------------------------------------------
   const save = useCallback(async () => {
@@ -653,7 +605,7 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
     const off = offsetRef.current;
     // Собираем mutes обратно: правим start/end/word/status, пересчитываем
     // stream_start/stream_end (их читает Vegas), сохраняем прочие поля.
-    const nextMutes: MuteRecord[] = store.present.map((m) => {
+    const nextMutes: MuteRecord[] = muteStore.present.map((m) => {
       const streamStart =
         Number.isFinite(m.raw.stream_start) || off !== 0 ? m.start + off : undefined;
       const streamEnd =
@@ -669,14 +621,25 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
         ...(streamEnd != null ? { stream_end: round3(streamEnd) } : {}),
       };
     });
-    const nextDoc: DecisionsDoc = { ...doc, mutes: nextMutes };
+    // Silence-сегменты — audio-секунды, отсортированы; их читает ExportScreen
+    // (не пере-детектит) и рендер вырезает `accepted`.
+    const nextSilences: SilenceRecord[] = silenceStore.present
+      .slice()
+      .sort((a, b) => a.start - b.start)
+      .map((s) => ({
+        id: s.id,
+        start: round3(s.start),
+        end: round3(s.end),
+        status: s.status,
+      }));
+    const nextDoc: DecisionsDoc = { ...doc, mutes: nextMutes, silences: nextSilences };
     setSaving(true);
     try {
       await writeDecisions(decisionsPath, nextDoc);
       docRef.current = nextDoc;
       store.mark();
       toast.success("Сохранено", {
-        description: `Заглушим ${store.present.filter((m) => m.status === SILENCED).length} из ${store.present.length}`,
+        description: `Заглушим ${muteStore.present.filter((m) => m.status === SILENCED).length} из ${muteStore.present.length}`,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -685,7 +648,7 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
     } finally {
       setSaving(false);
     }
-  }, [saving, store, decisionsPath]);
+  }, [saving, store, muteStore, silenceStore, decisionsPath]);
 
   // --- навигация по матам клавишами -----------------------------------------
   useHotkey(["arrowdown", "arrowright"], (e) => {
@@ -696,16 +659,58 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
     e.preventDefault();
     goToMute(-1);
   });
-  useHotkey(" ", (e) => {
-    e.preventDefault();
-    const m = mutes.find((x) => x.id === selectedId) ?? mutes[0];
-    if (m) playMute(m);
-  });
+  // Пробел = toggle: нажал — играет НЕПРЕРЫВНО от текущего плейхеда со сквозным
+  // глушением «как в экспорте» до конца дорожки; нажал ещё раз — стоп.
+  // Пер-момент playMute (клик по строке/блоку) не трогаем — он живёт отдельно.
+  useEffect(() => {
+    const isEditable = (el: EventTarget | null): boolean => {
+      if (!(el instanceof HTMLElement)) return false;
+      const tag = el.tagName;
+      return (
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        el.isContentEditable
+      );
+    };
+    // Пробел — переключатель (toggle): нажал — играет от плейхеда до конца
+    // дорожки со сквозным глушением «как в экспорте»; нажал ещё раз (или дошло
+    // до конца) — стоп. Пер-момент playMute (клик по строке/блоку) не трогаем.
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== " " && e.code !== "Space") return;
+      if (isEditable(e.target)) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      e.preventDefault();
+      if (e.repeat) return; // автоповтор при удержании — игнорируем
+      const el = audioRef.current;
+      const playing = !!el && !el.paused;
+      if (playing) {
+        stopPlayback();
+      } else {
+        // Играем от живого положения плейхеда до конца дорожки.
+        playFrom(currentAudioRef.current, true);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [playFrom, stopPlayback, currentAudioRef, audioRef]);
   useHotkey(["m", "enter"], () => {
+    // Тишина в фокусе — переключаем её; иначе мат.
+    if (selectedSilenceId) {
+      silenceEdit.toggleStatus(selectedSilenceId);
+      return;
+    }
     const m = mutes.find((x) => x.id === selectedId);
     if (m) toggleMuted(m);
   });
   useHotkey("delete", () => {
+    if (selectedSilenceId) {
+      silenceEdit.deleteSegment(selectedSilenceId);
+      setSelectedSilenceId(null);
+      return;
+    }
     if (selectedId) deleteMute(selectedId);
   });
   useHotkey("mod+z", (e) => {
@@ -720,7 +725,10 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
     e.preventDefault();
     save();
   });
-  useHotkey("escape", () => setSelectedId(null));
+  useHotkey("escape", () => {
+    setSelectedId(null);
+    setSelectedSilenceId(null);
+  });
 
   usePublishTimelineActions({
     onSave: save,
@@ -730,6 +738,27 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
     canRedo: store.canRedo,
     dirty: store.dirty,
   });
+
+  // Стабильные обработчики для мемоизированных TimelineCanvas/OverviewStrip:
+  // инлайн-стрелки в JSX меняли бы идентичность на каждый throttle-тик таймкода
+  // и сводили бы memo на нет. onResize/onSelect/onPickMarker дёргают свежие
+  // selectMute/adjustMuteFree через ref — сами остаются стабильными.
+  const selectMuteRef = useRef(selectMute);
+  selectMuteRef.current = selectMute;
+  const adjustFreeRef = useRef(adjustMuteFree);
+  adjustFreeRef.current = adjustMuteFree;
+  const toLocalRef = useRef(toLocal);
+  toLocalRef.current = toLocal;
+
+  const handleSelectPlay = useCallback((id: string) => {
+    selectMuteRef.current(id, { play: true });
+  }, []);
+  const handlePickMarker = useCallback((id: string) => {
+    selectMuteRef.current(id, { center: true });
+  }, []);
+  const handleResize = useCallback((id: string, aStart: number, aEnd: number) => {
+    adjustFreeRef.current(id, toLocalRef.current(aStart), toLocalRef.current(aEnd));
+  }, []);
 
   // --- render ---------------------------------------------------------------
   if (loading) {
@@ -770,13 +799,15 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
           </h1>
           <p className="mt-0.5 text-sm text-muted">
             Проверьте заглушки: что глушим, что оставляем.{" "}
-            <span className="text-fg">
-              Заглушим {silencedCount} из {mutes.length}
-            </span>
+            {reviewCount > 0 ? (
+              <span className="text-amber-400">осталось {reviewCount} проверить</span>
+            ) : (
+              <span className="text-fg">всё проверено</span>
+            )}
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <div className="flex items-center gap-1 rounded-md border border-white/8 bg-black/30 p-1">
+          <div className="flex items-center gap-1 rounded-md border border-white/5 bg-black/30 p-1">
             <Button
               size="sm"
               variant="ghost"
@@ -815,110 +846,268 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
         durationS={wave.duration_s}
         peaks={wave.peaks}
         markers={markers}
-        currentS={currentAudioS}
+        currentRef={currentAudioRef}
         view={view}
         onSeek={seekAudio}
-        onPickMarker={(id) => selectMute(id, { center: true })}
+        onPickMarker={handlePickMarker}
       />
 
-      {/* Нав-бар: переход по матам · зум · добавить */}
-      <div className="flex flex-wrap items-center gap-2">
-        <div className="flex items-center gap-1 rounded-md border border-white/8 bg-black/30 p-1">
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => goToMute(-1)}
-            disabled={!mutes.length}
-            className="h-7 w-7 p-0"
-            aria-label="Предыдущий мат"
-          >
-            <ChevronLeft className="h-4 w-4" />
-          </Button>
-          <span className="min-w-[74px] text-center font-mono text-[11px] tabular-nums text-subtle">
-            {selectedIndex >= 0 ? `мат ${selectedIndex + 1}/${mutes.length}` : `матов ${mutes.length}`}
+      {/* Переключатель режима: маты / тишина — каждый показывает свой тулбар */}
+      <div className="flex items-center gap-1 self-start rounded-lg border border-white/10 bg-white/5 p-1">
+        <button
+          type="button"
+          onClick={() => switchMode("mutes")}
+          className={cn(
+            "inline-flex h-8 items-center gap-2 rounded-md border px-3 text-xs font-medium transition-colors",
+            mode === "mutes"
+              ? "border-white/15 bg-surface text-fg shadow-[0_1px_0_rgb(255_255_255/0.05)_inset]"
+              : "border-transparent text-muted hover:text-fg"
+          )}
+        >
+          <VolumeX className="h-3.5 w-3.5" /> Маты
+          <span className="rounded bg-white/8 px-1.5 py-px font-mono text-[10px] tabular-nums text-subtle">
+            {mutes.length}
           </span>
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => goToMute(1)}
-            disabled={!mutes.length}
-            className="h-7 w-7 p-0"
-            aria-label="Следующий мат"
-          >
-            <ChevronRight className="h-4 w-4" />
-          </Button>
-        </div>
-
-        <div className="flex items-center gap-1 rounded-md border border-white/8 bg-black/30 p-1">
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => zoomBy(ZOOM_OUT)}
-            className="h-7 w-7 p-0"
-            aria-label="Отдалить"
-          >
-            <ZoomOut className="h-3.5 w-3.5" />
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => zoomBy(ZOOM_IN)}
-            className="h-7 w-7 p-0"
-            aria-label="Приблизить"
-          >
-            <ZoomIn className="h-3.5 w-3.5" />
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={fitAll}
-            className="h-7 px-2 text-xs"
-            aria-label="Весь стрим"
-          >
-            <Maximize2 className="mr-1 h-3.5 w-3.5" /> весь стрим
-          </Button>
-        </div>
-
-        <Button size="sm" variant="secondary" onClick={addMuteHere}>
-          <Plus className="mr-1.5 h-3.5 w-3.5" /> мат на плейхеде
-        </Button>
-
-        <span className="font-mono text-[11px] tabular-nums text-subtle">
-          {fmtMs(currentAudioS * 1000)} / {fmtMs(wave.duration_s * 1000)}
-        </span>
-
-        <span className="ml-auto flex items-center gap-1.5 text-xs text-subtle">
-          <VolumeX className="h-3.5 w-3.5 text-err" /> {silencedCount} заглушим
-          <span className="mx-1 text-white/15">·</span>
-          {mutes.length - silencedCount} оставим
-        </span>
+        </button>
+        <button
+          type="button"
+          onClick={() => switchMode("silence")}
+          className={cn(
+            "inline-flex h-8 items-center gap-2 rounded-md border px-3 text-xs font-medium transition-colors",
+            mode === "silence"
+              ? "border-white/15 bg-surface text-fg shadow-[0_1px_0_rgb(255_255_255/0.05)_inset]"
+              : "border-transparent text-muted hover:text-fg"
+          )}
+        >
+          <Scissors className="h-3.5 w-3.5" /> Тишина
+          {silences.length > 0 && (
+            <span className="rounded bg-white/8 px-1.5 py-px font-mono text-[10px] tabular-nums text-subtle">
+              {silences.length}
+            </span>
+          )}
+        </button>
       </div>
 
+      {/* Тулбар режима «Маты»: переход по матам · зум · добавить · сводка */}
+      {mode === "mutes" && (
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center gap-1 rounded-md border border-white/5 bg-black/30 p-1">
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => goToMute(-1)}
+              disabled={!mutes.length}
+              className="h-7 w-7 p-0"
+              aria-label="Предыдущий мат"
+            >
+              <ChevronLeft className="h-4 w-4" />
+            </Button>
+            <span className="min-w-[74px] text-center font-mono text-[11px] tabular-nums text-subtle">
+              {selectedIndex >= 0 ? `мат ${selectedIndex + 1}/${mutes.length}` : `матов ${mutes.length}`}
+            </span>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => goToMute(1)}
+              disabled={!mutes.length}
+              className="h-7 w-7 p-0"
+              aria-label="Следующий мат"
+            >
+              <ChevronRight className="h-4 w-4" />
+            </Button>
+          </div>
+
+          <div className="flex items-center gap-1 rounded-md border border-white/5 bg-black/30 p-1">
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => zoomBy(ZOOM_OUT)}
+              className="h-7 w-7 p-0"
+              aria-label="Отдалить"
+            >
+              <ZoomOut className="h-3.5 w-3.5" />
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => zoomBy(ZOOM_IN)}
+              className="h-7 w-7 p-0"
+              aria-label="Приблизить"
+            >
+              <ZoomIn className="h-3.5 w-3.5" />
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={fitAll}
+              className="h-7 px-2 text-xs"
+              aria-label="Весь стрим"
+            >
+              <Maximize2 className="mr-1 h-3.5 w-3.5" /> весь стрим
+            </Button>
+          </div>
+
+          <Button size="sm" variant="secondary" onClick={addMuteHere}>
+            <Plus className="mr-1.5 h-3.5 w-3.5" /> мат на плейхеде
+          </Button>
+
+          <span className="ml-auto flex items-center gap-1.5 text-xs text-subtle">
+            {reviewCount > 0 && (
+              <>
+                <span className="text-amber-400">{reviewCount} проверить</span>
+                <span className="mx-1 text-white/15">·</span>
+              </>
+            )}
+            <VolumeX className="h-3.5 w-3.5 text-err" /> {silencedCount} заглушим
+            <span className="mx-1 text-white/15">·</span>
+            {mutes.length - silencedCount} оставим
+          </span>
+
+          <span className="font-mono text-[11px] tabular-nums text-subtle">
+            {fmtMs(currentAudioS * 1000)} / {fmtMs(wave.duration_s * 1000)}
+          </span>
+        </div>
+      )}
+
+      {/* Тулбар режима «Тишина»: найти тишину · (шестерёнка) параметры · сводка */}
+      {mode === "silence" && (
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={runDetectSilence}
+            disabled={detectingSilence}
+            loading={detectingSilence}
+            aria-label="Найти тишину автоматически"
+          >
+            <Wand2 className="mr-1.5 h-3.5 w-3.5" />
+            {detectingSilence ? "ищу тишину…" : "найти тишину"}
+          </Button>
+
+          <Button
+            size="sm"
+            variant={showSilenceParams ? "secondary" : "ghost"}
+            onClick={() => setShowSilenceParams((v) => !v)}
+            className="h-8 px-2"
+            aria-label="Параметры поиска тишины"
+          >
+            <Settings2 className="mr-1.5 h-3.5 w-3.5" />
+            пауза ≤{maxPause}с · {thresholdDb}dB
+          </Button>
+
+          {/* Параметры (пауза/порог) — по умолчанию свёрнуты за шестерёнкой */}
+          {showSilenceParams && (
+            <div className="flex items-center gap-1 rounded-md border border-white/5 bg-black/30 p-1">
+              <span className="pl-1 text-[11px] text-subtle">пауза ≤</span>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setMaxPause((v) => Math.max(0, round1(v - 0.5)))}
+                disabled={detectingSilence || maxPause <= 0}
+                className="h-7 w-7 p-0"
+                aria-label="Меньше паузы"
+              >
+                <ZoomOut className="h-3.5 w-3.5" />
+              </Button>
+              <span className="min-w-[38px] text-center font-mono text-[11px] tabular-nums text-fg">
+                {maxPause}с
+              </span>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setMaxPause((v) => Math.min(10, round1(v + 0.5)))}
+                disabled={detectingSilence || maxPause >= 10}
+                className="h-7 w-7 p-0"
+                aria-label="Больше паузы"
+              >
+                <ZoomIn className="h-3.5 w-3.5" />
+              </Button>
+              <span className="pl-1 text-[11px] text-subtle">порог</span>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setThresholdDb((v) => Math.max(-50, v - 2))}
+                disabled={detectingSilence || thresholdDb <= -50}
+                className="h-7 w-7 p-0"
+                aria-label="Строже (тише порог)"
+              >
+                <ZoomOut className="h-3.5 w-3.5" />
+              </Button>
+              <span className="min-w-[46px] text-center font-mono text-[11px] tabular-nums text-fg">
+                {thresholdDb}dB
+              </span>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setThresholdDb((v) => Math.min(-15, v + 2))}
+                disabled={detectingSilence || thresholdDb >= -15}
+                className="h-7 w-7 p-0"
+                aria-label="Агрессивнее (громче порог)"
+              >
+                <ZoomIn className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+          )}
+
+          <span className="ml-auto flex items-center gap-1.5 text-xs text-subtle">
+            {silences.length > 0 ? (
+              <>
+                <Scissors className="h-3.5 w-3.5 text-amber-400" />
+                <span className="text-amber-400">{acceptedSilenceCount}</span> вырежем
+                <span className="mx-1 text-white/15">·</span>
+                {silences.length - acceptedSilenceCount} оставим
+              </>
+            ) : (
+              <span className="text-subtle">тишина не искалась</span>
+            )}
+          </span>
+
+          <span className="font-mono text-[11px] tabular-nums text-subtle">
+            {fmtMs(currentAudioS * 1000)} / {fmtMs(wave.duration_s * 1000)}
+          </span>
+        </div>
+      )}
+
       {/* Главный таймлайн */}
-      {mutes.length === 0 && (
+      {mode === "mutes" && mutes.length === 0 && (
         <Card variant="surface" padding="sm">
           <p className="text-center text-xs text-subtle">
             Заглушек нет — мат не найден или все убраны. «+ мат на плейхеде» добавит вручную.
           </p>
         </Card>
       )}
-      <div className="min-h-0 flex-1">
+      {mode === "silence" && silences.length === 0 && (
+        <Card variant="surface" padding="sm">
+          <p className="text-center text-xs text-subtle">
+            Тишина ещё не искалась. «найти тишину» подберёт длинные паузы к вырезу.
+          </p>
+        </Card>
+      )}
+      <div className="relative min-h-0 flex-1">
         <TimelineCanvas
           peaks={wave.peaks}
           durationS={wave.duration_s}
-          blocks={markers as TimelineBlock[]}
+          blocks={mode === "mutes" ? markers : EMPTY_BLOCKS}
           view={view}
-          currentS={currentAudioS}
+          currentRef={currentAudioRef}
           onViewChange={setView}
           onSeek={seekAudio}
-          onSelect={(id) => selectMute(id, { play: true })}
-          onResize={(id, aStart, aEnd) => adjustMuteFree(id, toLocal(aStart), toLocal(aEnd))}
+          onSelect={handleSelectPlay}
+          onResize={handleResize}
           onScrub={scrubAtAudio}
         />
+        {mode === "silence" && silenceBlocks.length > 0 && (
+          <SilenceOverlay
+            blocks={silenceBlocks}
+            durationS={wave.duration_s}
+            view={view}
+            onSelect={selectSilence}
+          />
+        )}
       </div>
 
       {/* Инспектор выбранного мата */}
-      {selected && (
+      {mode === "mutes" && selected && (
         <MuteInspector
           index={selectedIndex + 1}
           total={mutes.length}
@@ -947,19 +1136,76 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
         />
       )}
 
+      {/* Инспектор выбранного участка тишины */}
+      {mode === "silence" && selectedSilence && (
+        <Card variant="surface" padding="sm">
+          <div className="flex flex-wrap items-center gap-3 text-sm">
+            <span className="flex items-center gap-1.5 font-medium">
+              <Scissors className="h-4 w-4 text-amber-400" /> Тишина
+            </span>
+            <span className="font-mono text-xs tabular-nums text-subtle">
+              {fmtMs(selectedSilence.start * 1000)} – {fmtMs(selectedSilence.end * 1000)}
+              <span className="ml-1.5 text-white/40">
+                ({(selectedSilence.end - selectedSilence.start).toFixed(2)}с)
+              </span>
+            </span>
+            <span
+              className={
+                selectedSilence.status === "accepted"
+                  ? "rounded bg-amber-400/15 px-1.5 py-0.5 text-[11px] text-amber-400"
+                  : "rounded bg-white/8 px-1.5 py-0.5 text-[11px] text-subtle"
+              }
+            >
+              {selectedSilence.status === "accepted" ? "вырежем" : "оставим"}
+            </span>
+
+            <div className="ml-auto flex items-center gap-1.5">
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  playAudioRange(selectedSilence.start, selectedSilence.end, 0.06);
+                }}
+              >
+                прослушать
+              </Button>
+              <Button
+                size="sm"
+                variant={selectedSilence.status === "accepted" ? "secondary" : "primary"}
+                onClick={() => silenceEdit.toggleStatus(selectedSilence.id)}
+              >
+                {selectedSilence.status === "accepted" ? "оставить" : "вырезать"}
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  silenceEdit.deleteSegment(selectedSilence.id);
+                  setSelectedSilenceId(null);
+                }}
+                aria-label="Удалить участок тишины"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+          </div>
+        </Card>
+      )}
+
       {/* Hidden audio */}
       <audio
         ref={audioRef}
         src={audioSrc}
         preload="auto"
         className="hidden"
-        onTimeUpdate={onAudioTime}
-        onPause={onAudioPause}
+        onTimeUpdate={audioProps.onTimeUpdate}
+        onPause={audioProps.onPause}
+        onEnded={audioProps.onEnded}
       />
 
       <div className="flex items-center justify-between gap-2 pr-1 text-[11px] text-subtle">
         <span>
-          ←→/↑↓ — между матами · колесо — зум · Shift+колесо — панорама · Space — прослушать · M/Enter — глушить/оставить · Del — удалить
+          ←→/↑↓ — между матами · щипок/колесо — зум · две пальца/Shift+колесо — панорама · Space — прослушать · M/Enter — глушить/оставить (мат) или вырезать/оставить (тишина) · Del — удалить · Esc — снять выбор
         </span>
         {store.dirty && (
           <span>
@@ -987,6 +1233,10 @@ export function TimelineScreen({ decisionsPath }: { decisionsPath: string }) {
 
 function round3(n: number): number {
   return Math.round(n * 1000) / 1000;
+}
+
+function round1(n: number): number {
+  return Math.round(n * 10) / 10;
 }
 
 function extractProjectName(decisionsPath: string): string {

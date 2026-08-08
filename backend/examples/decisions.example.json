@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
-  "source": "./input/stream.mp4",
-  "original": "./input/original_video.mp4",
+  "source": "./stream.mp4",
+  "original": "./original_video.mp4",
   "range_in": "00:01:00.000",
   "range_out": "00:02:00.000",
   "local_duration": "00:01:00.000",

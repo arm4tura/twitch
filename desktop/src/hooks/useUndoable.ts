@@ -111,3 +111,45 @@ export function useUndoable<T>(initial: T, limit: number = DEFAULT_LIMIT): Undoa
     [present, set, undo, redo, reset, mark, past.length, future.length]
   );
 }
+
+/**
+ * sliceUndoable — проекция одного поля комбинированного undoable-стора в
+ * самостоятельный Undoable<S>.
+ *
+ * Зачем: TimelineScreen держит ОДИН стор `{mutes, silences}`, чтобы ⌘Z/⌘⇧Z
+ * ходили по единой истории поверх обоих списков. Но редакторы (useMuteEditing,
+ * useSilenceEditing) написаны против `Undoable<T[]>` каждый над своим списком.
+ * Адаптер отдаёт им «вид» на нужный срез: `set`/`present` работают со срезом,
+ * а undo/redo/reset/mark/флаги делегируются родителю — то есть история общая.
+ *
+ * `reset(nextSlice)` перезаписывает только свой срез (история родителя чистится
+ * его собственным reset при загрузке документа, не здесь).
+ */
+export function sliceUndoable<W, K extends keyof W>(
+  parent: Undoable<W>,
+  key: K
+): Undoable<W[K]> {
+  type S = W[K];
+  return {
+    present: parent.present[key],
+    set: (next) =>
+      parent.set((whole) => {
+        const prevSlice = whole[key];
+        const value =
+          typeof next === "function"
+            ? (next as (p: S) => S)(prevSlice)
+            : next;
+        if (Object.is(value, prevSlice)) return whole;
+        return { ...whole, [key]: value };
+      }),
+    undo: parent.undo,
+    redo: parent.redo,
+    reset: (nextSlice) =>
+      parent.set((whole) => ({ ...whole, [key]: nextSlice })),
+    mark: parent.mark,
+    canUndo: parent.canUndo,
+    canRedo: parent.canRedo,
+    dirty: parent.dirty,
+    size: parent.size,
+  };
+}

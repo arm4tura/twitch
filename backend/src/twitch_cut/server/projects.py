@@ -6,7 +6,7 @@ runner завершает `process` job, путь `req.decisions` добавля
 
 `GET /projects` эндпоинт читает реестр, для каждого пути читает
 `decisions.json` (быстро — это ~несколько KB), собирает метаданные (кол-во
-регионов, mtime, длительность из `range_*_ms`). Мёртвые/битые пути пропускает
+регионов, mtime, длительность из таймкодов `range_in`/`range_out`). Мёртвые/битые пути пропускает
 молча — они удалятся при следующем `register()`.
 
 Почему JSON, а не БД: у нас single-user desktop, никаких конкурентных запросов,
@@ -25,11 +25,11 @@ logger = logging.getLogger(__name__)
 
 
 def _default_config_dir() -> Path:
-    """Найти каталог конфига по XDG / Windows APPDATA / mac Application Support.
+    """Легаси-каталог конфига (XDG / Windows APPDATA / mac Application Support).
 
-    Не создаём каталог здесь — вызовется явно перед записью. Тесты подсовывают
-    свой tmp_path через переменную окружения TWITCH_CUT_PROJECTS_FILE (см.
-    default_projects_file).
+    Использовался как основное место реестра до переезда в DATA_ROOT; теперь —
+    только фолбэк для старых установок (см. default_projects_file). Каталог
+    здесь не создаём — вызовется явно перед записью.
     """
     if os.name == "nt":
         base = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
@@ -39,16 +39,90 @@ def _default_config_dir() -> Path:
 
 
 def default_projects_file() -> Path:
-    """Путь к реестру. Приоритет: env TWITCH_CUT_PROJECTS_FILE → XDG/APPDATA."""
+    """Путь к реестру. Приоритет:
+      1. env TWITCH_CUT_PROJECTS_FILE (тесты подсовывают свой tmp_path),
+      2. <DATA_ROOT>/projects.json — рядом с work/ и models/,
+      3. XDG/APPDATA — легаси-фолбэк, только если там уже лежит старый файл.
+
+    Реестр хранит пути к decisions.json внутри DATA_ROOT/work/. Держим его в
+    том же DATA_ROOT, чтобы portable-папка данных переносилась целиком (иначе
+    после переноса «недавние проекты» указывали бы в пустоту). Легаси-путь
+    подхватываем, только если новый ещё не создан и старый реально существует —
+    так старые установки не теряют список после обновления.
+    """
     override = os.environ.get("TWITCH_CUT_PROJECTS_FILE")
     if override:
         return Path(override)
-    return _default_config_dir() / "projects.json"
+
+    from ..config import DATA_ROOT
+
+    primary = DATA_ROOT / "projects.json"
+    if primary.exists():
+        return primary
+
+    legacy = _default_config_dir() / "projects.json"
+    if legacy.exists():
+        return legacy
+
+    return primary
 
 
 # --- registry I/O ------------------------------------------------------------
 
 MAX_REGISTRY_ENTRIES = 100
+
+
+def registered_roots(*, store_path: Optional[Path] = None) -> set[Path]:
+    """Родительские каталоги всех зарегистрированных decisions.json (resolved).
+
+    Используется авторизацией data-эндпоинтов (/decisions, /transcript): файлы
+    внутри папки любого «недавнего» проекта считаются легальными для чтения и
+    записи. Битые записи реестра пропускаются молча.
+    """
+    store = store_path or default_projects_file()
+    roots: set[Path] = set()
+    for raw in _load_registry(store):
+        try:
+            roots.add(Path(raw).expanduser().resolve().parent)
+        except Exception:  # noqa: BLE001
+            continue
+    return roots
+
+
+def registered_stream_paths(*, store_path: Optional[Path] = None) -> set[Path]:
+    """Пути к исходным видео (`source`/`stream`) всех зарегистрированных проектов.
+
+    Исходник живёт ТАМ, куда пользователь его положил (обычно вне work/), а не
+    в папке проекта — там только decisions.json + кэш. Авторизация /thumbnail
+    строится по этому списку: превью легально только для видео, реально
+    привязанного к одному из «недавних» проектов. Пути в decisions.json могут
+    быть относительными (напр. "./stream.mp4") — резолвим их относительно папки
+    самого decisions.json, а не cwd процесса. Битые записи пропускаем молча.
+    """
+    store = store_path or default_projects_file()
+    out: set[Path] = set()
+    for raw in _load_registry(store):
+        dpath = Path(raw).expanduser()
+        try:
+            doc = json.loads(dpath.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(doc, dict):
+            continue
+        for key in ("source", "original", "stream"):
+            v = doc.get(key)
+            if not isinstance(v, str) or not v:
+                continue
+            p = Path(v).expanduser()
+            # Относительные пути — от папки decisions.json (см. build_decisions,
+            # source может быть "./stream.mp4").
+            if not p.is_absolute():
+                p = dpath.resolve().parent / p
+            try:
+                out.add(p.resolve())
+            except Exception:  # noqa: BLE001
+                continue
+    return out
 
 
 def _load_registry(store_path: Path) -> list[str]:
@@ -101,6 +175,44 @@ def register_project(decisions_path: str | Path, *, store_path: Optional[Path] =
 # --- listing -----------------------------------------------------------------
 
 
+def _duration_ms(doc: dict[str, Any]) -> Optional[int]:
+    """Длительность обработанного куска в миллисекундах, или None.
+
+    Схема 1.1 (актуальная, см. decisions.build_decisions) хранит границы как
+    ТАЙМКОДЫ-строки в ключах `range_in`/`range_out` ("00:01:04.220") плюс готовый
+    `local_duration`. Раньше _project_meta искал только числовые `range_*_ms`,
+    которых в реальных файлах нет — поэтому длительность в Dashboard всегда была
+    пустой. Разбираем оба формата:
+      1) `local_duration` — таймкод-строка, самый прямой источник;
+      2) `range_in`/`range_out` — таймкоды-строки, берём разницу;
+      3) числовые `range_in_ms`/`range_out_ms` или вложенный `range: {in_ms,out_ms}`
+         — legacy / тестовый формат.
+    """
+    from ..timecode import parse_timecode
+
+    local = doc.get("local_duration")
+    if isinstance(local, str) and local:
+        try:
+            return parse_timecode(local).ms
+        except Exception:  # noqa: BLE001
+            pass
+
+    r_in, r_out = doc.get("range_in"), doc.get("range_out")
+    if isinstance(r_in, str) and isinstance(r_out, str):
+        try:
+            return parse_timecode(r_out).ms - parse_timecode(r_in).ms
+        except Exception:  # noqa: BLE001
+            pass
+
+    nested = doc.get("range") if isinstance(doc.get("range"), dict) else {}
+    in_ms = doc.get("range_in_ms", nested.get("in_ms"))
+    out_ms = doc.get("range_out_ms", nested.get("out_ms"))
+    if isinstance(in_ms, (int, float)) and isinstance(out_ms, (int, float)):
+        return int(out_ms) - int(in_ms)
+
+    return None
+
+
 def _project_meta(decisions_path: Path) -> Optional[dict[str, Any]]:
     """Собрать метаданные проекта из decisions.json. Возвращает None если битый.
 
@@ -126,12 +238,25 @@ def _project_meta(decisions_path: Path) -> Optional[dict[str, Any]]:
     # В decisions.json путь к исходному видео пишется в "source" (см. build_decisions,
     # schema 1.1). Ключ "stream" — legacy, оставлен как fallback для старых файлов.
     # Кладём в stream_path — как ожидает фронт (ProjectMeta.stream_path).
+    # Путь может быть ОТНОСИТЕЛЬНЫМ ("source": "./stream.mp4" — так пишет
+    # build_decisions). Резолвим его от папки decisions.json, иначе фронт
+    # отправит "./stream.mp4" в /thumbnail, а generate_thumbnail разрешит его от
+    # cwd процесса → файл не найдётся (404) или не пройдёт авторизацию (403).
+    # Тот же приём — в registered_stream_paths().
     stream_path: Optional[str] = None
     for k in ("source", "stream"):
         v = doc.get(k)
         if isinstance(v, str) and v:
             stream_path = v
             break
+    if stream_path:
+        p = Path(stream_path).expanduser()
+        if not p.is_absolute():
+            p = decisions_path.resolve().parent / p
+        try:
+            stream_path = str(p.resolve())
+        except Exception:  # noqa: BLE001
+            stream_path = None
     workdir = None
     if isinstance(caches, dict):
         # workdir нигде явно не хранится, но audio-cache лежит внутри него;
@@ -143,11 +268,7 @@ def _project_meta(decisions_path: Path) -> Optional[dict[str, Any]]:
             except Exception:
                 workdir = None
 
-    range_in_ms = doc.get("range_in_ms") or doc.get("range", {}).get("in_ms") if isinstance(doc.get("range"), dict) else doc.get("range_in_ms")
-    range_out_ms = doc.get("range_out_ms") or doc.get("range", {}).get("out_ms") if isinstance(doc.get("range"), dict) else doc.get("range_out_ms")
-    duration_ms: Optional[int] = None
-    if isinstance(range_in_ms, (int, float)) and isinstance(range_out_ms, (int, float)):
-        duration_ms = int(range_out_ms) - int(range_in_ms)
+    duration_ms = _duration_ms(doc)
 
     return {
         "decisions_path": str(decisions_path),

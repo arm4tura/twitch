@@ -11,8 +11,11 @@ import {
   UploadCloud,
   Volume2,
   X,
+  Download,
+  AlertCircle,
 } from "lucide-react";
-import { createProcessJob, getSettings, type JobState } from "../api";
+import { createProcessJob, getSettings, getVodInfo, createDownloadVodJob, subscribeJob, type JobState, type JobEvent, type VodInfo } from "../api";
+import { parseTwitchVodInput, twitchVodUrl } from "../lib/twitch";
 import { Button } from "../components/ui/Button";
 import { Card, CardDescription, CardTitle } from "../components/ui/Card";
 import {
@@ -20,10 +23,14 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "../components/ui/Collapsible";
+import { Checkbox } from "../components/ui/Checkbox";
 import { FileField } from "../components/ui/FileField";
 import { Input, Label, Select } from "../components/ui/Input";
+import { TimecodeInput } from "../components/ui/TimecodeInput";
+import { VodDownloadOptions } from "../components/VodDownloadOptions";
 import { HelpTip } from "../components/ui/Tooltip";
 import { cn } from "../lib/cn";
+import { fmtDurationMs } from "../lib/format";
 
 /**
  * Опции для select-полей продвинутых настроек. Списки отражают то, что реально
@@ -180,27 +187,22 @@ function baseName(p: string): string {
 function parseTimecodeMs(v: string): number | null {
   if (!v) return null;
   const parts = v.split(":");
-  if (parts.length < 2 || parts.length > 3) return null;
-  const [hStr, mStr, sPart] = parts.length === 3 ? parts : ["0", parts[0], parts[1]];
+  if (parts.length < 1 || parts.length > 3) return null;
+  // Раскладка согласована с маской TimecodeInput: слева направо, начиная с
+  // часов. 3 группы → H:M:S, 2 → H:M, 1 → H.
+  let hStr = "0";
+  let mStr = "0";
+  let sPart = "0";
+  if (parts.length === 3) [hStr, mStr, sPart] = parts;
+  else if (parts.length === 2) [hStr, mStr] = parts;
+  else [hStr] = parts;
   const [sStr, msStr = "0"] = sPart.split(".");
-  const h = Number(hStr);
-  const m = Number(mStr);
-  const s = Number(sStr);
+  const h = Number(hStr || "0");
+  const m = Number(mStr || "0");
+  const s = Number(sStr || "0");
   const ms = Number(msStr.padEnd(3, "0").slice(0, 3));
   if ([h, m, s, ms].some((n) => Number.isNaN(n))) return null;
   return ((h * 3600 + m * 60 + s) * 1000) + ms;
-}
-
-function fmtDurationMs(ms: number): string {
-  const s = Math.round(ms / 1000);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  return h > 0
-    ? `${h}ч ${m}мин`
-    : m > 0
-      ? `${m}мин ${sec}с`
-      : `${sec}с`;
 }
 
 const VIDEO_EXT = ["mp4", "mkv", "mov", "ts", "avi", "webm"];
@@ -356,6 +358,7 @@ export function NewJobScreen({
           submitting={submitting}
           error={error}
           onSubmit={() => submit(true)}
+          onDownloadVod={(jobId) => onJobStarted(jobId)}
         />
       ) : (
         <AdvancedForm
@@ -403,19 +406,24 @@ function ModeToggle({ mode, onChange }: { mode: Mode; onChange: (m: Mode) => voi
 // Простой режим
 // ============================================================================
 
+type Source = "file" | "vod";
+
 function SimpleForm({
   stream,
   onStream,
   submitting,
   error,
   onSubmit,
+  onDownloadVod,
 }: {
   stream: string;
   onStream: (v: string) => void;
   submitting: boolean;
   error: string | null;
   onSubmit: () => void;
+  onDownloadVod: (jobId: string) => void;
 }) {
+  const [source, setSource] = useState<Source>("file");
   const [dragOver, setDragOver] = useState(false);
   const dragDepth = useRef(0);
 
@@ -443,10 +451,22 @@ function SimpleForm({
 
   return (
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-5">
+      {/* Переключатель источника: локальный файл / скачать Twitch VOD */}
+      <SourceSwitch source={source} onChange={setSource} />
+
+      {source === "vod" ? (
+        <VodSource variant="full" onDownloadStarted={onDownloadVod} />
+      ) : (
+        <>
       {/* Drop-зона */}
       <div
         role="button"
         tabIndex={0}
+        aria-label={
+          stream
+            ? `Выбрана запись ${baseName(stream)}. Нажмите, чтобы выбрать другую`
+            : "Зона выбора записи стрима. Нажмите, чтобы выбрать файл, или перетащите его сюда"
+        }
         onClick={pick}
         onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && pick()}
         onDragEnter={(e) => {
@@ -543,7 +563,419 @@ function SimpleForm({
           Сначала выберите запись стрима.
         </p>
       )}
+        </>
+      )}
     </div>
+  );
+}
+
+// ============================================================================
+// Переключатель источника + скачивание VOD
+// ============================================================================
+
+function SourceSwitch({
+  source,
+  onChange,
+}: {
+  source: Source;
+  onChange: (s: Source) => void;
+}) {
+  const items: { value: Source; label: string; icon: ReactNode }[] = [
+    { value: "file", label: "Локальный файл", icon: <FileVideo className="h-4 w-4" /> },
+    { value: "vod", label: "Twitch VOD", icon: <Download className="h-4 w-4" /> },
+  ];
+  return (
+    <div className="inline-flex self-center rounded-lg border border-white/10 bg-black/20 p-0.5 text-sm">
+      {items.map((it) => (
+        <button
+          key={it.value}
+          type="button"
+          onClick={() => onChange(it.value)}
+          className={cn(
+            "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 font-medium transition-colors",
+            "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-from",
+            source === it.value ? "bg-white/[0.08] text-fg" : "text-muted hover:text-fg"
+          )}
+        >
+          {it.icon}
+          {it.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * VodSource — ввод ссылки на Twitch VOD → превью метаданных → выбор качества и
+ * обрезки → запуск download-джобы.
+ *
+ * Два режима работы (`variant`):
+ *  • "full" (простой режим) — стартует джобу и СРАЗУ уводит на JobScreen через
+ *    onDownloadStarted. Прогресс показывает общий экран джобы.
+ *  • "inline" (расширенный режим) — качает VOD, НЕ покидая форму: подписывается
+ *    на события джобы, показывает компактный прогресс-бар прямо в карточке, а по
+ *    завершении отдаёт путь к скачанному mp4 через onResolvedStream — им
+ *    заполняется поле «Запись Twitch», и дальше юзер гоняет обычный расширенный
+ *    пайплайн уже по локальному файлу.
+ *
+ * Поток ввода общий: юзер вставляет URL → дебаунс → parseTwitchVodInput
+ * валидирует локально → getVodInfo тянет title/длительность/качества для превью
+ * и границ обрезки.
+ */
+function VodSource({
+  variant = "full",
+  onDownloadStarted,
+  onResolvedStream,
+}: {
+  variant?: "full" | "inline";
+  onDownloadStarted?: (jobId: string) => void;
+  onResolvedStream?: (streamPath: string) => void;
+}) {
+  const [url, setUrl] = useState("");
+  const [info, setInfo] = useState<VodInfo | null>(null);
+  const [loadingInfo, setLoadingInfo] = useState(false);
+  const [infoError, setInfoError] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
+
+  const [quality, setQuality] = useState("source");
+  const [trimEnabled, setTrimEnabled] = useState(false);
+  const [trimStart, setTrimStart] = useState("");
+  const [trimEnd, setTrimEnd] = useState("");
+
+  // Inline-режим: прогресс скачивания прямо в карточке (без ухода на JobScreen).
+  const [dl, setDl] = useState<{
+    stage: string;
+    progress: number;
+    message: string;
+    status: JobState["status"];
+    result: string | null;
+  } | null>(null);
+  const unsubRef = useRef<null | (() => void)>(null);
+
+  // Отписка от WS при размонтировании.
+  useEffect(() => {
+    return () => {
+      unsubRef.current?.();
+      unsubRef.current = null;
+    };
+  }, []);
+
+  // Локальная валидация ссылки — без запроса к сети.
+  const parsed = useMemo(() => parseTwitchVodInput(url), [url]);
+  const urlInvalid = url.trim().length > 0 && parsed == null;
+
+  // Дебаунс + запрос метаданных при валидной ссылке. Гонки гасим флагом.
+  useEffect(() => {
+    if (!parsed) {
+      setInfo(null);
+      setInfoError(null);
+      setLoadingInfo(false);
+      return;
+    }
+    let alive = true;
+    setLoadingInfo(true);
+    setInfoError(null);
+    const t = window.setTimeout(() => {
+      getVodInfo(twitchVodUrl(parsed.id))
+        .then((vi) => {
+          if (!alive) return;
+          setInfo(vi);
+          // Дефолт качества — первое из списка (обычно source).
+          if (vi.qualities.length) setQuality(vi.qualities[0].value);
+          // Если в ссылке был ?t= — предзаполняем начало обрезки.
+          if (parsed.startOffsetSec != null && parsed.startOffsetSec > 0) {
+            setTrimEnabled(true);
+            const s = parsed.startOffsetSec;
+            const hh = Math.floor(s / 3600);
+            const mm = Math.floor((s % 3600) / 60);
+            const ss = s % 60;
+            const pad = (n: number) => n.toString().padStart(2, "0");
+            setTrimStart(`${pad(hh)}:${pad(mm)}:${pad(ss)}`);
+          }
+        })
+        .catch((e) => {
+          if (!alive) return;
+          setInfo(null);
+          // Не блокируем скачивание, если info-endpoint ещё не готов на бэке —
+          // просто не покажем превью/границы. Сообщаем мягко.
+          setInfoError(e instanceof Error ? e.message : String(e));
+        })
+        .finally(() => {
+          if (alive) setLoadingInfo(false);
+        });
+    }, 400);
+    return () => {
+      alive = false;
+      window.clearTimeout(t);
+    };
+  }, [parsed]);
+
+  const start = async () => {
+    if (!parsed) return;
+    setStartError(null);
+    setStarting(true);
+    try {
+      const state = await createDownloadVodJob({
+        url: twitchVodUrl(parsed.id),
+        quality,
+        range_in: trimEnabled && trimStart ? trimStart : null,
+        range_out: trimEnabled && trimEnd ? trimEnd : null,
+      });
+      if (variant === "full") {
+        // Простой режим — уходим на общий экран джобы.
+        onDownloadStarted?.(state.id);
+        return;
+      }
+      // Inline (расширенный) — остаёмся, показываем прогресс, ждём файл.
+      setDl({
+        stage: state.stage,
+        progress: state.progress,
+        message: state.message,
+        status: state.status,
+        result: null,
+      });
+      unsubRef.current = await subscribeJob(state.id, (ev: JobEvent) => {
+        const s = ev.state;
+        const resultStream =
+          s.status === "done" && s.result
+            ? ((s.result.stream as string) || (s.result.output as string) || null)
+            : null;
+        setDl({
+          stage: s.stage,
+          progress: s.progress,
+          message: s.message,
+          status: s.status,
+          result: resultStream,
+        });
+        if (s.status === "done" && resultStream) {
+          onResolvedStream?.(resultStream);
+        }
+        if (s.status === "failed") {
+          setStartError(s.error || "Скачивание не удалось.");
+        }
+      });
+    } catch (err) {
+      setStartError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const downloading =
+    dl != null && (dl.status === "running" || dl.status === "pending");
+  const done = dl?.status === "done" && !!dl.result;
+
+  return (
+    <div className="flex flex-col gap-5">
+      {/* Поле ссылки */}
+      <div>
+        <Label>Ссылка на Twitch VOD</Label>
+        <Input
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          placeholder="https://www.twitch.tv/videos/123456789"
+          leftIcon={<Download className="h-4 w-4" />}
+          invalid={urlInvalid}
+          spellCheck={false}
+          autoCapitalize="off"
+          disabled={downloading}
+        />
+        {urlInvalid ? (
+          <p className="mt-1.5 flex items-center gap-1.5 text-xs text-err">
+            <AlertCircle className="h-3.5 w-3.5" />
+            Не похоже на ссылку VOD. Пример: twitch.tv/videos/123456789
+          </p>
+        ) : (
+          <p className="mt-1.5 text-xs text-subtle">
+            Вставьте ссылку на запись (не клип и не трансляцию) или её ID.
+          </p>
+        )}
+      </div>
+
+      {/* Превью метаданных */}
+      {parsed && (
+        <VodPreview info={info} loading={loadingInfo} error={infoError} />
+      )}
+
+      {/* Качество + обрезка — показываем, как только ссылка валидна.
+          В inline-режиме прячем, когда скачивание уже пошло/завершилось. */}
+      {parsed && !downloading && !done && (
+        <VodDownloadOptions
+          qualities={info?.qualities ?? []}
+          quality={quality}
+          onQualityChange={setQuality}
+          durationMs={info?.duration_ms ?? null}
+          trimEnabled={trimEnabled}
+          onTrimEnabledChange={setTrimEnabled}
+          trimStart={trimStart}
+          trimEnd={trimEnd}
+          onTrimStartChange={setTrimStart}
+          onTrimEndChange={setTrimEnd}
+        />
+      )}
+
+      {/* Inline-прогресс скачивания (расширенный режим) */}
+      {variant === "inline" && dl && (
+        <VodDownloadProgress
+          stage={dl.stage}
+          progress={dl.progress}
+          message={dl.message}
+          status={dl.status}
+          resultPath={dl.result}
+        />
+      )}
+
+      {startError && <ErrorCard error={startError} />}
+
+      {/* Кнопка «Скачать» — в inline прячем после успешного скачивания. */}
+      {!done && (
+        <>
+          <Button
+            size="lg"
+            onClick={start}
+            loading={starting || downloading}
+            disabled={!parsed || downloading}
+            className="w-full"
+          >
+            <Download className="h-4 w-4" />
+            {downloading ? "Скачивание…" : "Скачать VOD"}
+          </Button>
+          {!parsed && (
+            <p className="text-center text-xs text-subtle">
+              Вставьте ссылку на VOD, чтобы продолжить.
+            </p>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * VodDownloadProgress — компактный прогресс скачивания VOD внутри формы
+ * (расширенный режим). Показывает стадию, процент и, по завершении, путь к
+ * готовому файлу. Свои цвета берёт из статуса: running — brand, done — ok,
+ * failed — err.
+ */
+function VodDownloadProgress({
+  stage,
+  progress,
+  message,
+  status,
+  resultPath,
+}: {
+  stage: string;
+  progress: number;
+  message: string;
+  status: JobState["status"];
+  resultPath: string | null;
+}) {
+  const done = status === "done";
+  const failed = status === "failed";
+  return (
+    <Card padding="sm" className="space-y-2">
+      <div className="flex items-center justify-between text-xs">
+        <span
+          className={cn(
+            "font-medium",
+            done ? "text-ok" : failed ? "text-err" : "text-fg"
+          )}
+        >
+          {done
+            ? "VOD скачан"
+            : failed
+            ? "Скачивание не удалось"
+            : message || stage || "Скачивание…"}
+        </span>
+        {!done && !failed && (
+          <span className="font-mono-tabular text-muted">
+            {Math.round(progress)}%
+          </span>
+        )}
+      </div>
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/5">
+        <div
+          className={cn(
+            "h-full rounded-full transition-all",
+            done ? "bg-ok" : failed ? "bg-err" : "bg-brand-from"
+          )}
+          style={{ width: `${done ? 100 : Math.max(2, progress)}%` }}
+        />
+      </div>
+      {done && resultPath && (
+        <div className="truncate font-mono text-[10px] text-subtle" title={resultPath}>
+          {resultPath}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+/** Карточка превью VOD: превьюшка + название/канал/длительность. */
+function VodPreview({
+  info,
+  loading,
+  error,
+}: {
+  info: VodInfo | null;
+  loading: boolean;
+  error: string | null;
+}) {
+  // Превью с CDN Twitch иногда 404-ит (ещё не сгенерировано/протухло). Ловим
+  // ошибку загрузки картинки и мягко падаем на плейсхолдер-иконку, чтобы не
+  // показывать «сломанное изображение». Сбрасываем флаг при смене URL.
+  const [imgFailed, setImgFailed] = useState(false);
+  const thumbUrl = info?.thumbnail_url ?? null;
+  useEffect(() => {
+    setImgFailed(false);
+  }, [thumbUrl]);
+
+  if (loading) {
+    return (
+      <Card padding="sm" className="flex items-center gap-3">
+        <div className="h-14 w-24 shrink-0 animate-pulse rounded-md bg-white/5" />
+        <div className="flex-1 space-y-2">
+          <div className="h-3 w-2/3 animate-pulse rounded bg-white/5" />
+          <div className="h-3 w-1/3 animate-pulse rounded bg-white/5" />
+        </div>
+      </Card>
+    );
+  }
+  if (error || !info) {
+    // Мягкая деградация: превью недоступно, но скачать всё равно можно.
+    return (
+      <Card padding="sm" className="flex items-center gap-2 text-xs text-subtle">
+        <AlertCircle className="h-4 w-4 shrink-0 text-warn" />
+        Превью недоступно — метаданные VOD не загрузились. Скачивание всё равно
+        возможно.
+      </Card>
+    );
+  }
+  return (
+    <Card padding="sm" className="flex items-center gap-3">
+      {info.thumbnail_url && !imgFailed ? (
+        <img
+          src={info.thumbnail_url}
+          alt=""
+          onError={() => setImgFailed(true)}
+          className="h-14 w-24 shrink-0 rounded-md object-cover"
+        />
+      ) : (
+        <div className="flex h-14 w-24 shrink-0 items-center justify-center rounded-md bg-white/5 text-muted">
+          <FileVideo className="h-5 w-5" />
+        </div>
+      )}
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-sm font-medium text-fg" title={info.title}>
+          {info.title || "Без названия"}
+        </div>
+        <div className="mt-0.5 truncate text-xs text-muted">
+          {info.channel}
+          {info.duration_ms > 0 && <> · {fmtDurationMs(info.duration_ms)}</>}
+        </div>
+      </div>
+    </Card>
   );
 }
 
@@ -572,6 +1004,11 @@ function AdvancedForm({
   error: string | null;
   onSubmit: () => void;
 }) {
+  // Источник записи в расширенном режиме: локальный файл или скачать Twitch VOD.
+  // При скачивании путь к готовому mp4 подставляется в form.stream, дальше —
+  // обычный расширенный пайплайн по локальному файлу.
+  const [streamSource, setStreamSource] = useState<Source>("file");
+
   return (
     <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_320px]">
       {/* Форма */}
@@ -592,15 +1029,38 @@ function AdvancedForm({
           </div>
 
           <div className="flex flex-col gap-3">
-            <FilePickerCard
-              label="Запись Twitch"
-              icon={<FileVideo className="h-4 w-4" />}
-              value={form.stream}
-              onChange={(v) => set("stream", v)}
-              kind="file"
-              filters={[{ name: "Видео", extensions: VIDEO_EXT }]}
-              title="Выберите запись стрима"
-            />
+            {/* Источник записи: локальный файл / скачать Twitch VOD */}
+            <div>
+              <div className="mb-2 flex items-center justify-between">
+                <Label className="mb-0">Запись Twitch</Label>
+                <SourceSwitch source={streamSource} onChange={setStreamSource} />
+              </div>
+
+              {streamSource === "vod" ? (
+                <Card variant="surface" padding="sm">
+                  <VodSource
+                    variant="inline"
+                    onResolvedStream={(p) => {
+                      // Готовый файл подставляем как запись и переключаемся на
+                      // локальный источник — плитка покажет скачанный mp4.
+                      set("stream", p);
+                      setStreamSource("file");
+                    }}
+                  />
+                </Card>
+              ) : (
+                <FilePickerCard
+                  label="Запись Twitch"
+                  icon={<FileVideo className="h-4 w-4" />}
+                  value={form.stream}
+                  onChange={(v) => set("stream", v)}
+                  kind="file"
+                  filters={[{ name: "Видео", extensions: VIDEO_EXT }]}
+                  title="Выберите запись стрима"
+                />
+              )}
+            </div>
+
             {/* Оригинал видео скрыт по просьбе: бэкенд подставляет оригинал сам.
                 Расскомментировать, если снова понадобится ручной выбор. */}
             {/* <FilePickerCard
@@ -720,22 +1180,22 @@ function AdvancedForm({
                   <FieldLabel help="С какой секунды начинать обработку стрима. Формат HH:MM:SS.mmm — например «00:05:00» пропустит первые 5 минут.">
                     range_in
                   </FieldLabel>
-                  <Input
+                  <TimecodeInput
                     value={form.range_in}
-                    onChange={(e) => set("range_in", e.target.value)}
+                    onChange={(v) => set("range_in", v)}
+                    withMillis
                     placeholder="00:00:00.000"
-                    className="font-mono-tabular"
                   />
                 </div>
                 <div>
                   <FieldLabel help="До какой секунды обрабатывать. Оставь пустым — до конца файла. Формат тот же: HH:MM:SS.mmm.">
                     range_out
                   </FieldLabel>
-                  <Input
+                  <TimecodeInput
                     value={form.range_out}
-                    onChange={(e) => set("range_out", e.target.value)}
+                    onChange={(v) => set("range_out", v)}
+                    withMillis
                     placeholder="01:20:00.000"
-                    className="font-mono-tabular"
                   />
                 </div>
                 <div className="md:col-span-2">
@@ -751,20 +1211,18 @@ function AdvancedForm({
                   />
                 </div>
                 {form.transcriber === "whisperx" && (
-                  <label className="flex items-center gap-2 text-sm text-muted md:col-span-2">
-                    <input
-                      type="checkbox"
+                  <div className="flex items-center gap-1.5 md:col-span-2">
+                    <Checkbox
                       checked={form.vad_filter}
                       onChange={(e) => set("vad_filter", e.target.checked)}
-                      className="h-4 w-4 rounded border-white/10 bg-black/30 accent-brand-from"
+                      label="Включить VAD-фильтр (WhisperX)"
                     />
-                    Включить VAD-фильтр (WhisperX)
                     <HelpTip>
                       Дополнительная фильтрация тишины ВНУТРИ WhisperX (помимо
                       VAD method). Убирает ложные срабатывания на дыхание/шум.
                       Немного замедляет, но обычно улучшает качество.
                     </HelpTip>
-                  </label>
+                  </div>
                 )}
               </div>
             </CollapsibleContent>

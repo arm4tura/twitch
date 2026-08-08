@@ -161,3 +161,90 @@ export const PROCESS_STEPS: StepDef[] = [
     description: "Записываем результат и скрипт для Vegas",
   },
 ];
+
+/** Стадии финального рендера — под runner._run_render_sync. */
+export const RENDER_STEPS: StepDef[] = [
+  {
+    key: "init",
+    title: "Подготовка",
+    description: "Запуск рендера",
+    aliases: ["prepare"],
+  },
+  {
+    key: "render",
+    title: "Монтаж видео",
+    description: "Вырезаем сегменты и кодируем через ffmpeg",
+  },
+  {
+    key: "done",
+    title: "Готово",
+    description: "Итоговый файл записан",
+  },
+];
+
+/** Стадии скачивания VOD — под runner._run_download_vod_sync.
+ * Backend эмитит prepare/info → download → verify → combine → done. `info` и
+ * `prepare` (прогрев загрузчика) маппим в «Подготовку», чтобы не плодить шаги
+ * ради пары секунд. */
+export const DOWNLOAD_STEPS: StepDef[] = [
+  {
+    key: "prepare",
+    title: "Подготовка",
+    description: "Готовим загрузчик и получаем данные",
+    aliases: ["init", "info"],
+  },
+  {
+    key: "download",
+    title: "Скачивание",
+    description: "Качаем сегменты записи с Twitch",
+  },
+  {
+    key: "verify",
+    title: "Проверка",
+    description: "Сверяем целостность сегментов",
+  },
+  {
+    key: "combine",
+    title: "Сборка",
+    description: "Склеиваем сегменты в один файл",
+  },
+  {
+    key: "done",
+    title: "Готово",
+    description: "Запись скачана",
+  },
+];
+
+/** Стадии детекта тишины — под runner._run_detect_silence_sync. */
+export const DETECT_SILENCE_STEPS: StepDef[] = [
+  {
+    key: "init",
+    title: "Подготовка",
+    description: "Запуск детекта",
+    aliases: ["detect"],
+  },
+  {
+    key: "postprocess",
+    title: "Обработка пауз",
+    description: "Склейка близких и добавление отступов",
+  },
+  {
+    key: "done",
+    title: "Готово",
+    description: "Список пауз собран",
+  },
+];
+
+/** Выбор набора стадий по типу job'а (JobState.kind). */
+export function stepsForKind(kind: string | undefined): StepDef[] {
+  switch (kind) {
+    case "render":
+      return RENDER_STEPS;
+    case "detect_silence":
+      return DETECT_SILENCE_STEPS;
+    case "download_vod":
+      return DOWNLOAD_STEPS;
+    default:
+      return PROCESS_STEPS;
+  }
+}

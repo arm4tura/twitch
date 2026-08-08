@@ -30,6 +30,16 @@ declare global {
       showInFolder(targetPath: string): Promise<boolean>;
       openPath(targetPath: string): Promise<boolean>;
       openExternal(url: string): Promise<boolean>;
+      startDrag(filePath: string): void;
+      onStartDragError(
+        cb: (info: { path: string; reason: string; message?: string }) => void
+      ): () => void;
+      platform: string;
+      wipeData(opts?: { quit?: boolean }): Promise<{
+        ok: boolean;
+        error?: string;
+        cancelled?: boolean;
+      }>;
     };
   }
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   ArrowRight,
@@ -9,7 +9,7 @@ import {
   Loader2,
   Terminal,
 } from "lucide-react";
-import { cancelJob, type JobState } from "../api";
+import { cancelJob, createProcessJob, type JobState } from "../api";
 import { useJobEvents, type JobLogEntry } from "../hooks/useJobEvents";
 import { Button } from "../components/ui/Button";
 import { Card, CardTitle } from "../components/ui/Card";
@@ -24,8 +24,8 @@ import {
 import { ProgressRing } from "../components/ui/ProgressBar";
 import { ScrollArea } from "../components/ui/ScrollArea";
 import { StatusBadge } from "../components/ui/StatusBadge";
-import { PROCESS_STEPS, Stepper } from "../components/ui/Stepper";
-import { fmtRelativeMs } from "../lib/format";
+import { Stepper, stepsForKind } from "../components/ui/Stepper";
+import { fmtDurationMs, fmtRelativeMs } from "../lib/format";
 
 /**
  * JobScreen — «диспетчерская» одной джобы.
@@ -41,19 +41,123 @@ import { fmtRelativeMs } from "../lib/format";
 export function JobScreen({
   jobId,
   onDone,
+  onChainJob,
 }: {
   jobId: string;
   onDone: (decisionsPath: string | null) => void;
+  /**
+   * Цепочка: download_vod по завершении сам стартует process-джобу и просит
+   * родителя перецепить экран на неё. Один поток «скачал → обработал →
+   * таймлайн» без кликов. Опционально — при отсутствии просто покажем «скачано».
+   */
+  onChainJob?: (jobId: string) => void;
 }) {
   const { state, log, error, wsReady } = useJobEvents(jobId);
   const [cancelling, setCancelling] = useState(false);
   const [errorOpen, setErrorOpen] = useState(false);
   const [cancelOpen, setCancelOpen] = useState(false);
+  // Авто-цепочка download→process. `chaining` — идёт старт process-джобы (между
+  // done скачивания и перецепкой экрана): показываем переходное состояние вместо
+  // мёртвой кнопки. `chainError` — не удалось стартовать обработку. Ref-гард от
+  // повторного запуска: final может прилететь и по WS, и повторным ре-рендером.
+  const [chaining, setChaining] = useState(false);
+  const [chainError, setChainError] = useState<string | null>(null);
+  const chainStartedRef = useRef(false);
+
+  // Оценка «сколько осталось». Наивная формула elapsed/progress от старта job'а
+  // дёргается вверх на прогреве (ffmpeg инициализирует энкодер, первые time=
+  // шумные, стадия render мапит 0-100→10-100). Поэтому:
+  //  1) Считаем скорость от ЯКОРЯ — первого надёжного тика (progress ≥ 12%),
+  //     а не от created_at. Прогрев в расчёт не попадает.
+  //  2) Держим оценку МОНОТОННОЙ вниз (min с прошлой) пока прогресс растёт —
+  //     число только убывает, как ждёт пользователь.
+  // Якорь и последняя оценка сбрасываются при смене job'а / падении прогресса.
+  const [etaMs, setEtaMs] = useState<number | null>(null);
+  const anchorRef = useRef<{ atMs: number; progress: number } | null>(null);
+  const lastEtaRef = useRef<number | null>(null);
+  const etaJobRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const p = state?.progress ?? 0;
+    const running = state?.status === "running";
+
+    // Сброс при смене job'а или откате прогресса (новый прогон в том же экране).
+    if (etaJobRef.current !== (state?.id ?? null)) {
+      etaJobRef.current = state?.id ?? null;
+      anchorRef.current = null;
+      lastEtaRef.current = null;
+      setEtaMs(null);
+    }
+    if (!running || p >= 99.5) {
+      if (!running) {
+        anchorRef.current = null;
+        lastEtaRef.current = null;
+      }
+      setEtaMs(null);
+      return;
+    }
+    // Ставим якорь на первом надёжном тике — рендер реально пошёл (не init/prepare).
+    if (!anchorRef.current) {
+      if (p < 12) return; // ещё прогрев — рано оценивать
+      anchorRef.current = { atMs: Date.now(), progress: p };
+      return; // нужна вторая точка, чтобы померить скорость
+    }
+    const a = anchorRef.current;
+    const dp = p - a.progress;
+    if (dp <= 0.1) return; // прогресс ещё не сдвинулся заметно
+    const elapsed = Date.now() - a.atMs;
+    const remaining = (elapsed / dp) * (100 - p);
+    if (!Number.isFinite(remaining) || remaining <= 0) return;
+    // Монотонность вниз: показываем не больше прошлой оценки.
+    const clamped =
+      lastEtaRef.current != null ? Math.min(remaining, lastEtaRef.current) : remaining;
+    lastEtaRef.current = clamped;
+    setEtaMs(clamped);
+  }, [state?.id, state?.progress, state?.status]);
 
   // Автооткрытие error-диалога при переходе в failed.
   useEffect(() => {
     if (state?.status === "failed") setErrorOpen(true);
   }, [state?.status]);
+
+  // Сброс состояния цепочки при смене джобы (в т.ч. когда мы сами перецепили
+  // экран на process-джобу — та уже не download_vod, цепочку не повторяем).
+  useEffect(() => {
+    chainStartedRef.current = false;
+    setChaining(false);
+    setChainError(null);
+  }, [jobId]);
+
+  // Авто-цепочка: download_vod завершился → стартуем обработку скачанного файла
+  // и просим родителя перецепить экран на новую джобу. Так «обычный режим» =
+  // один сквозной поток (скачал → распознал → мат → правки → таймлайн).
+  useEffect(() => {
+    if (state?.kind !== "download_vod" || state.status !== "done") return;
+    if (!onChainJob || chainStartedRef.current) return;
+    const stream =
+      ((state.result as any)?.stream as string) ||
+      ((state.result as any)?.output as string) ||
+      "";
+    if (!stream) {
+      // Файла нет — цепочку не запустить; покажем это как ошибку цепочки, но
+      // файл всё равно скачан (FooterBar даст «Показать файл»).
+      setChainError("Скачанный файл не найден — обработку не запустить.");
+      return;
+    }
+    chainStartedRef.current = true;
+    setChaining(true);
+    setChainError(null);
+    (async () => {
+      try {
+        const next = await createProcessJob({ stream });
+        onChainJob(next.id);
+      } catch (err) {
+        chainStartedRef.current = false;
+        setChaining(false);
+        setChainError(err instanceof Error ? err.message : String(err));
+      }
+    })();
+  }, [state?.kind, state?.status, state?.result, onChainJob]);
 
   const doCancel = async () => {
     setCancelling(true);
@@ -73,8 +177,8 @@ export function JobScreen({
 
       {/* Hero + Stepper + Log */}
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[280px_minmax(0,1fr)]">
-        {/* Hero: ProgressRing */}
-        <div className="flex flex-col items-center justify-start gap-4">
+        {/* Hero: ProgressRing — по центру по вертикали относительно Stepper'а справа */}
+        <div className="flex flex-col items-center justify-center gap-4">
           <ProgressRing value={state?.progress ?? 0} size={200} stroke={10}>
             <div className="flex flex-col items-center">
               <div className="font-mono-tabular text-4xl font-semibold text-fg tabular-nums">
@@ -89,15 +193,20 @@ export function JobScreen({
           <div className="w-full max-w-[220px] text-center text-xs text-muted">
             {state?.message || "Ждём событий с backend…"}
           </div>
+          {etaMs != null && (
+            <div className="text-[11px] text-subtle">
+              осталось ≈ {fmtDurationMs(etaMs)}
+            </div>
+          )}
         </div>
 
-        {/* Stepper */}
+        {/* Stepper — набор стадий зависит от типа job'а (process/render/detect). */}
         <Card variant="surface" padding="lg">
           <div className="mb-4 flex items-center justify-between">
             <CardTitle>Стадии</CardTitle>
           </div>
           <Stepper
-            steps={PROCESS_STEPS}
+            steps={stepsForKind(state?.kind)}
             currentStage={state?.stage ?? ""}
             completed={state?.status === "done"}
             failed={state?.status === "failed"}
@@ -128,7 +237,11 @@ export function JobScreen({
           </button>
         </div>
         <ScrollArea className="h-[280px]">
-          <div className="flex flex-col divide-y divide-white/[0.04] px-5 py-2 font-mono-tabular text-[12px]">
+          <div
+            className="flex flex-col divide-y divide-white/[0.04] px-5 py-2 font-mono-tabular text-[12px]"
+            aria-live="polite"
+            aria-relevant="additions"
+          >
             {log.length === 0 ? (
               <div className="py-8 text-center text-subtle">пока пусто</div>
             ) : (
@@ -142,10 +255,26 @@ export function JobScreen({
       <FooterBar
         state={state}
         cancelling={cancelling}
+        chaining={chaining}
+        chainError={chainError}
         onRequestCancel={() => setCancelOpen(true)}
         onOpenTimeline={() => onDone(decisionsPath)}
         onShowError={() => setErrorOpen(true)}
       />
+
+      {/* Ошибка авто-цепочки: файл скачан, но обработку не удалось стартовать —
+          показываем отдельно от WS-ошибки подключения. */}
+      {chainError && (
+        <Card
+          variant="surface"
+          className="border-err/30 bg-err/5 text-sm text-err"
+        >
+          <div className="font-medium">Скачано, но обработка не запустилась</div>
+          <div className="mt-1 break-all font-mono-tabular text-[11px] text-err/90">
+            {chainError}
+          </div>
+        </Card>
+      )}
 
       {error && !state && (
         <Card
@@ -235,7 +364,7 @@ function Header({
       <div>
         <div className="flex items-center gap-3">
           <h1 className="text-2xl font-semibold tracking-tight text-fg">
-            {stageLabel(state?.stage)}
+            {stageLabel(state?.kind, state?.stage)}
           </h1>
           {state && <StatusBadge status={state.status} />}
         </div>
@@ -258,18 +387,112 @@ function Header({
 function FooterBar({
   state,
   cancelling,
+  chaining,
+  chainError,
   onRequestCancel,
   onOpenTimeline,
   onShowError,
 }: {
   state: JobState | null;
   cancelling: boolean;
+  chaining: boolean;
+  chainError: string | null;
   onRequestCancel: () => void;
   onOpenTimeline: () => void;
   onShowError: () => void;
 }) {
   if (!state) return null;
   if (state.status === "done") {
+    // download_vod — не финал потока: файл скачан, дальше авто-стартует
+    // обработка. Пока цепочка запускается — переходное состояние; если она
+    // сорвалась (chainError) — даём «Показать файл» как запасной выход.
+    if (state.kind === "download_vod") {
+      const out = String(
+        (state.result as any)?.stream ?? (state.result as any)?.output ?? ""
+      );
+      if (chainError) {
+        return (
+          <Card
+            variant="elevated"
+            className="flex flex-wrap items-center justify-between gap-3 border-ok/30 bg-ok/5"
+          >
+            <div className="flex min-w-0 items-center gap-3">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-ok/15 text-ok">
+                <CheckCircle2 className="h-5 w-5" />
+              </div>
+              <div className="min-w-0">
+                <div className="text-sm font-medium text-fg">Запись скачана</div>
+                <div className="truncate font-mono-tabular text-xs text-muted">
+                  {out || "файл сохранён"}
+                </div>
+              </div>
+            </div>
+            {out && (
+              <Button
+                onClick={async () => {
+                  await window.twitchCut.showInFolder(out);
+                }}
+              >
+                <ExternalLink className="h-4 w-4" /> Показать файл
+              </Button>
+            )}
+          </Card>
+        );
+      }
+      return (
+        <Card
+          variant="surface"
+          className="flex flex-wrap items-center justify-between gap-3 border-ok/30 bg-ok/5"
+        >
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-ok/15 text-ok">
+              <CheckCircle2 className="h-5 w-5" />
+            </div>
+            <div className="min-w-0">
+              <div className="text-sm font-medium text-fg">Запись скачана</div>
+              <div className="truncate text-xs text-muted">
+                {chaining ? "Запускаю обработку…" : "Готовим обработку…"}
+              </div>
+            </div>
+          </div>
+          <Button disabled loading>
+            <Loader2 className="h-4 w-4" /> Обработка
+          </Button>
+        </Card>
+      );
+    }
+    // Рендер/детект завершаются файлом, а не таймлайном — своя сводка и CTA.
+    if (state.kind === "render") {
+      const out = String((state.result as any)?.output_path ?? "");
+      return (
+        <Card
+          variant="elevated"
+          className="flex flex-wrap items-center justify-between gap-3 border-ok/30 bg-ok/5"
+        >
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-ok/15 text-ok">
+              <CheckCircle2 className="h-5 w-5" />
+            </div>
+            <div className="min-w-0">
+              <div className="text-sm font-medium text-fg">Видео готово</div>
+              <div className="truncate font-mono-tabular text-xs text-muted">
+                {out || "рендер завершён"}
+              </div>
+            </div>
+          </div>
+          {out && (
+            <Button
+              onClick={async () => {
+                const ok = await window.twitchCut.showInFolder(out);
+                if (!ok) return;
+              }}
+            >
+              <ExternalLink className="h-4 w-4" /> Показать файл
+            </Button>
+          )}
+        </Card>
+      );
+    }
     return (
       <Card
         variant="elevated"
@@ -368,9 +591,9 @@ function LogRow({ entry }: { entry: JobLogEntry }) {
   );
 }
 
-function stageLabel(stage: string | undefined) {
+function stageLabel(kind: string | undefined, stage: string | undefined) {
   if (!stage) return "Обработка";
-  const step = PROCESS_STEPS.find(
+  const step = stepsForKind(kind).find(
     (s) => s.key === stage || s.aliases?.includes(stage)
   );
   return step?.title ?? "Обработка";

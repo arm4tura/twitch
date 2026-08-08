@@ -13,7 +13,25 @@ export type JobKind =
   | "process"
   | "export_vegas"
   | "highlights_export"
-  | "highlights_import";
+  | "highlights_import"
+  | "render_highlights"
+  | "export_vegas_highlights"
+  | "detect_silence"
+  | "render"
+  | "download_vod";
+
+/** Highlight из decisions.json (bundle: highlights[].highlights). */
+export interface Highlight {
+  start_s: number;
+  end_s: number;
+  title: string;
+  reason: string;
+  score: number;
+  quote?: string | null;
+  /** Абсолютные секунды исходника — проставляет merge (stream_offset). */
+  stream_start_s?: number;
+  stream_end_s?: number;
+}
 
 export interface JobState {
   id: string;
@@ -22,7 +40,7 @@ export interface JobState {
   progress: number;
   stage: string;
   message: string;
-  result: Record<string, any> | null;
+  result: Record<string, unknown> | null;
   error: string | null;
   created_at: string;
   finished_at: string | null;
@@ -127,11 +145,86 @@ export function createProcessJob(req: ProcessJobRequest): Promise<JobState> {
   });
 }
 
+// --- download VOD -----------------------------------------------------------
+// Скачивание Twitch VOD через bundled TwitchDownloaderCLI (subprocess на бэке).
+// Тело повторяет DownloadVodRequest в schemas.py.
+
+export interface DownloadVodRequest {
+  /** Twitch VOD URL или числовой ID. Бэкенд извлекает ID сам. */
+  url: string;
+  /** Значение качества из VodInfo.qualities[].value. По умолчанию источник. */
+  quality?: string;
+  /** Обрезка (таймкоды HH:MM:SS). Пусто/None → с начала / до конца. */
+  range_in?: string | null;
+  range_out?: string | null;
+  /** OAuth-токен для sub-only VOD. Пусто, если VOD публичный. */
+  oauth?: string | null;
+  /** Куда качать; None → бэкенд создаёт подпапку в work/. */
+  workdir?: string | null;
+}
+
+/** Одно доступное качество VOD (из info-режима CLI). */
+export interface VodQualityInfo {
+  value: string;
+  label: string;
+}
+
+/** Метаданные VOD для превью перед скачиванием. */
+export interface VodInfo {
+  id: string;
+  title: string;
+  channel: string;
+  /** Длительность в мс — граница для полей обрезки. */
+  duration_ms: number;
+  /** URL превьюшки (может быть null). */
+  thumbnail_url: string | null;
+  qualities: VodQualityInfo[];
+}
+
+/**
+ * Запросить метаданные VOD (title/длительность/качества) БЕЗ скачивания.
+ * Бэкенд зовёт `TwitchDownloaderCLI info`. Быстрый вызов для превью-карточки.
+ */
+export function getVodInfo(url: string): Promise<VodInfo> {
+  return request(`/vod/info?url=${encodeURIComponent(url)}`);
+}
+
+export function createDownloadVodJob(req: DownloadVodRequest): Promise<JobState> {
+  return request("/jobs/download-vod", {
+    method: "POST",
+    body: JSON.stringify(req),
+  });
+}
+
 export interface HighlightsExportRequest {
   decisions: string;
   out_dir: string;
   transcript?: string | null;
   n_highlights?: number;
+}
+
+/** Один source-файл транскрипта в собранном пакете (manifest.chunks[]). */
+export interface PackageChunk {
+  id: number;
+  /** Имя файла относительно out_dir, напр. "transcript_001.md". */
+  path: string;
+  first_ts: number;
+  last_ts: number;
+  word_count: number;
+}
+
+/**
+ * Результат highlights-export job (state.result). out_dir — абсолютный каталог
+ * пакета; manifest.chunks — source-файлы транскрипта для загрузки в NotebookLM.
+ */
+export interface HighlightsExportResult {
+  out_dir: string;
+  manifest: {
+    chunks: PackageChunk[];
+    n_highlights: number;
+    total_words: number;
+    files: { prompt: string; schema: string; readme: string };
+  };
 }
 
 export function createHighlightsExportJob(
@@ -145,9 +238,21 @@ export function createHighlightsExportJob(
 
 export interface HighlightsImportRequest {
   decisions: string;
-  response: string;
+  /** Путь к файлу ответа (альтернатива response_text). */
+  response?: string;
+  /** Сырой текст ответа NotebookLM — вставленный в textarea. Приоритетнее response. */
+  response_text?: string;
   output: string;
   transcript?: string | null;
+}
+
+export interface HighlightsImportResult {
+  output: string;
+  highlights_count: number;
+  /** Обогащённые highlights (с stream_start_s/stream_end_s). */
+  highlights: Highlight[];
+  /** Проблемные элементы, отброшенные при толерантном парсинге. */
+  warnings?: string[];
 }
 
 export function createHighlightsImportJob(
@@ -173,6 +278,127 @@ export function createExportVegasJob(
   });
 }
 
+// --- highlights render / vegas markers ---------------------------------------
+
+export interface RenderHighlightsRequest {
+  decisions: string;
+  input_path: string;
+  out_dir: string;
+  quality?: "fast" | "balanced" | "max";
+  padding_s?: number;
+  force?: boolean;
+}
+
+export interface HighlightClip {
+  index: number;
+  title: string;
+  start_s: number;
+  end_s: number;
+  path: string;
+}
+
+export interface RenderHighlightsResult {
+  out_dir: string;
+  clips: HighlightClip[];
+  count: number;
+}
+
+export function createRenderHighlightsJob(
+  req: RenderHighlightsRequest
+): Promise<JobState> {
+  return request("/jobs/render-highlights", {
+    method: "POST",
+    body: JSON.stringify(req),
+  });
+}
+
+export interface ExportVegasHighlightsRequest {
+  decisions: string;
+  vegas: string;
+}
+
+export function createExportVegasHighlightsJob(
+  req: ExportVegasHighlightsRequest
+): Promise<JobState> {
+  return request("/jobs/export-vegas-highlights", {
+    method: "POST",
+    body: JSON.stringify(req),
+  });
+}
+
+// --- detect-silence ---------------------------------------------------------
+
+/**
+ * Запрос на детект тишины. Времена/пороги — в секундах и дБ (см.
+ * DetectSilenceRequest в schemas.py). Все поля кроме video_path имеют
+ * дефолты на бэке — шлём только те, что реально хотим переопределить.
+ */
+export interface DetectSilenceRequest {
+  video_path: string;
+  threshold_db?: number;
+  min_duration?: number;
+  merge_gap?: number;
+  padding_before?: number;
+  padding_after?: number;
+  workdir?: string | null;
+  force?: boolean;
+}
+
+/**
+ * Результат detect-silence job (state.result по завершении). Сегменты — пары
+ * [start, end] в секундах в координатах video_path (audio-space исходника).
+ */
+export interface DetectSilenceResult {
+  video_path: string;
+  segments: [number, number][];
+  count: number;
+  total_duration: number;
+}
+
+export function createDetectSilenceJob(
+  req: DetectSilenceRequest
+): Promise<JobState> {
+  return request("/jobs/detect-silence", {
+    method: "POST",
+    body: JSON.stringify(req),
+  });
+}
+
+// --- render -----------------------------------------------------------------
+
+/**
+ * Запрос на рендер: вырезать segments_to_remove ([start,end] в секундах) из
+ * input_path и записать в output_path. encoder=null → бэкенд выберет сам.
+ */
+export interface RenderRequest {
+  input_path: string;
+  output_path: string;
+  segments_to_remove: [number, number][];
+  encoder?: string | null;
+  audio_bitrate?: string;
+  /** Пресет скорость↔качество энкодера. Дефолт на бэке — "balanced". */
+  quality?: "fast" | "balanced" | "max";
+  /** Обрезать вывод по диапазону обработки (абс. секунды исходника). */
+  range_start?: number | null;
+  range_end?: number | null;
+  force?: boolean;
+}
+
+export interface RenderResult {
+  input_path: string;
+  output_path: string;
+  output_size: number;
+  removed_count: number;
+  kept_duration: number;
+}
+
+export function createRenderJob(req: RenderRequest): Promise<JobState> {
+  return request("/jobs/render", {
+    method: "POST",
+    body: JSON.stringify(req),
+  });
+}
+
 // --- decisions / transcript -------------------------------------------------
 
 export function readDecisions(path: string): Promise<any> {
@@ -191,6 +417,16 @@ export function writeDecisions(
 
 export function readTranscript(path: string): Promise<any> {
   return request(`/transcript?path=${encodeURIComponent(path)}`);
+}
+
+/**
+ * Готовый промпт для NotebookLM (кнопка «Скопировать промпт» в AI Tiktok).
+ * n_highlights — сколько моментов просить у модели (бэкенд валидирует 1..50).
+ */
+export function getPrompt(
+  nHighlights = 5
+): Promise<{ prompt: string; n_highlights: number }> {
+  return request(`/prompt?n_highlights=${nHighlights}`);
 }
 
 // --- projects registry ------------------------------------------------------
@@ -310,6 +546,18 @@ export function mediaUrl(streamPath: string): string {
     );
   }
   return `${_cachedBase}/media?path=${encodeURIComponent(streamPath)}`;
+}
+
+/**
+ * Полный URL к /thumbnail для `<img src="...">` в карточке проекта.
+ *
+ * Синхронный (как mediaUrl) — <img> нужен src в первый render. Возвращает null,
+ * если base URL ещё не резолвился: карточка тогда показывает Film-плейсхолдер
+ * до готовности бэкенда. При 404 (исходник удалён) <img> сам стриггерит onError.
+ */
+export function thumbnailUrl(streamPath: string, width = 640): string | null {
+  if (!_cachedBase) return null;
+  return `${_cachedBase}/thumbnail?path=${encodeURIComponent(streamPath)}&w=${width}`;
 }
 
 /**

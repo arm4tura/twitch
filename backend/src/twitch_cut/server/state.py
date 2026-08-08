@@ -40,6 +40,11 @@ class JobKind(str, Enum):
     EXPORT_VEGAS = "export_vegas"
     HIGHLIGHTS_EXPORT = "highlights_export"
     HIGHLIGHTS_IMPORT = "highlights_import"
+    RENDER_HIGHLIGHTS = "render_highlights"
+    EXPORT_VEGAS_HIGHLIGHTS = "export_vegas_highlights"
+    DETECT_SILENCE = "detect_silence"
+    RENDER = "render"
+    DOWNLOAD_VOD = "download_vod"
 
 
 def _now_iso() -> str:

@@ -61,6 +61,69 @@ def logs_dir() -> Path:
     return _default_config_dir()
 
 
+# --- validation -------------------------------------------------------------
+
+# Известные ключи и их типы. Неизвестные ключи НЕ отвергаем (round-trip для
+# полей из будущих версий), но известные — проверяем, чтобы кривой клиент или
+# посторонний POST на localhost не превратил settings.json в мусор, ломающий
+# запуск. bool проверяем ДО int: в Python bool — подкласс int.
+_KNOWN_STR_KEYS = frozenset({
+    "default_transcriber",
+    "default_device",
+    "default_compute_type",
+    "default_model",
+    "default_language",
+    "default_vad_method",
+})
+_MAX_KEYS = 100
+_MAX_STR_LEN = 1000
+
+
+class SettingsValidationError(ValueError):
+    """Полезная нагрузка PUT /settings не прошла проверку."""
+
+
+def validate_settings(payload: Any) -> dict[str, Any]:
+    """Проверить тело PUT /settings. Возвращает тот же dict, если всё ок.
+
+    Правила:
+      - корень — объект (dict), не список/строка;
+      - не больше _MAX_KEYS ключей (защита от разбухания файла);
+      - известные строковые ключи — строки не длиннее _MAX_STR_LEN;
+      - default_batch_size — целое 1..512;
+      - default_vad_filter — bool;
+      - неизвестные ключи пропускаются as-is (forward-compat).
+
+    Кидает SettingsValidationError с человекочитаемым сообщением.
+    """
+    if not isinstance(payload, dict):
+        raise SettingsValidationError("settings must be a JSON object")
+    if len(payload) > _MAX_KEYS:
+        raise SettingsValidationError(f"too many keys (>{_MAX_KEYS})")
+
+    for key in _KNOWN_STR_KEYS:
+        if key in payload:
+            val = payload[key]
+            if not isinstance(val, str):
+                raise SettingsValidationError(f"'{key}' must be a string")
+            if len(val) > _MAX_STR_LEN:
+                raise SettingsValidationError(f"'{key}' too long")
+
+    if "default_vad_filter" in payload:
+        if not isinstance(payload["default_vad_filter"], bool):
+            raise SettingsValidationError("'default_vad_filter' must be a boolean")
+
+    if "default_batch_size" in payload:
+        bs = payload["default_batch_size"]
+        # bool — подкласс int, но батч true/false бессмысленен.
+        if isinstance(bs, bool) or not isinstance(bs, int):
+            raise SettingsValidationError("'default_batch_size' must be an integer")
+        if not (1 <= bs <= 512):
+            raise SettingsValidationError("'default_batch_size' out of range (1..512)")
+
+    return payload
+
+
 # --- I/O --------------------------------------------------------------------
 
 

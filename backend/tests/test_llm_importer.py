@@ -2,7 +2,12 @@ import json
 
 import pytest
 
-from twitch_cut.llm.importer import MergeError, merge_into_decisions, parse_response
+from twitch_cut.llm.importer import (
+    MergeError,
+    merge_into_decisions,
+    parse_response,
+    parse_text,
+)
 
 
 def _write(tmp_path, name, content):
@@ -94,3 +99,70 @@ def test_merge_into_decisions_appends_highlights_key(tmp_path):
     assert merged["highlights"]["highlights"][0]["title"] == "первый пик"
     # Оригинал не тронут.
     assert "highlights" not in dec
+
+
+# --- parse_text: толерантный разбор ------------------------------------------
+
+
+def test_parse_text_returns_no_warnings_when_clean():
+    hs, warnings = parse_text(json.dumps(VALID_ONE))
+    assert len(hs.highlights) == 1
+    assert warnings == []
+
+
+def test_parse_text_keeps_valid_drops_broken():
+    # Один годный highlight + один с инвертированным временем: годный проходит,
+    # битый попадает в warnings (а не роняет весь разбор).
+    mixed = {
+        "highlights": [
+            VALID_ONE["highlights"][0],
+            {**VALID_ONE["highlights"][0], "start_s": 100, "end_s": 50},
+        ]
+    }
+    hs, warnings = parse_text(json.dumps(mixed))
+    assert len(hs.highlights) == 1
+    assert hs.highlights[0].title == "первый пик"
+    assert len(warnings) == 1
+    assert "end_s" in warnings[0]
+
+
+def test_parse_text_raises_when_all_rejected():
+    # Все элементы битые → нечего спасать → MergeError.
+    allbad = {
+        "highlights": [
+            {**VALID_ONE["highlights"][0], "start_s": 100, "end_s": 50},
+        ]
+    }
+    with pytest.raises(MergeError):
+        parse_text(json.dumps(allbad))
+
+
+# --- merge: обогащение stream-координатами -----------------------------------
+
+
+def test_merge_enriches_stream_coords_from_range_in():
+    # range_in задаёт сдвиг локальное→абсолютное. stream_start_s/stream_end_s
+    # должны появиться у каждого highlight (их читают рендер клипов и Vegas).
+    hs, _ = parse_text(json.dumps(VALID_ONE))
+    dec = {"mutes": [], "cuts": [], "range_in": "00:01:00.000"}
+    merged = merge_into_decisions(dec, hs)
+    h = merged["highlights"]["highlights"][0]
+    assert h["stream_start_s"] == 70.5  # 10.5 + 60
+    assert h["stream_end_s"] == 115.5  # 55.5 + 60
+
+
+def test_merge_stream_coords_default_zero_offset():
+    # Нет range_in → offset 0 → stream-координаты совпадают с локальными.
+    hs, _ = parse_text(json.dumps(VALID_ONE))
+    merged = merge_into_decisions({"mutes": []}, hs)
+    h = merged["highlights"]["highlights"][0]
+    assert h["stream_start_s"] == 10.5
+    assert h["stream_end_s"] == 55.5
+
+
+def test_merge_explicit_offset_overrides_range_in():
+    hs, _ = parse_text(json.dumps(VALID_ONE))
+    dec = {"range_in": "00:01:00.000"}
+    merged = merge_into_decisions(dec, hs, stream_offset_s=5.0)
+    h = merged["highlights"]["highlights"][0]
+    assert h["stream_start_s"] == 15.5  # 10.5 + 5, не 60

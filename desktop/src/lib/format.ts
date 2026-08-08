@@ -49,16 +49,39 @@ export function parseTimecode(str: string): number | null {
   return ((h * 3600 + mm * 60 + ss) * 1000) + ms;
 }
 
+/**
+ * Человекочитаемая длительность из миллисекунд по-русски: «2ч 5м» / «1м 20с» /
+ * «45с». Единый формат для ETA обработки (JobScreen) и оценки диапазона
+ * (NewJobScreen) — раньше в каждом экране была своя чуть-разная копия.
+ */
+export function fmtDurationMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "—";
+  const totalSec = Math.round(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  if (h > 0) return `${h}ч ${m}м`;
+  if (m > 0) return `${m}м ${s}с`;
+  return `${s}с`;
+}
+
 /** "1h 24m", "24m", "42s" — для карточек проектов. */
 export function fmtDurationHuman(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "—";
-  const s = Math.floor(seconds);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  const rem = m % 60;
-  return rem === 0 ? `${h}h` : `${h}h ${rem}m`;
+  const total = Math.floor(seconds);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  // Показываем только значимые единицы: секунды опускаем если ==0, минуты
+  // если ==0 при наличии часов. «4m 32s», «4m», «1h», «1h 5m», «1h 5m 3s», «45s».
+  if (h > 0) {
+    const parts = [`${h}h`];
+    if (m > 0) parts.push(`${m}m`);
+    if (s > 0) parts.push(`${s}s`);
+    return parts.join(" ");
+  }
+  if (m > 0) return s > 0 ? `${m}m ${s}s` : `${m}m`;
+  return `${s}s`;
 }
 
 /** ISO-строка → "5 минут назад" / "вчера" / "3 июля". Простая локальная реализация без i18n-либы. */
@@ -74,8 +97,10 @@ export function fmtRelativeMs(ms: number, fallback = "—"): string {
   const sec = Math.floor(diffMs / 1000);
   if (sec < 45) return "только что";
   const min = Math.floor(sec / 60);
-  if (min < 45) return `${min} мин назад`;
   const hr = Math.floor(min / 60);
+  // Пока не прошло полного часа — показываем минуты (иначе 45–59 мин давали
+  // «0 ч назад»). Минимум 1 мин, чтобы не мигало «0 мин назад».
+  if (hr < 1) return `${Math.max(1, min)} мин назад`;
   if (hr < 22) return `${hr} ч назад`;
   const day = Math.floor(hr / 24);
   if (day === 1) return "вчера";

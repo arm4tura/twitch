@@ -34,12 +34,24 @@ export interface UseJobEventsResult {
   wsReady: boolean;
 }
 
+/**
+ * Лог держим В ПАМЯТИ МОДУЛЯ по jobId. Бэкенд историю событий не хранит
+ * (state.subscribe отдаёт только snapshot + живые тики), поэтому при уходе с
+ * JobScreen и возврате хук перемонтируется и терял бы накопленные строки.
+ * Кэш их переживает в пределах сессии — возврат на экран восстанавливает лог.
+ * Чистится вместе с процессом (desktop-сессия = один запуск).
+ */
+const LOG_CACHE = new Map<string, JobLogEntry[]>();
+const LOG_CACHE_LIMIT = 500;
+
 export function useJobEvents(
   jobId: string | null,
   onFinal?: (state: JobState) => void
 ): UseJobEventsResult {
   const [state, setState] = useState<JobState | null>(null);
-  const [log, setLog] = useState<JobLogEntry[]>([]);
+  const [log, setLog] = useState<JobLogEntry[]>(() =>
+    jobId ? (LOG_CACHE.get(jobId) ?? []) : []
+  );
   const [error, setError] = useState<string | null>(null);
   const [wsReady, setWsReady] = useState(false);
   // Держим последний stage+message, чтобы не дублировать. Ref, не state:
@@ -59,7 +71,12 @@ export function useJobEvents(
     let alive = true;
     let unsub: (() => void) | null = null;
     setError(null);
-    lastLogRef.current = "";
+    // Восстанавливаем накопленный лог из кэша (возврат на экран job'а) и
+    // пере-сеедим dedup-ключ последней строкой, чтобы не задублировать её.
+    const cached = LOG_CACHE.get(jobId) ?? [];
+    setLog(cached);
+    const last = cached[cached.length - 1];
+    lastLogRef.current = last ? `${last.stage}::${last.message}` : "";
 
     const appendLog = (s: JobState) => {
       const key = `${s.stage}::${s.message}`;
@@ -77,7 +94,9 @@ export function useJobEvents(
       setLog((prev) => {
         // Кэп 500 строк — простая защита от «завтра пришлось листать 2 ГБ лога».
         const next = [...prev, entry];
-        return next.length > 500 ? next.slice(-500) : next;
+        const capped = next.length > LOG_CACHE_LIMIT ? next.slice(-LOG_CACHE_LIMIT) : next;
+        LOG_CACHE.set(jobId, capped); // держим в памяти для возврата на экран
+        return capped;
       });
     };
 
