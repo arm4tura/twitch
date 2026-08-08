@@ -53,6 +53,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Кладём бинарник TwitchDownloaderCLI в build/tdcli/win-x64 ДО electron-builder.
+      # В репо бинарника нет (только .gitkeep), а workflow зовёт `npm run build`, а не
+      # `npm run dist`, поэтому хук predist сам не сработает — качаем явным шагом,
+      # иначе в установщик Windows downloader не попадёт (backend докачал бы на
+      # первом запуске, но лучше сразу «из коробки»).
+      - name: Prepare TwitchDownloaderCLI (win-x64)
+        run: npm run prepare-tdcli
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       # Тег push → публикуем в Releases (--publish always).
       # Ручной запуск → только собираем, не публикуем (--publish never).
       - name: Build & publish installer (on tag)
@@ -95,6 +105,15 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # Кладём mac-бинарники TwitchDownloaderCLI (обе арки) в build/tdcli/osx-* ДО
+      # electron-builder — по той же причине, что и в windows-джобе (predist не
+      # срабатывает при `npm run build`). Дефолт prepare-tdcli на macOS качает
+      # СРАЗУ osx-arm64 и osx-x64 (см. parseTargets в prepare-tdcli.js).
+      - name: Prepare TwitchDownloaderCLI (macOS arm64 + x64)
+        run: npm run prepare-tdcli
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # На теге собираем dmg+zip под обе арки (arm64 + x64) и публикуем в тот же
       # релиз. electron-builder дописывает файлы к уже существующему релизу тега,
