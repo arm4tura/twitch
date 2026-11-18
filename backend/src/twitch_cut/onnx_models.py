@@ -11,10 +11,10 @@ provider onnxruntime:
   - 'cuda' — GPU на Windows/Linux: CUDA EP (если стоит onnxruntime-gpu) или
     DirectML (onnxruntime-directml: любая видеокарта под Windows — NVIDIA,
     AMD, Intel — и никаких CUDA/cuDNN);
-  - 'mps'  — Apple: CoreML EP;
+  - 'mps'  — Apple: CPU (CoreML с GigaAM не работает, см. `_providers_for`);
   - 'cpu'  — CPU.
-Не поднялся ускоритель — тихо уходим на CPU с варнингом: медленнее, но прогон
-не падает.
+Не поднялся ускоритель или упал на прогоне — тихо уходим на CPU с варнингом:
+медленнее, но прогон не падает.
 """
 
 from __future__ import annotations
@@ -160,31 +160,23 @@ def _sha256(path: Path) -> str:
 
 
 def _providers_for(device: str, available: list[str]) -> list[Any]:
-    """Список execution providers под `device` проекта, CPU всегда последним."""
+    """Список execution providers под `device` проекта, CPU всегда последним.
+
+    'mps' (Apple) сознательно идёт на CPU, а не в CoreML. Замер на реальном
+    стриме: CoreML создаёт сессию, но на первом же прогоне GigaAM падает —
+    длина куска речи у нас переменная, а MLProgram не умеет неограниченные
+    размерности в attention («unbounded dimension which is not supported»).
+    Чинить это значит дополнять каждый кусок до фиксированных 30 с, то есть
+    считать лишнее. На Apple Silicon CPU-путь и так быстрый (10 минут стрима —
+    меньше минуты), а 'mps' остаётся валидным значением: он сохранён в
+    настройках у пользователей прошлых версий.
+    """
     wanted: list[Any] = []
     if device == "cuda":
         if "CUDAExecutionProvider" in available:
             wanted.append(("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}))
         if "DmlExecutionProvider" in available:
             wanted.append("DmlExecutionProvider")
-    elif device == "mps":
-        if "CoreMLExecutionProvider" in available:
-            # Кэш скомпилированной CoreML-модели: без него 400 МБ графа
-            # перекомпилируются при каждом открытии сессии. Neural Engine не
-            # берём (CPUAndGPU, а не ALL): он считает только во float16, а
-            # GPU с float32-накоплением держит log-probs ближе к CPU-пути.
-            cache_dir = MODELS_DIR / "coreml_cache"
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            wanted.append(
-                (
-                    "CoreMLExecutionProvider",
-                    {
-                        "ModelFormat": "MLProgram",
-                        "MLComputeUnits": "CPUAndGPU",
-                        "ModelCacheDirectory": str(cache_dir),
-                    },
-                )
-            )
     wanted.append("CPUExecutionProvider")
     return wanted
 
@@ -198,8 +190,46 @@ def accelerator_label(device: str) -> str:
     return name.replace("ExecutionProvider", "")
 
 
-def create_session(path: Path, device: str) -> Any:
-    """InferenceSession под `device`. Ускоритель не поднялся → CPU."""
+class FallbackSession:
+    """InferenceSession, которая при сбое ускорителя ВО ВРЕМЯ прогона один раз
+    пересоздаётся на CPU и повторяет запрос.
+
+    Ускоритель может создать сессию и упасть только на `run()` — так было с
+    CoreML (см. `_providers_for`), так же может повести себя DirectML на
+    конкретном драйвере. Ошибка на CPU — настоящая и пробрасывается как есть.
+    """
+
+    def __init__(self, path: Path, session: Any, make_cpu_session: Any):
+        self._path = path
+        self._session = session
+        self._make_cpu_session = make_cpu_session
+
+    def _on_cpu(self) -> bool:
+        return self._session.get_providers() == ["CPUExecutionProvider"]
+
+    def run(self, output_names: Any, feeds: dict[str, Any]) -> Any:
+        try:
+            return self._session.run(output_names, feeds)
+        except Exception as exc:  # noqa: BLE001 — сбой EP; на CPU пробросим
+            if self._on_cpu():
+                raise
+            logger.warning(
+                "%s: ускоритель %s упал на прогоне (%s) — дальше на CPU",
+                self._path.name,
+                self._session.get_providers()[0],
+                str(exc).splitlines()[0][:200],
+            )
+            self._session = self._make_cpu_session()
+            return self._session.run(output_names, feeds)
+
+    def __getattr__(self, name: str) -> Any:
+        # get_inputs / get_providers / get_modelmeta — у текущей сессии.
+        return getattr(self._session, name)
+
+
+def create_session(path: Path, device: str) -> FallbackSession:
+    """Сессия onnxruntime под `device`. Ускоритель не поднялся или упал на
+    прогоне → CPU (см. FallbackSession)."""
     import onnxruntime as ort
 
     providers = _providers_for(device, ort.get_available_providers())
@@ -217,6 +247,11 @@ def create_session(path: Path, device: str) -> Any:
             opts.intra_op_num_threads = int(threads)
         return opts
 
+    def _cpu_session() -> Any:
+        return ort.InferenceSession(
+            str(path), sess_options=_options(False), providers=["CPUExecutionProvider"]
+        )
+
     dml = "DmlExecutionProvider" in providers
     try:
         session = ort.InferenceSession(str(path), sess_options=_options(dml), providers=providers)
@@ -224,11 +259,9 @@ def create_session(path: Path, device: str) -> Any:
         if providers == ["CPUExecutionProvider"]:
             raise
         logger.warning("%s: ускоритель не поднялся (%s) — работаю на CPU", path.name, exc)
-        session = ort.InferenceSession(
-            str(path), sess_options=_options(False), providers=["CPUExecutionProvider"]
-        )
+        session = _cpu_session()
     logger.info("%s: onnxruntime %s", path.name, ", ".join(session.get_providers()))
-    return session
+    return FallbackSession(path, session, _cpu_session)
 
 
 def read_meta(session: Any) -> dict[str, Any]:

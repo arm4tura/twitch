@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 import twitch_cut.onnx_models as onnx_models
-from twitch_cut.onnx_models import ModelFile, _providers_for, ensure_model
+from twitch_cut.onnx_models import FallbackSession, ModelFile, _providers_for, ensure_model
 
 
 @pytest.fixture
@@ -65,7 +65,8 @@ def test_present_model_is_not_downloaded_again(release: Path):
         ("cuda", ["DmlExecutionProvider", "CPUExecutionProvider"], "DmlExecutionProvider"),
         ("cuda", ["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"], "CUDAExecutionProvider"),
         ("cuda", ["CPUExecutionProvider"], "CPUExecutionProvider"),
-        ("mps", ["CoreMLExecutionProvider", "CPUExecutionProvider"], "CoreMLExecutionProvider"),
+        # CoreML с GigaAM не работает (падает на прогоне) — 'mps' идёт на CPU.
+        ("mps", ["CoreMLExecutionProvider", "CPUExecutionProvider"], "CPUExecutionProvider"),
         ("mps", ["CPUExecutionProvider"], "CPUExecutionProvider"),
     ],
 )
@@ -76,3 +77,41 @@ def test_device_maps_to_provider_with_cpu_fallback(device, available, first, tmp
 
     assert names[0] == first
     assert names[-1] == "CPUExecutionProvider", "CPU — всегда последний запасной"
+
+
+class _FakeSession:
+    def __init__(self, providers, fail=False):
+        self.providers, self.fail, self.calls = providers, fail, 0
+
+    def get_providers(self):
+        return self.providers
+
+    def get_inputs(self):
+        return ["x"]
+
+    def run(self, _outputs, feeds):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("Unable to compute the prediction\nдлинный хвост")
+        return [feeds["x"] * 2]
+
+
+def test_accelerator_failing_at_run_falls_back_to_cpu():
+    """Ускоритель создал сессию, но упал на прогоне (как CoreML с GigaAM) —
+    запрос повторяется на CPU, и дальше сессия работает на CPU."""
+    accel = _FakeSession(["DmlExecutionProvider", "CPUExecutionProvider"], fail=True)
+    cpu = _FakeSession(["CPUExecutionProvider"])
+    session = FallbackSession(Path("m.onnx"), accel, lambda: cpu)
+
+    assert session.run(None, {"x": 21}) == [42]
+    assert session.get_providers() == ["CPUExecutionProvider"]
+    assert session.run(None, {"x": 1}) == [2]
+    assert accel.calls == 1, "на упавший ускоритель больше не ходим"
+
+
+def test_failure_on_cpu_is_real_and_raised():
+    session = FallbackSession(
+        Path("m.onnx"), _FakeSession(["CPUExecutionProvider"], fail=True), lambda: None
+    )
+    with pytest.raises(RuntimeError):
+        session.run(None, {"x": 1})

@@ -1,17 +1,19 @@
 """Сравнить ускорители GigaAM на одном аудио: скорость и расхождения с CPU.
 
-Зачем. Устройство по умолчанию выбирается по замеру, а не на глаз: на macOS
-это вопрос «CoreML ('mps') быстрее CPU и не двигает текст?», на Windows —
-то же про DirectML ('cuda'). CPU-прогон — эталон (он сверен с torch-путём,
-см. tools/onnx_parity.py), остальные устройства меряются против него.
+Зачем. Устройство по умолчанию выбирается по замеру, а не на глаз: на Windows
+это вопрос «DirectML ('cuda') быстрее CPU и не двигает текст?». CPU-прогон —
+эталон (он сверен с torch-путём, см. tools/onnx_parity.py), остальные
+устройства меряются против него. (Так и выяснилось, что CoreML с GigaAM не
+работает: сессия создаётся, а первый прогон падает — см. onnx_models.)
 
 Запуск (из backend/):
-    python tools/bench_device.py <аудио.wav>                    # cpu + ускоритель платформы
-    python tools/bench_device.py <аудио.wav> --devices cpu,mps
+    python tools/bench_device.py <аудио.wav>                    # cpu + cuda
+    python tools/bench_device.py <аудио.wav> --devices cpu,cuda
 
-Время модели и время прогона печатаются раздельно: первая сессия CoreML
-компилирует граф (минуты), дальше берёт его из models/coreml_cache. Поэтому
-каждое устройство гоняется дважды и в зачёт идёт второй прогон.
+Время загрузки модели и время прогона печатаются раздельно; каждое устройство
+гоняется дважды и в зачёт идёт второй прогон (первый прогревает драйвер).
+Печатается и провайдер, который реально считал: если ускоритель упал, там
+будет CPU.
 """
 
 from __future__ import annotations
@@ -59,13 +61,13 @@ def main() -> int:
     parser.add_argument("--devices", default=None, help="через запятую; по умолчанию cpu + ускоритель платформы")
     args = parser.parse_args()
 
-    devices = args.devices.split(",") if args.devices else ["cpu", "mps" if sys.platform == "darwin" else "cuda"]
+    devices = args.devices.split(",") if args.devices else ["cpu", "cuda"]
     results: dict[str, tuple[dict, float, str]] = {}
     for device in devices:
         load_started = time.perf_counter()
         gigaam_asr._load_engine("v3_ctc", device)
         load = time.perf_counter() - load_started
-        _run(args.audio, device)  # прогрев (и компиляция CoreML)
+        _run(args.audio, device)  # прогрев
         transcript, elapsed, accel = _run(args.audio, device)
         results[device] = (transcript, elapsed, accel)
         print(f"{device}: провайдер {accel}, загрузка {load:.1f} с, прогон {elapsed:.1f} с", flush=True)

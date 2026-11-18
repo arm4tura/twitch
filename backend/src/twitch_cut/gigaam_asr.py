@@ -80,7 +80,11 @@ class _Engine:
 
     vad: Any
     asr: Any
-    accelerator: str
+
+    @property
+    def accelerator(self) -> str:
+        """Провайдер, который считает GigaAM сейчас (после сбоя ускорителя — CPU)."""
+        return self.asr.session.get_providers()[0].replace("ExecutionProvider", "")
 
 
 def _load_engine(model_name: str, device: str) -> _Engine:
@@ -104,14 +108,12 @@ def _load_engine(model_name: str, device: str) -> _Engine:
     # VAD гоняет КАЖДУЮ секунду аудио десять раз (окно 10 с, шаг 1 с) — на
     # трёхчасовом стриме это минуты CPU, поэтому на GPU он едет вместе с ASR.
     # Решение у VAD жёсткое (argmax по классам), поэтому погрешность GPU его
-    # почти не двигает. CoreML — исключение: LSTM он не берёт (из 50 узлов
-    # графа поддержаны 16), граф рвётся на куски и выходит медленнее CPU.
-    vad_session = create_session(vad_path, "cpu" if device == "mps" else device)
+    # почти не двигает.
+    vad_session = create_session(vad_path, device)
     asr_session = create_session(asr_path, device)
     engine = _Engine(
         vad=SpeechDetector(vad_session, read_meta(vad_session)),
         asr=GigaAMOnnx(asr_session, read_meta(asr_session)),
-        accelerator=asr_session.get_providers()[0].replace("ExecutionProvider", ""),
     )
     _MODEL_CACHE[cache_key] = engine
     return engine
@@ -315,8 +317,8 @@ def transcribe_with_gigaam(
     возвращает (transcript_dict, cache_key, cache_path). Кэш инвалидируется по
     отпечатку аудио + модели + устройства.
 
-    device: 'cuda' | 'mps' | 'cpu' — см. `onnx_models` (GPU через CUDA/DirectML,
-    Apple через CoreML). Не поднялся ускоритель — считаем на CPU.
+    device: 'cuda' | 'mps' | 'cpu' — см. `onnx_models` (GPU через CUDA/DirectML;
+    'mps' на Apple — CPU). Не поднялся или упал ускоритель — считаем на CPU.
 
     on_progress: необязательный колбэк (fraction 0..1, message) — тикает по мере
     прохода VAD-сегментов, чтобы UI мог показать ETA самой длинной стадии.

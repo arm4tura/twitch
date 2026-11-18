@@ -156,7 +156,7 @@ let GPU_MODE = true; // уточняется после bootstrap; показы�
 
 /**
  * Показывать ли предупреждающий бейдж «CPU». На macOS — нет: там CPU и есть
- * режим по умолчанию (GigaAM на Apple Silicon быстрый), а CoreML включают руками.
+ * режим (GigaAM на Apple Silicon быстрый, а CoreML с ним не работает).
  */
 function gpuModeFor(accel: Accel | null): boolean {
   if (process.platform === "darwin") return true;
@@ -198,7 +198,7 @@ function buildBackendEnv(venvRoot: string | null): NodeJS.ProcessEnv {
   // и бэкенд ищет бинарник в PATH.
   const tdcliDir = resolveTdcliDir();
   if (tdcliDir) env.TWITCH_CUT_TDCLI_DIR = tdcliDir;
-  // Ускоритель бэкенд выбирает сам (onnxruntime: DirectML/CUDA/CoreML, нет —
+  // Ускоритель бэкенд выбирает сам (onnxruntime: DirectML/CUDA, нет —
   // CPU), поэтому TWITCH_CUT_CPU больше не выставляем.
   if (!venvRoot) return env;
 

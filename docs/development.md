@@ -6,7 +6,7 @@
 
 - Python 3.10-3.12 (сборка установщика - 3.12)
 - Node.js 18+ и npm
-- Видеокарта не обязательна: GigaAM идёт через onnxruntime (DirectML на Windows, CPU/CoreML на macOS)
+- Видеокарта не обязательна: GigaAM идёт через onnxruntime (DirectML на Windows, CPU на macOS)
 
 ## Backend (Python + распознавание)
 
@@ -61,8 +61,7 @@ python tools/onnx_parity.py <аудио.wav>  # сверка с torch-путём
 Новые файлы заливаются в релиз `models-v2` на GitHub, а их sha256 - в
 `src/twitch_cut/onnx_models.py` (иначе `prefetch` их не примет).
 
-Скорость ускорителей на своём железе (CoreML на Mac, DirectML на Windows)
-против CPU - с проверкой, что текст не разъехался:
+Скорость ускорителя на своём железе (DirectML на Windows) против CPU - с проверкой, что текст не разъехался:
 
 ```bash
 python tools/bench_device.py <аудио.wav>

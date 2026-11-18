@@ -68,15 +68,14 @@ interface KnownSettings {
   edit_journal: boolean;
 }
 
-// Платформа хоста — от неё зависит, какой ускоритель имеет смысл: на Mac —
-// CoreML (mps), на Windows/Linux — GPU через DirectML/CUDA (cuda).
+// Платформа хоста — от неё зависит, какой ускоритель имеет смысл: на
+// Windows/Linux — GPU через DirectML/CUDA (cuda), на Mac — CPU.
 const IS_MAC = window.twitchCut.platform === "darwin";
 
 const DEFAULTS: KnownSettings = {
   default_transcriber: "gigaam",
-  // На Mac по умолчанию CPU: GigaAM в onnxruntime на Apple Silicon и так
-  // быстрый, а CoreML (mps) пока экспериментальный — см. config.default_device.
-  // На Windows/Linux — GPU (onnxruntime сам уйдёт на CPU, если GPU нет).
+  // На Mac — CPU (см. DEVICE_OPTIONS). На Windows/Linux — GPU: onnxruntime сам
+  // уйдёт на CPU, если GPU нет.
   default_device: IS_MAC ? "cpu" : "cuda",
   default_compute_type: "float16",
   // balanced — единственная измеренная точка (см. config.SENSITIVITY_LEVELS):
@@ -98,13 +97,11 @@ const TRANSCRIBER_OPTIONS = [
   { value: "gigaam", label: "GigaAM v3 — лучший для русского" },
   { value: "whisperx", label: "WhisperX — универсальный, все языки" },
 ];
-// Ускоритель зависит от платформы: на Mac — CoreML (mps), на Windows/Linux —
-// GPU через DirectML (любая видеокарта) или CUDA. CPU доступен везде.
+// Ускоритель зависит от платформы: на Windows/Linux — GPU через DirectML (любая
+// видеокарта) или CUDA. На Mac выбирать нечего: CoreML с GigaAM не работает
+// (см. onnx_models._providers_for), а CPU на Apple Silicon и так быстрый.
 const DEVICE_OPTIONS = IS_MAC
-  ? [
-      { value: "cpu", label: "cpu — по умолчанию, на Apple Silicon быстро" },
-      { value: "mps", label: "mps — CoreML (экспериментально)" },
-    ]
+  ? [{ value: "cpu", label: "cpu — на Apple Silicon быстро" }]
   : [
       { value: "cuda", label: "cuda — GPU (любая видеокарта через DirectML / NVIDIA CUDA)" },
       { value: "cpu", label: "cpu — работает везде, но медленнее" },
@@ -158,6 +155,14 @@ function pickKnown(raw: Settings): KnownSettings {
     if (k === "default_sensitivity") {
       const s = String(v);
       const ok = SENSITIVITY_OPTIONS.some((o) => o.value === s);
+      return (ok ? s : DEFAULTS[k]) as KnownSettings[K];
+    }
+    // Устройство — тоже закрытый список под платформу. У пользователей прошлых
+    // версий на Mac сохранён 'mps', которого в списке больше нет (см.
+    // DEVICE_OPTIONS) — показываем дефолт, а не пустой селект.
+    if (k === "default_device") {
+      const s = String(v);
+      const ok = DEVICE_OPTIONS.some((o) => o.value === s);
       return (ok ? s : DEFAULTS[k]) as KnownSettings[K];
     }
     return String(v) as KnownSettings[K];

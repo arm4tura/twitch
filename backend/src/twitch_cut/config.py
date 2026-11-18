@@ -54,8 +54,8 @@ def default_device() -> str:
       1. TWITCH_CUT_DEVICE — явный оверрайд (cuda|cpu|mps), уважаем как есть;
       2. TWITCH_CUT_CPU=1 — форсим CPU;
       3. macOS → 'cpu': GigaAM в onnxruntime на Apple Silicon и так быстрый, а
-         CoreML ('mps') считает во float16 и может сдвинуть текст — его
-         включают руками;
+         CoreML с ним не работает ('mps' тоже идёт на CPU, см.
+         onnx_models._providers_for);
       4. иначе — 'cuda', то есть «GPU»: CUDA или DirectML (любая видеокарта
          под Windows), см. onnx_models. Нет GPU — onnxruntime сам уйдёт на CPU.
 
@@ -664,7 +664,7 @@ class PipelineConfig:
             )
         if self.device not in {"cuda", "cpu", "mps"}:
             raise ValueError("device must be 'cuda', 'cpu', or 'mps'")
-        # 'mps' (Apple, у GigaAM — CoreML в onnxruntime) понимает только
+        # 'mps' (Apple; у GigaAM сейчас то же, что CPU) понимает только
         # GigaAM. whisperx идёт через ctranslate2, whispercpp — через
         # whisper-cli; ни тот, ни другой его не умеют. Ловим тут, чтобы не
         # свалиться внутри загрузки модели.

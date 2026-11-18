@@ -59,7 +59,6 @@ const LANGUAGE_OPTIONS = [
 ];
 const DEVICE_OPTIONS = [
   { value: "cuda", label: "cuda — GPU (DirectML / NVIDIA CUDA)" },
-  { value: "mps", label: "mps — CoreML на Mac (экспериментально)" },
   { value: "cpu", label: "cpu" },
 ];
 const COMPUTE_OPTIONS = [
@@ -157,7 +156,10 @@ function loadForm(): FormState {
     const raw = localStorage.getItem(LS_KEY);
     if (!raw) return DEFAULT_FORM;
     const parsed = JSON.parse(raw);
-    return { ...DEFAULT_FORM, ...parsed };
+    const form: FormState = { ...DEFAULT_FORM, ...parsed };
+    // Сохранённого устройства может уже не быть в списке ('mps' прошлых версий).
+    if (!DEVICE_OPTIONS.some((o) => o.value === form.device)) form.device = DEFAULT_FORM.device;
+    return form;
   } catch {
     return DEFAULT_FORM;
   }
