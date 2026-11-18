@@ -49,10 +49,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -88,9 +88,9 @@ jobs:
           dist/x64/twitch-cut-backend/twitch-cut-backend.exe accel
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
@@ -126,7 +126,7 @@ jobs:
       # Всегда прикладываем установщик как artifact — можно скачать со страницы
       # запуска даже при ручном прогоне без релиза.
       - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: twitch-cut-windows-installer
           path: |
@@ -146,10 +146,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -186,7 +186,7 @@ jobs:
         run: tar czf backend-macos-${{ matrix.arch }}.tgz -C dist/${{ matrix.arch }} twitch-cut-backend
 
       - name: Upload backend
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: backend-macos-${{ matrix.arch }}
           path: backend/backend-macos-${{ matrix.arch }}.tgz
@@ -201,10 +201,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download backends
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           pattern: backend-macos-*
           path: backend-artifacts
@@ -219,9 +219,9 @@ jobs:
           done
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
@@ -251,7 +251,7 @@ jobs:
         run: npm run build && npx electron-builder --mac --arm64 --x64 --publish never
 
       - name: Upload dmg artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: twitch-cut-macos-dmg
           path: |

@@ -111,13 +111,31 @@ def _store_weights_fp16(path: Path, min_elements: int = 1024) -> int:
     return converted
 
 
-def export_gigaam(out_dir: Path) -> Path:
+def _quantize_int8(src: Path, dst: Path) -> None:
+    """Динамическая int8-квантизация весов MatMul (эксперимент, не в релизе).
+
+    Замер на 10 минутах реального стрима (CPU, Apple Silicon): распознавание
+    в 3.4 раза быстрее (26 с против 88), файл 305 МБ вместо 424 — но ~0.7%
+    слов меняются, у пяти мьютов из 30 границы сдвинулись на 20–40 мс и
+    добавился один ложный («онес» → «он ес»). Per-channel не лучше. Conv в int8
+    onnxruntime на CPU не исполняет (нет ConvInteger). Поэтому в приложении —
+    fp32-граф; вариант здесь, чтобы прогнать его через `twitch-cut eval` на
+    размеченных правках, прежде чем предлагать как «быстрый режим».
+    """
+    from onnxruntime.quantization import QuantType, quantize_dynamic
+
+    quantize_dynamic(str(src), str(dst), weight_type=QuantType.QInt8, op_types_to_quantize=["MatMul"])
+
+
+def export_gigaam(out_dir: Path, int8: bool = False) -> list[Path]:
     """GigaAM v3_ctc: энкодер + CTC-голова одним графом, на выходе log-probs.
 
     Штатный экспорт gigaam (`GigaAMASR._to_onnx`): входы — мел-признаки
     [B, 64, T] и их длины, выходы — log_probs [B, T', 34] и длины после
     сабсэмплинга. Мел-спектрограмма в граф НЕ входит: её считает numpy
     (`gigaam_onnx.log_mel`), так граф остаётся тем, что поддерживает gigaam.
+
+    `int8` — дополнительно `gigaam_v3_ctc_int8.onnx` (см. `_quantize_int8`).
     """
     import gigaam
 
@@ -132,11 +150,15 @@ def export_gigaam(out_dir: Path) -> Path:
     model.eval()
     cfg = model.cfg
     pre = cfg.preprocessor
+    targets = [out_dir / GIGAAM_ONNX_NAME]
     with tempfile.TemporaryDirectory() as tmp:
         model.to_onnx(tmp)
         produced = Path(tmp) / f"{cfg.model_name}.onnx"
-        target = out_dir / GIGAAM_ONNX_NAME
+        target = targets[0]
         target.write_bytes(produced.read_bytes())
+        if int8:
+            targets.append(out_dir / GIGAAM_ONNX_NAME.replace(".onnx", "_int8.onnx"))
+            _quantize_int8(produced, targets[1])
     converted = _store_weights_fp16(target)
     print(f"{target.name}: {converted} инициализаторов хранятся во float16")
 
@@ -168,8 +190,9 @@ def export_gigaam(out_dir: Path) -> Path:
         if GIGAAM_CKPT.exists()
         else None,
     }
-    _attach_meta(target, meta)
-    return target
+    for path in targets:
+        _attach_meta(path, meta)
+    return targets
 
 
 def export_vad(out_dir: Path) -> Path:
@@ -237,6 +260,9 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=MODELS_DIR / "onnx")
     parser.add_argument("--skip-gigaam", action="store_true")
     parser.add_argument("--skip-vad", action="store_true")
+    parser.add_argument(
+        "--int8", action="store_true", help="ещё и int8-вариант GigaAM (эксперимент, см. _quantize_int8)"
+    )
     args = parser.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -244,7 +270,7 @@ def main() -> int:
     if not args.skip_vad:
         produced.append(export_vad(args.out))
     if not args.skip_gigaam:
-        produced.append(export_gigaam(args.out))
+        produced.extend(export_gigaam(args.out, int8=args.int8))
     for path in produced:
         size_mb = path.stat().st_size / (1024 * 1024)
         print(f"{path.name}: {size_mb:.1f} МБ, sha256 {_sha256(path)}")

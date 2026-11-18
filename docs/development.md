@@ -61,6 +61,17 @@ python tools/onnx_parity.py <аудио.wav>  # сверка с torch-путём
 Новые файлы заливаются в релиз `models-v2` на GitHub, а их sha256 - в
 `src/twitch_cut/onnx_models.py` (иначе `prefetch` их не примет).
 
+Скорость ускорителей на своём железе (CoreML на Mac, DirectML на Windows)
+против CPU - с проверкой, что текст не разъехался:
+
+```bash
+python tools/bench_device.py <аудио.wav>
+```
+
+`tools/export_onnx.py --int8` дополнительно собирает int8-вариант GigaAM: на CPU
+он в ~3.4 раза быстрее, но меняет ~0.7% слов, поэтому в приложение не входит
+(подробности - в `_quantize_int8`).
+
 ## Desktop UI (Electron)
 
 ```bash
