@@ -4,7 +4,9 @@ import {
   Plus,
   RefreshCw,
   FolderOpen,
-  Sparkles,
+  Search,
+  List,
+  Grid2X2,
   Film,
   Clock,
   FileText,
@@ -12,10 +14,10 @@ import {
   MoreVertical,
   Trash2,
 } from "lucide-react";
+import { SourcePoster } from "../components/SourcePoster";
 import { EmptyState } from "../components/ui/EmptyState";
 import { Button } from "../components/ui/Button";
 import { Card } from "../components/ui/Card";
-import { StatCard } from "../components/ui/StatCard";
 import { Checkbox } from "../components/ui/Checkbox";
 import {
   DropdownMenu,
@@ -56,10 +58,15 @@ import {
 export function DashboardScreen({
   onNew,
   onOpen,
+  onExport,
 }: {
+  onExport: (path: string) => void;
   onNew: () => void;
   onOpen: (decisionsPath: string) => void;
 }) {
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [layout, setLayout] = useState<"list" | "grid">("list");
   const [projects, setProjects] = useState<ProjectMeta[] | null>(null);
   const [jobs, setJobs] = useState<JobState[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -158,9 +165,13 @@ export function DashboardScreen({
     [projects]
   );
 
+  const filtered = (projects ?? []).filter((p) => deriveTitle(p).toLocaleLowerCase().includes(query.toLocaleLowerCase()));
+
+  const selectedProject = filtered.find(p => p.decisions_path === selectedPath) ?? filtered[0];
+
   return (
-    <div className="mx-auto max-w-6xl p-8">
-      <header className="mb-8 flex items-end justify-between gap-6">
+    <div className="screen-page library-page" data-layout={layout}>
+      <header className="mb-5 flex flex-wrap items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight text-fg">Проекты</h1>
           <p className="mt-1 text-sm text-muted">
@@ -187,31 +198,20 @@ export function DashboardScreen({
         </div>
       </header>
 
-      {/* Stat row */}
-      <section className="mb-8 grid grid-cols-1 gap-3 sm:grid-cols-3">
-        <StatCard
-          icon={<FolderOpen className="h-3.5 w-3.5" />}
-          label="Проектов"
-          value={projects === null ? "—" : projects.length}
-          hint={projects && projects.length > 0 ? "завершено" : "начните с нового"}
-        />
-        <StatCard
-          icon={<Film className="h-3.5 w-3.5" />}
-          label="Активных задач"
-          value={runningCount}
-          hint={
-            runningCount > 0
-              ? "в очереди или выполняются"
-              : "нет активных обработок"
-          }
-        />
-        <StatCard
-          icon={<Sparkles className="h-3.5 w-3.5" />}
-          label="Всего правок"
-          value={totalEdits}
-          hint="заглушки, вырезы и хайлайты"
-        />
-      </section>
+      <div className="library-toolbar">
+        <div className="flex flex-wrap items-center gap-4 text-xs text-muted">
+          <span><strong className="text-fg">{projects?.length ?? "—"}</strong> проектов</span>
+          <span><strong className="text-fg">{runningCount}</strong> в обработке</span>
+          <span><strong className="text-fg">{totalEdits}</strong> правок</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <label className="library-search"><Search className="h-4 w-4" />
+            <input aria-label="Поиск проектов" placeholder="Поиск по названию…" value={query} onChange={(e) => setQuery(e.target.value)} />
+          </label>
+          <Button variant="ghost" size="icon" aria-label="Список" aria-pressed={layout === "list"} onClick={() => setLayout("list")}><List className="h-4 w-4" /></Button>
+          <Button variant="ghost" size="icon" aria-label="Сетка" aria-pressed={layout === "grid"} onClick={() => setLayout("grid")}><Grid2X2 className="h-4 w-4" /></Button>
+        </div>
+      </div>
 
       {/* Error banner */}
       {error && <DashboardError error={error} onRetry={reload} />}
@@ -231,15 +231,34 @@ export function DashboardScreen({
           }
         />
       ) : (
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {projects.map((p) => (
+        <div className="library-workspace"><div className="project-library">
+          {filtered.length === 0 && <p className="p-6 text-sm text-muted">Ничего не найдено. Попробуйте другое название.</p>}
+          {filtered.map((p) => (
             <ProjectCard
               key={p.decisions_path}
               project={p}
               onOpen={onOpen}
               onDelete={openDelete}
+              selected={selectedProject?.decisions_path === p.decisions_path}
+              onSelect={() => setSelectedPath(p.decisions_path)}
             />
           ))}
+        </div>
+        {selectedProject && <aside className="project-detail" aria-label="Выбранный проект">
+          <SourcePoster key={selectedProject.stream_path} path={selectedProject.stream_path} />
+          <div className="project-detail-body">
+            <span className="text-xs text-muted">Выбранный проект</span>
+            <h2 className="mt-2 text-lg font-semibold leading-snug">{deriveTitle(selectedProject)}</h2>
+            <dl className="detail-facts">
+              <div><dt>Обновлён</dt><dd>{fmtRelativeMs(selectedProject.updated_at_ms)}</dd></div>
+              <div><dt>Длительность</dt><dd>{selectedProject.duration_ms != null ? fmtDurationHuman(selectedProject.duration_ms / 1000) : "Не указана"}</dd></div>
+              <div><dt>Заглушки</dt><dd>{selectedProject.mutes_count}</dd></div>
+              <div><dt>Вырезы</dt><dd>{selectedProject.cuts_count}</dd></div>
+              <div><dt>Клипы</dt><dd>{selectedProject.highlights_count}</dd></div>
+            </dl>
+            <div className="flex flex-wrap gap-2"><Button onClick={() => onOpen(selectedProject.decisions_path)}>Открыть редактор</Button><Button variant="secondary" onClick={() => onExport(selectedProject.decisions_path)}>Экспорт</Button></div>
+          </div>
+        </aside>}
         </div>
       )}
 
@@ -299,7 +318,11 @@ function ProjectCard({
   project,
   onOpen,
   onDelete,
+  selected,
+  onSelect,
 }: {
+  selected: boolean;
+  onSelect: () => void;
   project: ProjectMeta;
   onOpen: (path: string) => void;
   onDelete: (project: ProjectMeta) => void;
@@ -319,18 +342,12 @@ function ProjectCard({
     <Card
       variant="elevated"
       padding="none"
-      className="group flex flex-col overflow-hidden transition-transform hover:-translate-y-0.5 hover:border-white/10"
+      onClick={onSelect}
+      className={`project-item group overflow-hidden hover:border-white/20 ${selected ? "project-selected" : ""}`}
     >
       {/* Cover — превью кадра записи во всю ширину, с откатом на Film-плейсхолдер.
           16:9 блок: object-cover заполняет его без чёрных полос по бокам. */}
-      <div className="relative aspect-video w-full overflow-hidden bg-gradient-to-br from-brand-from/20 via-brand-to/10 to-transparent">
-        <div
-          className="absolute inset-0 opacity-40"
-          style={{
-            backgroundImage:
-              "radial-gradient(600px circle at 30% 20%, rgb(139 92 246 / 0.35), transparent 50%)",
-          }}
-        />
+      <div className="project-cover relative aspect-video overflow-hidden bg-elevated">
         {showThumb ? (
           <img
             src={thumbSrc}
@@ -366,6 +383,15 @@ function ProjectCard({
             <MoreVertical className="h-4 w-4" />
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start">
+            <DropdownMenuItem
+              onSelect={async () => {
+                const dir = projectDir(project.decisions_path);
+                const ok = await window.twitchCut.openPath(dir);
+                if (!ok) toast.error("Не удалось открыть папку", { description: dir });
+              }}
+            >
+              <FolderOpen className="h-4 w-4" /> Открыть папку проекта
+            </DropdownMenuItem>
             <DropdownMenuItem variant="danger" onSelect={() => onDelete(project)}>
               <Trash2 className="h-4 w-4" /> Удалить проект
             </DropdownMenuItem>
@@ -374,10 +400,10 @@ function ProjectCard({
       </div>
 
       {/* Body */}
-      <div className="flex flex-1 flex-col gap-3 p-4">
+      <div className="project-body flex min-w-0 flex-1 flex-col gap-2 p-4">
         <div className="min-w-0">
           <h3 className="truncate text-sm font-semibold text-fg" title={title}>
-            {title}
+            <button type="button" className="block w-full truncate text-left" aria-pressed={selected} onClick={onSelect}>{title}</button>
           </h3>
           <div className="mt-0.5 flex items-center justify-between gap-2 text-[11px] text-subtle">
             <span className="flex items-center gap-1.5">
@@ -390,6 +416,9 @@ function ProjectCard({
           </div>
         </div>
 
+        <div className="flex flex-wrap gap-3 text-xs text-muted">
+          <span>{project.mutes_count} заглушек</span><span>{project.cuts_count} вырезов</span><span>{project.highlights_count} клипов</span>
+        </div>
         {/* Нижний блок: путь к файлу */}
         <div className="mt-auto flex min-w-0 flex-col gap-1.5 border-t border-white/5 pt-3 text-[11px] text-subtle">
           <div
@@ -403,7 +432,7 @@ function ProjectCard({
           </div>
         </div>
 
-        <div className="pt-1">
+        <div className="project-open pt-1">
           <Button
             variant="secondary"
             size="sm"
@@ -515,8 +544,12 @@ function deriveMeta(p: ProjectMeta): { title: string; timestamp: string | null }
       folder = parent;
     }
   }
+  // Сохранённый настоящий тайтл стрима (переименование по тумблеру во время
+  // детекта оффтопа) приоритетнее имени папки vod_<id>. Метку даты/времени всё
+  // равно тянем из имени папки — она к тайтлу не относится.
+  const stored = (p.title ?? "").trim();
   const m = folder.match(/^(.*)_(\d{8})_(\d{4})$/);
-  if (!m) return { title: folder, timestamp: null };
+  if (!m) return { title: stored || folder, timestamp: null };
   const [, base, ymd, hm] = m;
   const y = Number(ymd.slice(0, 4));
   const mo = Number(ymd.slice(4, 6));
@@ -524,9 +557,9 @@ function deriveMeta(p: ProjectMeta): { title: string; timestamp: string | null }
   const hh = hm.slice(0, 2);
   const mm = hm.slice(2, 4);
   const date = new Date(y, mo - 1, d);
-  if (Number.isNaN(date.getTime())) return { title: folder, timestamp: null };
+  if (Number.isNaN(date.getTime())) return { title: stored || folder, timestamp: null };
   const stamp = date.toLocaleDateString("ru-RU", { day: "numeric", month: "short" });
-  return { title: base || folder, timestamp: `${stamp}, ${hh}:${mm}` };
+  return { title: stored || base || folder, timestamp: `${stamp}, ${hh}:${mm}` };
 }
 
 /** `.../deep/nested/path/decisions.json` → `…/nested/path/decisions.json` (2 сегмента). */

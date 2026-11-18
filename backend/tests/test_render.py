@@ -117,6 +117,57 @@ def test_build_concat_inputs():
     assert fc == "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]"
 
 
+def test_build_concat_inputs_with_mute():
+    """mute_out_ranges → concat отдаёт [a0], затем volume=0 гасит его на этих
+    диапазонах → [a]. Видео [v] не трогаем; инпуты те же, что без матов."""
+    input_args, fc = render._build_concat_inputs(
+        Path("/src.mp4"), [(0.0, 10.0), (20.0, 30.0)], [(5.0, 7.0)]
+    )
+    assert input_args.count("-i") == 2  # маты не добавляют инпутов
+    assert "concat=n=2:v=1:a=1[v][a0]" in fc
+    assert "[a0]volume=enable=" in fc
+    assert "between(t,5.000,7.000)" in fc
+    assert fc.endswith(":volume=0[a]")
+
+
+# --- _project_mutes_to_output ---
+
+
+def test_project_mute_inside_single_keep():
+    # keep 0-10, 20-30 (склеиваются в выход 0-20); мат 5-7 внутри 1-го keep'а.
+    out = render._project_mutes_to_output([(5.0, 7.0)], [(0.0, 10.0), (20.0, 30.0)])
+    assert out == [(5.0, 7.0)]
+
+
+def test_project_mute_inside_second_keep():
+    # мат 22-25 во 2-м keep'е: 1-й keep даёт base=10, проекция 12-15.
+    out = render._project_mutes_to_output([(22.0, 25.0)], [(0.0, 10.0), (20.0, 30.0)])
+    assert out == [(12.0, 15.0)]
+
+
+def test_project_mute_spanning_cut_splits_in_two():
+    # мат 8-22 пересекает вырез 10-20 → два выходных куска.
+    out = render._project_mutes_to_output([(8.0, 22.0)], [(0.0, 10.0), (20.0, 30.0)])
+    assert out == [(8.0, 10.0), (10.0, 12.0)]
+
+
+def test_project_mute_inside_cut_dropped():
+    # мат 12-18 целиком в вырезанной зоне 10-20 → его в выходе нет.
+    out = render._project_mutes_to_output([(12.0, 18.0)], [(0.0, 10.0), (20.0, 30.0)])
+    assert out == []
+
+
+def test_project_mutes_sorted_by_output_start():
+    # входные маты не отсортированы — выход сортируем по началу.
+    out = render._project_mutes_to_output([(20.0, 22.0), (5.0, 7.0)], [(0.0, 30.0)])
+    assert out == [(5.0, 7.0), (20.0, 22.0)]
+
+
+def test_volume_mute_filter_joins_ranges():
+    f = render._volume_mute_filter([(5.0, 7.0), (12.0, 15.0)])
+    assert f == "volume=enable='between(t,5.000,7.000)+between(t,12.000,15.000)':volume=0"
+
+
 # --- render_video (fake Popen) ---
 
 
@@ -190,6 +241,62 @@ def test_render_reads_only_kept_ranges(fake_video, tmp_path, monkeypatch):
     # элементом — ищем подстроку в этом аргументе.
     fc = cmd[cmd.index("-filter_complex") + 1]
     assert "concat=n=2:v=1:a=1[v][a]" in fc
+
+
+def test_render_mutes_emit_volume_filter(fake_video, tmp_path, monkeypatch):
+    """segments_to_mute → filter_complex гасит аудио в ноль (volume=enable),
+    кадры НЕ вырезаются: -ss остаётся по числу keep'ов, инпуты не растут."""
+    out = tmp_path / "out.mp4"
+    captured: dict[str, list] = {}
+
+    def _capture_popen(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakePopen(["frame=1 time=00:00:05.00 bitrate=1000\n"], 0)
+
+    monkeypatch.setattr(render, "get_ffmpeg_path", lambda: "/fake/ffmpeg")
+    monkeypatch.setattr(render.subprocess, "Popen", _capture_popen)
+
+    render.render_video(
+        fake_video,
+        out,
+        segments_to_remove=[(20.0, 30.0)],  # keep 0-20, 30-60
+        segments_to_mute=[(5.0, 7.0)],  # мат внутри 1-го keep'а → выход 5-7
+        total_duration=60.0,
+        encoder="libx264",
+    )
+
+    cmd = captured["cmd"]
+    assert cmd.count("-ss") == 2  # мат не добавил инпутов — только keeps
+    fc = cmd[cmd.index("-filter_complex") + 1]
+    assert "concat=n=2:v=1:a=1[v][a0]" in fc
+    assert "volume=enable='between(t,5.000,7.000)':volume=0[a]" in fc
+
+
+def test_render_mute_outside_keeps_is_noop(fake_video, tmp_path, monkeypatch):
+    """Мат, спроецированный в ничто (лежит в вырезе), не добавляет volume-фильтр —
+    filter_complex остаётся обычной склейкой."""
+    out = tmp_path / "out.mp4"
+    captured: dict[str, list] = {}
+
+    def _capture_popen(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakePopen(["frame=1 time=00:00:05.00 bitrate=1000\n"], 0)
+
+    monkeypatch.setattr(render, "get_ffmpeg_path", lambda: "/fake/ffmpeg")
+    monkeypatch.setattr(render.subprocess, "Popen", _capture_popen)
+
+    render.render_video(
+        fake_video,
+        out,
+        segments_to_remove=[(20.0, 30.0)],  # вырез 20-30
+        segments_to_mute=[(22.0, 25.0)],  # целиком в вырезе → проекции нет
+        total_duration=60.0,
+        encoder="libx264",
+    )
+
+    fc = captured["cmd"][captured["cmd"].index("-filter_complex") + 1]
+    assert fc == "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]"
+    assert "volume=enable" not in fc
 
 
 def test_render_ffmpeg_failure_raises(fake_video, tmp_path, monkeypatch):

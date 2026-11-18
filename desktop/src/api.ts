@@ -18,7 +18,8 @@ export type JobKind =
   | "export_vegas_highlights"
   | "detect_silence"
   | "render"
-  | "download_vod";
+  | "download_vod"
+  | "detect_offtopic";
 
 /** Highlight из decisions.json (bundle: highlights[].highlights). */
 export interface Highlight {
@@ -135,6 +136,11 @@ export interface ProcessJobRequest {
   batch_size?: number;
   vad_filter?: boolean;
   vad_method?: string;
+  // Чувствительность детекции мата: 'low' | 'balanced' | 'high'. Одна ручка
+  // вместо шести чисел (отступы мьюта, склейка, поджим границ по звуку, порог
+  // спотинга) — их значения выводит бэкенд (config.SENSITIVITY_LEVELS). Здесь
+  // намеренно НЕТ самих чисел: они не должны разъезжаться между UI и бэком.
+  sensitivity?: string;
   mock_transcript?: string | null;
 }
 
@@ -374,6 +380,8 @@ export interface RenderRequest {
   input_path: string;
   output_path: string;
   segments_to_remove: [number, number][];
+  /** [start,end] в секундах — заглушить аудио в ноль, кадры оставить (маты). */
+  segments_to_mute?: [number, number][];
   encoder?: string | null;
   audio_bitrate?: string;
   /** Пресет скорость↔качество энкодера. Дефолт на бэке — "balanced". */
@@ -389,6 +397,7 @@ export interface RenderResult {
   output_path: string;
   output_size: number;
   removed_count: number;
+  muted_count?: number;
   kept_duration: number;
 }
 
@@ -441,6 +450,9 @@ export function getPrompt(
 export interface ProjectMeta {
   decisions_path: string;
   name: string;
+  /** Настоящий тайтл стрима с Twitch, если сохранён в decisions.json. UI
+   *  предпочитает его имени папки vod_<id>. */
+  title?: string | null;
   workdir: string | null;
   stream_path: string | null;
   updated_at_ms: number;
@@ -491,6 +503,183 @@ export function getLogsDir(): Promise<{ path: string }> {
 }
 
 /**
+ * Уровень чувствительности к мату из настроек — для запуска обработки.
+ *
+ * Best-effort: настройки не прочитались (бэкенд ещё не поднялся, файла нет) →
+ * null, и запрос уходит без поля, а бэкенд берёт свой `balanced`. Вынесено сюда,
+ * потому что обработка запускается из двух мест — формы новой обработки и
+ * авто-цепочки после скачивания VOD, — и настройка обязана действовать в обоих.
+ */
+export function getDefaultSensitivity(): Promise<string | null> {
+  return getSettings()
+    .then((s) =>
+      typeof s.default_sensitivity === "string" && s.default_sensitivity
+        ? s.default_sensitivity
+        : null
+    )
+    .catch(() => null);
+}
+
+// --- AI: провайдеры / шаблоны / детекция оффтопа ----------------------------
+//
+// БЕЗОПАСНОСТЬ: api_key НИКОГДА не проходит через renderer. GET-эндпоинты
+// (providers/templates) секрета не несут — идут напрямую через request().
+// А testConnection / detectOfftopic требуют ключ: renderer передаёт только
+// `api_key_ref`, а расшифровку и вставку api_key делает Electron main
+// (window.twitchCut.aiTestConnection / aiDetectOfftopic → loopback-POST).
+// Поэтому эти две обёртки идут через IPC-мост, а не через request().
+
+/** Провайдер ИИ (зеркалит llm_offtopic/providers.py AIProvider). Без секрета. */
+export interface AiProvider {
+  id: string;
+  label: string;
+  format: "anthropic" | "openai";
+  base_url?: string | null;
+  models: string[];
+  /** Символическая ссылка на ключ в safeStorage (НЕ сам ключ). */
+  api_key_ref?: string | null;
+  /**
+   * Схема авторизации для anthropic-формата: "x-api-key" (нативный Anthropic)
+   * или "bearer" (agentrouter и прокси на Messages API). Меняет только
+   * заголовок — ключ тот же, ставит его SDK. Для openai не используется.
+   */
+  auth_scheme?: "x-api-key" | "bearer";
+  /** Доп. HTTP-заголовки к каждому запросу (default_headers у SDK). Без секрета. */
+  headers?: Record<string, string> | null;
+  /**
+   * Держать ли SSE-стрим. По умолчанию true. false — у провайдеров с битым
+   * стримом (agentrouter: delta:null/billing.summary ломают парсер) — берётся
+   * один цельный не-стримовый ответ.
+   */
+  stream?: boolean;
+  builtin: boolean;
+}
+
+/** Шаблон промпта (зеркалит llm_offtopic/templates.py PromptTemplate). */
+export interface AiTemplate {
+  id: string;
+  label: string;
+  kind: "topic" | "classification";
+  text: string;
+  builtin: boolean;
+}
+
+/** Оффтоп-сегмент (зеркалит llm_offtopic/model.py OfftopicSegment + stream_*). */
+export interface OfftopicSegment {
+  /** Границы в LOCAL-секундах (от начала транскрипта), как mutes[i].start. */
+  start_s: number;
+  end_s: number;
+  confidence: number;
+  reason: string;
+  topic?: string | null;
+  quote?: string | null;
+  /** Audit: модель/ступень каскада, вынёсшие вердикт. */
+  model?: string | null;
+  stage?: string | null;
+  /** Секунд видео МОЛЧАЛО в сегменте (путь source; 0 = играло всю реплику). */
+  pause_s?: number | null;
+  /** Доля слов сегмента, привязанных к исходнику 0..1 (путь source). */
+  anchored?: number | null;
+  /** Абсолютные секунды исходника — проставляет merger (stream_offset). */
+  stream_start_s?: number;
+  stream_end_s?: number;
+}
+
+/**
+ * Тело detect-offtopic (зеркалит schemas.py DetectOfftopicRequest), НО без
+ * `api_key`: renderer шлёт `api_key_ref`, main достаёт ключ и вставляет api_key.
+ */
+export interface DetectOfftopicRequest {
+  decisions: string;
+  output: string;
+  transcript?: string | null;
+  provider_id?: string;
+  provider?: Record<string, unknown> | null;
+  /** Ссылка на ключ в safeStorage; main расшифрует и подставит api_key. */
+  api_key_ref?: string | null;
+  cheap_model?: string | null;
+  expensive_model?: string | null;
+  /** [source/single-pass] Модель LLM; None → дефолт провайдера. */
+  model?: string | null;
+  /** null|source|single-pass|windows (см. schemas.py DetectOfftopicRequest). */
+  method?: string | null;
+  /** Локальный файл исходника — распознаём и используем как ground truth. */
+  source_audio?: string | null;
+  /** Готовый JSON транскрипта исходника (вместо распознавания source_audio). */
+  source_transcript?: string | null;
+  /** Модель ASR исходника; должна совпадать с моделью стрима. */
+  source_model?: string | null;
+  /** Устройство ASR исходника (cpu безопаснее). */
+  source_device?: string | null;
+  topic_template?: Record<string, unknown> | null;
+  classification_template?: Record<string, unknown> | null;
+  window_s?: number | null;
+  overlap_s?: number | null;
+  chunk_s?: number | null;
+  merge_gap_s?: number | null;
+  cascade_threshold?: number | null;
+}
+
+/** Тело test-connection (без api_key — только ref, main подставит ключ). */
+export interface TestConnectionRequest {
+  provider_id?: string;
+  provider?: Record<string, unknown> | null;
+  api_key_ref?: string | null;
+}
+
+/** Результат detect-offtopic job (state.result по завершении). */
+export interface DetectOfftopicResult {
+  output: string;
+  segments_count: number;
+  total_offtopic_s: number;
+  offtopic: OfftopicSegment[];
+}
+
+/** Встроенные + пользовательские провайдеры (без секретов). */
+export function getAiProviders(): Promise<{ builtin: AiProvider[]; custom: AiProvider[] }> {
+  return request("/ai/providers");
+}
+
+/** Встроенные + пользовательские шаблоны промптов. */
+export function getAiTemplates(): Promise<{ builtin: AiTemplate[]; custom: AiTemplate[] }> {
+  return request("/ai/templates");
+}
+
+/**
+ * Проверить соединение с провайдером. Идёт через Electron main (ключ по
+ * api_key_ref достаётся и вставляется main-side; renderer ключ не держит).
+ * Возвращает распарсенный ответ backend { ok, detail } или бросает Error.
+ */
+export async function testAiConnection(
+  req: TestConnectionRequest
+): Promise<{ ok: boolean; detail: string }> {
+  const res = await window.twitchCut.aiTestConnection(req as unknown as Record<string, unknown>);
+  if (!res.ok) {
+    // res.ok=false тут = транспортная/IPC-ошибка (не «плохой ключ» — тот
+    // приходит в data с HTTP 200 и { ok:false, detail }).
+    throw new Error(res.error || `test-connection failed (HTTP ${res.status ?? "?"})`);
+  }
+  return res.data as { ok: boolean; detail: string };
+}
+
+/**
+ * Запустить джобу AI-детекции оффтопа. Идёт через Electron main (ключ
+ * инжектится main-side). Возвращает снапшот джобы (JobState) — дальше UI
+ * подписывается через subscribeJob(state.id).
+ */
+export async function createDetectOfftopicJob(
+  req: DetectOfftopicRequest
+): Promise<JobState> {
+  const res = await window.twitchCut.aiDetectOfftopic(req as unknown as Record<string, unknown>);
+  if (!res.ok) {
+    const data = res.data as { detail?: unknown } | null;
+    const detail = data?.detail ? JSON.stringify(data.detail) : res.error;
+    throw new Error(detail || `detect-offtopic failed (HTTP ${res.status ?? "?"})`);
+  }
+  return res.data as JobState;
+}
+
+/**
  * Рекомендованный путь workdir для нового джоба. Backend строит
  * `~/twitch_cut/projects/{basename}_{yyyymmdd_hhmm}/` — уникально по минуте,
  * никогда не перезаписывает предыдущий проект.
@@ -507,7 +696,37 @@ export function suggestWorkdir(streamPath?: string): Promise<{ path: string }> {
 /** Peaks-массив в формате, готовом к передаче wavesurfer.js через `peaks:` opt. */
 export interface WaveformData {
   peaks: number[];
+  /**
+   * Настоящие границы контура по бакетам (min ≤ 0 ≤ max). Асимметричный min/max
+   * даёт узнаваемую «рваную» форму Audacity; зеркальный ±peaks — гладкий блоб.
+   * Опционально: кэши format<3 их не содержат → фронт падает на `peaks`.
+   */
+  min?: number[];
+  max?: number[];
+  /**
+   * RMS-энергия по тем же бакетам, что и peaks (0..1). Рисуется как яркое ядро
+   * внутри контура пика — фирменный вид Audacity. Опционально: старые кэши
+   * (format<2) его не содержат, фронт тогда рисует один контур.
+   */
+  rms?: number[];
   duration_s: number;
+  sample_rate: number;
+  source: string;
+}
+
+/**
+ * «Слой детали» — peaks ТОЛЬКО для видимого окна (см. /waveform/range).
+ *
+ * `start_s`/`end_s` — ФАКТИЧЕСКИ покрытый диапазон: у конца файла ffmpeg отдаёт
+ * меньше, чем просили, и рисовать нужно по этим границам, иначе волна съедет.
+ */
+export interface WaveformRange {
+  peaks: number[];
+  min: number[];
+  max: number[];
+  rms: number[];
+  start_s: number;
+  end_s: number;
   sample_rate: number;
   source: string;
 }
@@ -527,6 +746,30 @@ export function getWaveform(
   return request(
     `/waveform?path=${encodeURIComponent(streamPath)}&peaks=${peaks}`
   );
+}
+
+/**
+ * Получить peaks ТОЛЬКО для окна [startS, endS] — «слой детали» при зуме.
+ *
+ * Так работают Audacity/Reaper: чем глубже зум, тем мельче запрошенный диапазон,
+ * поэтому крошка волны видна на любом масштабе (базовые 8192 точки на весь
+ * стрим при зуме в 5 секунд дали бы ~20 точек = гладкий блоб).
+ *
+ * НЕ кэшируется на бэкенде (комбинаций бесконечно) — декод узкого слайса стоит
+ * десятки ms. Вызывающий обязан дебаунсить и отменять устаревшие запросы через
+ * `signal`, иначе быстрый зум-жест наплодит очередь.
+ */
+export function getWaveformRange(
+  streamPath: string,
+  startS: number,
+  endS: number,
+  res: number = 2048,
+  signal?: AbortSignal
+): Promise<WaveformRange> {
+  const qs =
+    `path=${encodeURIComponent(streamPath)}` +
+    `&start=${startS.toFixed(6)}&end=${endS.toFixed(6)}&res=${res}`;
+  return request(`/waveform/range?${qs}`, { signal });
 }
 
 /**

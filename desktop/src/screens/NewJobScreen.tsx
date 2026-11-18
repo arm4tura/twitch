@@ -14,7 +14,7 @@ import {
   Download,
   AlertCircle,
 } from "lucide-react";
-import { createProcessJob, getSettings, getVodInfo, createDownloadVodJob, subscribeJob, type JobState, type JobEvent, type VodInfo } from "../api";
+import { createProcessJob, getDefaultSensitivity, getSettings, getVodInfo, createDownloadVodJob, subscribeJob, type JobState, type JobEvent, type VodInfo } from "../api";
 import { parseTwitchVodInput, twitchVodUrl } from "../lib/twitch";
 import { Button } from "../components/ui/Button";
 import { Card, CardDescription, CardTitle } from "../components/ui/Card";
@@ -58,7 +58,8 @@ const LANGUAGE_OPTIONS = [
   { value: "auto", label: "auto — автоопределение" },
 ];
 const DEVICE_OPTIONS = [
-  { value: "cuda", label: "cuda — GPU (NVIDIA)" },
+  { value: "cuda", label: "cuda — GPU (DirectML / NVIDIA CUDA)" },
+  { value: "mps", label: "mps — CoreML на Mac (экспериментально)" },
   { value: "cpu", label: "cpu" },
 ];
 const COMPUTE_OPTIONS = [
@@ -295,19 +296,28 @@ export function NewJobScreen({
    * В расширенном — те же входы плюс выбор движка и его параметры; workdir и
    * пути выходов бэкенд по-прежнему создаёт сам. Навигацию на job'у делаем без
    * decisionsPath — JobScreen возьмёт итоговый путь из результата после завершения.
+   *
+   * Чувствительность к мату читаем из настроек ЗДЕСЬ, а не из формы: это не
+   * параметр запуска, а вкус монтажёра, и он должен действовать в обоих режимах,
+   * включая простой. Через форму бы не сработало — форма кэшируется в
+   * localStorage и дефолты из настроек в неё подтягиваются только один раз.
+   * Best-effort: настройки не прочитались — шлём запрос без уровня, бэкенд
+   * возьмёт свой `balanced`.
    */
   const submit = async (simple: boolean) => {
     setError(null);
     setSubmitting(true);
     try {
+      const sensitivity = await getDefaultSensitivity();
       const whisperx = form.transcriber === "whisperx";
       const req = simple
-        ? { stream: form.stream }
+        ? { stream: form.stream, ...(sensitivity ? { sensitivity } : {}) }
         : {
             stream: form.stream,
             banwords: form.banwords,
             // Оригинал видео скрыт в UI — шлём только если раньше был выбран.
             ...(form.original ? { original: form.original } : {}),
+            ...(sensitivity ? { sensitivity } : {}),
             range_in: form.range_in || null,
             range_out: form.range_out || null,
             transcriber: form.transcriber,
@@ -336,7 +346,7 @@ export function NewJobScreen({
   };
 
   return (
-    <div className="mx-auto flex max-w-7xl flex-col gap-6 p-8">
+    <div className="screen-page flex flex-col gap-5">
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight text-fg">
@@ -450,7 +460,7 @@ function SimpleForm({
   };
 
   return (
-    <div className="mx-auto flex w-full max-w-2xl flex-col gap-5">
+    <div className="import-workspace" data-source={source}>
       {/* Переключатель источника: локальный файл / скачать Twitch VOD */}
       <SourceSwitch source={source} onChange={setSource} />
 
@@ -482,11 +492,11 @@ function SimpleForm({
         }}
         onDrop={onDrop}
         className={cn(
-          "group flex cursor-pointer flex-col items-center justify-center gap-4 rounded-2xl border-2 border-dashed px-6 py-16 text-center transition-colors",
+          "import-drop group flex cursor-pointer flex-col items-center justify-center gap-4 rounded-md border border-dashed px-6 py-12 text-center transition-colors",
           "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-from",
           dragOver
             ? "border-brand-from bg-brand-from/10"
-            : "border-white/12 bg-surface/30 hover:border-white/25 hover:bg-surface/50"
+            : "border-white/[0.12] bg-surface/30 hover:border-white/25 hover:bg-surface/50"
         )}
       >
         {stream ? (
@@ -531,7 +541,7 @@ function SimpleForm({
       </div>
 
       {/* Пояснение — что произойдёт, простым языком */}
-      <Card variant="glass" padding="md">
+      <Card variant="glass" padding="md" className="import-summary">
         <div className="mb-3 flex items-center gap-2">
           <Sparkles className="h-4 w-4 text-brand-from" />
           <CardTitle>Что произойдёт</CardTitle>
@@ -767,7 +777,7 @@ function VodSource({
   const done = dl?.status === "done" && !!dl.result;
 
   return (
-    <div className="flex flex-col gap-5">
+    <div className={variant === "full" ? "vod-source-workspace" : "flex flex-col gap-5"}>
       {/* Поле ссылки */}
       <div>
         <Label>Ссылка на Twitch VOD</Label>
@@ -794,9 +804,9 @@ function VodSource({
       </div>
 
       {/* Превью метаданных */}
-      {parsed && (
-        <VodPreview info={info} loading={loadingInfo} error={infoError} />
-      )}
+      {(parsed || variant === "full") && <aside className="vod-source-preview">
+        {parsed ? <VodPreview info={info} loading={loadingInfo} error={infoError} /> : <Card padding="md"><FileVideo className="mb-3 h-7 w-7 text-subtle" /><CardTitle>Запись Twitch</CardTitle><p className="mt-2 text-xs leading-relaxed text-muted">Вставьте ссылку слева. Здесь появятся кадр записи, название канала и длительность.</p></Card>}
+      </aside>}
 
       {/* Качество + обрезка — показываем, как только ссылка валидна.
           В inline-режиме прячем, когда скачивание уже пошло/завершилось. */}
@@ -1352,7 +1362,7 @@ function FilePickerCard({
         "group flex items-center gap-3 rounded-xl border px-4 py-3 text-left transition-colors",
         "cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-from",
         filled
-          ? "border-white/12 bg-surface/50 hover:border-white/25"
+          ? "border-white/[0.12] bg-surface/50 hover:border-white/25"
           : "border-dashed border-white/15 bg-black/20 hover:border-white/30 hover:bg-surface/40"
       )}
     >

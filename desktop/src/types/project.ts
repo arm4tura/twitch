@@ -51,6 +51,54 @@ export interface SilenceRecord {
   [k: string]: unknown;
 }
 
+/**
+ * Один оффтоп-сегмент из decisions["offtopic"].segments (реальная схема —
+ * backend/src/twitch_cut/llm_offtopic/model.py::OfftopicSegment + stream_*_s,
+ * которые проставляет merger.py). Границы `start_s`/`end_s` — LOCAL-секунды
+ * (от range_in), как у mutes[i].start; `stream_*_s` — абсолютные в исходнике.
+ * Лишние поля сохраняем as-is (round-trip).
+ */
+export interface OfftopicSegment {
+  start_s: number;
+  end_s: number;
+  confidence: number;
+  reason: string;
+  topic?: string | null;
+  quote?: string | null;
+  /** Audit: модель/ступень каскада, вынёсшие вердикт. */
+  model?: string | null;
+  stage?: string | null;
+  /** Секунд видео МОЛЧАЛО в сегменте (путь source; 0 = играло всю реплику). */
+  pause_s?: number | null;
+  /** Доля слов сегмента, привязанных к исходнику 0..1 (путь source). */
+  anchored?: number | null;
+  /** Абсолютные секунды исходника — проставляет merger (stream_offset). */
+  stream_start_s?: number;
+  stream_end_s?: number;
+  [k: string]: unknown;
+}
+
+/**
+ * Бандл AI-детекции оффтопа в decisions.json (ключ "offtopic"). Пишет
+ * merger.py при merge результата джобы detect-offtopic. Пустой segments —
+ * легитимный результат («оффтопа не найдено»).
+ */
+export interface OfftopicBundle {
+  segments: OfftopicSegment[];
+  /** Id провайдера/модели или 'mock' (audit trail). */
+  source?: string;
+  /** Хеш транскрипта — рассинхрон = сегменты стухли. */
+  transcript_hash?: string;
+  model?: string;
+  /** Путь классификации, породивший бандл (см. model.py::OfftopicSet.method). */
+  method?: string;
+  /** Хеш транскрипта исходника (путь source). */
+  source_transcript_hash?: string;
+  /** Модель ASR исходника (путь source). */
+  source_model?: string;
+  [k: string]: unknown;
+}
+
 /** Кэши путей (аудио-извлечение диапазона + транскрипт). */
 export interface DecisionsCaches {
   audio?: string | null;
@@ -61,6 +109,9 @@ export interface DecisionsCaches {
 /** Корневой документ decisions.json. Незнакомые поля сохраняем. */
 export interface DecisionsDoc {
   schema_version?: string;
+  /** Настоящий тайтл стрима с Twitch (если включён тумблер переименования и его
+   *  вытащил детект оффтопа). Приоритетнее имени папки vod_<id> в UI. */
+  title?: string;
   /** Путь к исходному stream (полный файл). */
   source?: string;
   /** Legacy-ключ на случай старых файлов. */
@@ -71,6 +122,8 @@ export interface DecisionsDoc {
   mutes?: MuteRecord[];
   /** Обнаруженная тишина после ревью (audio-секунды). Пишет TimelineScreen. */
   silences?: SilenceRecord[];
+  /** AI-детекция оффтопа (бандл segments + метаданные). Пишет detect-offtopic. */
+  offtopic?: OfftopicBundle;
   cuts?: unknown[];
   highlights?: unknown;
   caches?: DecisionsCaches;

@@ -40,6 +40,30 @@ declare global {
         error?: string;
         cancelled?: boolean;
       }>;
+
+      // --- AI-ключи и операции (см. electron/preload.ts). `get`/расшифровка
+      // намеренно отсутствует: открытый ключ в renderer не возвращается. ---
+      aiKeySet(
+        ref: string,
+        plaintextKey: string
+      ): Promise<{ ok: boolean; error?: string }>;
+      aiKeyHas(
+        ref: string
+      ): Promise<{ ok: boolean; present?: boolean; error?: string }>;
+      aiKeyList(): Promise<{ ok: boolean; refs?: string[]; error?: string }>;
+      aiKeyDelete(ref: string): Promise<{ ok: boolean; error?: string }>;
+      aiTestConnection(req: Record<string, unknown>): Promise<{
+        ok: boolean;
+        status?: number;
+        data?: unknown;
+        error?: string;
+      }>;
+      aiDetectOfftopic(req: Record<string, unknown>): Promise<{
+        ok: boolean;
+        status?: number;
+        data?: unknown;
+        error?: string;
+      }>;
     };
   }
 }

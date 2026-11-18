@@ -4,11 +4,15 @@ import logging
 import re
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import imageio_ffmpeg
 
 from .cache import file_fingerprint, stable_hash, write_json
 from .timecode import TimeSpan, parse_timecode
+
+if TYPE_CHECKING:
+    import numpy as np
 
 logger = logging.getLogger(__name__)
 _DURATION_RE = re.compile(r"Duration:\s*(?P<duration>\d{1,2}:\d{2}:\d{2}(?:[\.,]\d{1,3})?)")
@@ -29,6 +33,57 @@ def probe_media_duration(media_path: Path) -> TimeSpan:
     if not match:
         raise RuntimeError(f"Could not detect media duration for {media_path}")
     return parse_timecode(match.group("duration"))
+
+
+def load_audio_16k(path: Path, sample_rate: int = 16000) -> "np.ndarray":
+    """Аудио как float32 [-1, 1), моно, `sample_rate` Гц — вход ASR и VAD.
+
+    Наш собственный `extract_audio_range` уже пишет WAV pcm_s16le 16 кГц моно —
+    такой файл читаем напрямую, без ffmpeg (часовой стрим — это сотни МБ
+    PCM, гонять их через pipe незачем). Любой другой файл декодирует бандл-
+    ffmpeg ровно в тот же формат. Деление на 32768 — то же, что у gigaam и
+    pyannote, поэтому сэмплы бит в бит совпадают с прежним torch-путём.
+    """
+    import wave
+
+    import numpy as np
+
+    try:
+        with wave.open(str(path), "rb") as wav:
+            if (
+                wav.getframerate() == sample_rate
+                and wav.getnchannels() == 1
+                and wav.getsampwidth() == 2
+                and wav.getcomptype() == "NONE"
+            ):
+                pcm = wav.readframes(wav.getnframes())
+                return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+    except (wave.Error, EOFError):
+        pass  # не WAV или WAV с кодеком — пусть разбирается ffmpeg
+
+    cmd = [
+        get_ffmpeg_path(),
+        "-nostdin",
+        "-threads",
+        "0",
+        "-i",
+        str(path),
+        "-f",
+        "s16le",
+        "-ac",
+        "1",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        str(sample_rate),
+        "-",
+    ]
+    try:
+        pcm = subprocess.run(cmd, capture_output=True, check=True).stdout
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode("utf-8", "replace").strip() if exc.stderr else ""
+        raise RuntimeError(f"ffmpeg не смог прочитать аудио {path.name}: {stderr}") from exc
+    return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
 
 
 def extract_audio_range(

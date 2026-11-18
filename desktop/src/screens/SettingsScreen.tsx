@@ -5,9 +5,11 @@ import {
   Info,
   Loader2,
   Mic,
+  NotebookPen,
   RotateCcw,
   Save,
   SlidersHorizontal,
+  Sparkles,
   Trash2,
 } from "lucide-react";
 import { Button } from "../components/ui/Button";
@@ -16,6 +18,7 @@ import { Input, Label, Select } from "../components/ui/Input";
 import { HelpTip } from "../components/ui/Tooltip";
 import { toast } from "../components/ui/Toast";
 import { getLogsDir, getSettings, putSettings, type Settings } from "../api";
+import { AiProvidersCard } from "../components/settings/AiProvidersCard";
 
 /**
  * SettingsScreen — значения по умолчанию для новой обработки + системные пути.
@@ -27,6 +30,8 @@ import { getLogsDir, getSettings, putSettings, type Settings } from "../api";
  *
  * Что здесь:
  * - Движок распознавания (default_transcriber) — gigaam | whisperx.
+ * - Чувствительность к мату (default_sensitivity) — low | balanced | high; одна
+ *   ручка вместо шести чисел мьюта, сами числа считает бэкенд.
  * - Вычисления: device + compute_type (единственное, что реально читает форма
  *   новой обработки на машине без GPU).
  * - Параметры WhisperX (только при whisperx): модель, язык, VAD, batch_size.
@@ -43,28 +48,48 @@ interface KnownSettings {
   default_transcriber: string;
   default_device: string;
   default_compute_type: string;
+  // Чувствительность детекции мата: low | balanced | high. Одна настройка на шесть
+  // чисел бэкенда (отступы, склейка, поджим границ, порог спотинга) — сами числа
+  // живут только в config.SENSITIVITY_LEVELS, сюда едет имя уровня.
+  default_sensitivity: string;
   // WhisperX-only (используются, только если default_transcriber === "whisperx")
   default_model: string;
   default_language: string;
   default_batch_size: number;
   default_vad_method: string;
   default_vad_filter: boolean;
+  // Переименовывать проект в настоящий тайтл стрима с Twitch при детекте оффтопа
+  // (вместо имени папки vod_<id>). Тайтл тянется из get_vod_info по id.
+  rename_project_to_title: boolean;
+  // Журнал ручных правок: каждое сохранение из «Правки» дописывает, что человек
+  // изменил относительно решения программы, в <decisions>.edits.json рядом с
+  // проектом. Нужен для разбора «как должно быть vs как сделала программа»
+  // (backend/src/twitch_cut/edit_journal.py, раздел в `twitch-cut audit`).
+  edit_journal: boolean;
 }
 
-// Платформа хоста — от неё зависит, какой ускоритель по умолчанию имеет смысл:
-// на Mac (Apple Silicon) это Metal/MPS, на Windows/Linux — CUDA.
+// Платформа хоста — от неё зависит, какой ускоритель имеет смысл: на Mac —
+// CoreML (mps), на Windows/Linux — GPU через DirectML/CUDA (cuda).
 const IS_MAC = window.twitchCut.platform === "darwin";
 
 const DEFAULTS: KnownSettings = {
   default_transcriber: "gigaam",
-  // На Mac CUDA нет — по умолчанию Apple Metal (mps). На остальных — cuda.
-  default_device: IS_MAC ? "mps" : "cuda",
+  // На Mac по умолчанию CPU: GigaAM в onnxruntime на Apple Silicon и так
+  // быстрый, а CoreML (mps) пока экспериментальный — см. config.default_device.
+  // На Windows/Linux — GPU (onnxruntime сам уйдёт на CPU, если GPU нет).
+  default_device: IS_MAC ? "cpu" : "cuda",
   default_compute_type: "float16",
+  // balanced — единственная измеренная точка (см. config.SENSITIVITY_LEVELS):
+  // выше неё F1 уже не растёт, ниже теряются находки.
+  default_sensitivity: "balanced",
   default_model: "large-v3",
   default_language: "ru",
   default_batch_size: 16,
   default_vad_method: "pyannote",
   default_vad_filter: true,
+  rename_project_to_title: true,
+  // По умолчанию выключен: это диагностика, а не часть обычной работы.
+  edit_journal: false,
 };
 
 // Списки опций — те же, что в NewJobScreen (держим синхронно вручную; вынесем
@@ -73,16 +98,16 @@ const TRANSCRIBER_OPTIONS = [
   { value: "gigaam", label: "GigaAM v3 — лучший для русского" },
   { value: "whisperx", label: "WhisperX — универсальный, все языки" },
 ];
-// Ускоритель зависит от платформы: на Mac предлагаем Apple Metal (mps),
-// на Windows/Linux — CUDA. CPU доступен везде как запасной вариант.
+// Ускоритель зависит от платформы: на Mac — CoreML (mps), на Windows/Linux —
+// GPU через DirectML (любая видеокарта) или CUDA. CPU доступен везде.
 const DEVICE_OPTIONS = IS_MAC
   ? [
-      { value: "mps", label: "mps — GPU Apple (Metal)" },
-      { value: "cpu", label: "cpu — работает везде, но медленно" },
+      { value: "cpu", label: "cpu — по умолчанию, на Apple Silicon быстро" },
+      { value: "mps", label: "mps — CoreML (экспериментально)" },
     ]
   : [
-      { value: "cuda", label: "cuda — GPU (NVIDIA)" },
-      { value: "cpu", label: "cpu — работает везде, но медленно" },
+      { value: "cuda", label: "cuda — GPU (любая видеокарта через DirectML / NVIDIA CUDA)" },
+      { value: "cpu", label: "cpu — работает везде, но медленнее" },
     ];
 const COMPUTE_OPTIONS = [
   { value: "float16", label: "float16 — быстрее, нужно ≥ 8 GB VRAM" },
@@ -107,16 +132,33 @@ const VAD_OPTIONS = [
   { value: "pyannote", label: "pyannote — точнее, но медленнее" },
   { value: "silero", label: "silero — быстрый VAD" },
 ];
+// Чувствительность: одна ручка «в какую сторону ошибаться». Подписи говорят про
+// цену ошибки, а не про параметры — числа за ними стоят на бэке и замерены там же.
+const SENSITIVITY_OPTIONS = [
+  { value: "low", label: "Осторожно — не глушить лишнего" },
+  { value: "balanced", label: "Обычно — рекомендуется" },
+  { value: "high", label: "Строго — не пропустить мат" },
+];
 
 function pickKnown(raw: Settings): KnownSettings {
   const g = <K extends keyof KnownSettings>(k: K): KnownSettings[K] => {
     const v = raw[k];
     if (v == null) return DEFAULTS[k];
     // Runtime type-guard — на случай если файл правили руками.
-    if (k === "default_vad_filter") return Boolean(v) as KnownSettings[K];
+    if (k === "default_vad_filter" || k === "rename_project_to_title" || k === "edit_journal") {
+      return Boolean(v) as KnownSettings[K];
+    }
     if (k === "default_batch_size") {
       const n = Number(v);
       return (Number.isFinite(n) ? n : DEFAULTS[k]) as KnownSettings[K];
+    }
+    // Уровень чувствительности — закрытый список. Мусор в файле (правили руками,
+    // переехали уровни) отбрасываем здесь: иначе бэкенд отдал бы 422 на каждой
+    // обработке, а причина была бы не видна.
+    if (k === "default_sensitivity") {
+      const s = String(v);
+      const ok = SENSITIVITY_OPTIONS.some((o) => o.value === s);
+      return (ok ? s : DEFAULTS[k]) as KnownSettings[K];
     }
     return String(v) as KnownSettings[K];
   };
@@ -124,11 +166,14 @@ function pickKnown(raw: Settings): KnownSettings {
     default_transcriber: g("default_transcriber"),
     default_device: g("default_device"),
     default_compute_type: g("default_compute_type"),
+    default_sensitivity: g("default_sensitivity"),
     default_model: g("default_model"),
     default_language: g("default_language"),
     default_batch_size: g("default_batch_size"),
     default_vad_method: g("default_vad_method"),
     default_vad_filter: g("default_vad_filter"),
+    rename_project_to_title: g("rename_project_to_title"),
+    edit_journal: g("edit_journal"),
   };
 }
 
@@ -142,6 +187,7 @@ function pickUnknown(raw: Settings): Settings {
 }
 
 export function SettingsScreen() {
+  const [section, setSection] = useState("recognition");
   const [loaded, setLoaded] = useState<boolean>(false);
   const [known, setKnown] = useState<KnownSettings>(DEFAULTS);
   const [unknown, setUnknown] = useState<Settings>({});
@@ -236,13 +282,12 @@ export function SettingsScreen() {
   const isWhisperx = known.default_transcriber === "whisperx";
 
   return (
-    <div className="mx-auto flex max-w-4xl flex-col gap-6 p-8">
+    <div className="screen-page settings-page flex flex-col gap-5">
       <header className="flex items-end justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight text-fg">Настройки</h1>
           <p className="mt-1 text-sm text-muted">
-            Значения по умолчанию для новой обработки и системные пути. Файл
-            лежит рядом с реестром проектов.
+            Распознавание, подключённые модели и параметры приложения.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -260,6 +305,11 @@ export function SettingsScreen() {
         </div>
       </header>
 
+      <div className="settings-workspace">
+        <nav className="settings-nav" aria-label="Разделы настроек">
+          {[["recognition", "Распознавание"], ["providers", "Провайдеры ИИ"], ["projects", "Проекты и журнал"], ["application", "Приложение"]].map(([id, label]) => <button key={id} type="button" aria-current={section === id ? "page" : undefined} onClick={() => setSection(id)}>{label}</button>)}
+        </nav>
+        <div className="settings-content">
       {!loaded ? (
         <div className="flex items-center gap-2 text-sm text-muted">
           <Loader2 className="h-4 w-4 animate-spin" /> Загрузка…
@@ -275,6 +325,7 @@ export function SettingsScreen() {
             </Card>
           )}
 
+          <div hidden={section !== "recognition"} className="settings-group">
           {/* Движок распознавания — главный выбор проекта */}
           <Card variant="elevated">
             <div className="mb-4 flex items-start gap-3">
@@ -284,10 +335,7 @@ export function SettingsScreen() {
               <div>
                 <CardTitle>Движок распознавания</CardTitle>
                 <CardDescription>
-                  На чём распознавать речь по умолчанию. <b>GigaAM v3</b> заточен
-                  под русский — точнее ловит мат и даёт узкие пословные тайминги.
-                  <b> WhisperX</b> — универсальный, знает все языки, но под
-                  русский настроен слабее.
+                  <b>GigaAM v3</b> — для русской речи. <b>WhisperX</b> — для записей на разных языках.
                 </CardDescription>
               </div>
             </div>
@@ -308,6 +356,46 @@ export function SettingsScreen() {
             </div>
           </Card>
 
+          {/* Чувствительность — единственная ручка «в какую сторону ошибаться» */}
+          <Card variant="elevated">
+            <div className="mb-4 flex items-start gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-brand/10 text-brand-from">
+                <SlidersHorizontal className="h-4 w-4" />
+              </div>
+              <div>
+                <CardTitle>Чувствительность к мату</CardTitle>
+                <CardDescription>
+                  Определяет порог поиска и отступы заглушек. Более строгий режим может захватывать соседние слова.
+                </CardDescription>
+              </div>
+            </div>
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              <div className="md:col-span-2">
+                <div className="mb-1.5 flex items-center gap-1.5">
+                  <Label className="mb-0">Уровень</Label>
+                  <HelpTip>
+                    Замер на 15 минутах реального стрима (правки монтажёра как
+                    истина): «Строго» глушит целиком 36 матов из 142 против 30 у
+                    «Обычно», платя 3 лишними секундами мьюта на 15 минут.
+                    «Осторожно» экономит 2 секунды, но теряет 3 попадания.
+                  </HelpTip>
+                </div>
+                <Select
+                  value={known.default_sensitivity}
+                  onChange={(e) => set("default_sensitivity", e.target.value)}
+                  options={SENSITIVITY_OPTIONS}
+                />
+                <p className="mt-1.5 text-xs text-subtle">
+                  {known.default_sensitivity === "low"
+                    ? "Мьюты уже — чистая речь почти не страдает, но хвост мата может остаться слышимым."
+                    : known.default_sensitivity === "high"
+                      ? "Мьюты шире и кандидатов на проверку больше — меньше шансов, что мат останется слышен."
+                      : "Рекомендуется: измеренная точка равновесия, дальше точность не растёт."}
+                </p>
+              </div>
+            </div>
+          </Card>
+
           {/* Вычисления — реально читается формой новой обработки */}
           <Card variant="elevated">
             <div className="mb-4 flex items-start gap-3">
@@ -318,7 +406,7 @@ export function SettingsScreen() {
                 <CardTitle>Вычисления</CardTitle>
                 <CardDescription>
                   {IS_MAC
-                    ? "Где считать: GPU Apple (Metal/mps) или CPU. На Apple Silicon mps ускоряет GigaAM в десятки раз — оставляйте его."
+                    ? "Для Apple Silicon используйте mps. CPU доступен на любом Mac."
                     : "Где считать: GPU (NVIDIA) или CPU. На машине без видеокарты выбирайте cpu — иначе обработка не запустится."}
                 </CardDescription>
               </div>
@@ -326,7 +414,7 @@ export function SettingsScreen() {
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
               <div>
                 <div className="mb-1.5 flex items-center gap-1.5">
-                  <Label className="mb-0">Device</Label>
+                  <Label className="mb-0">Устройство</Label>
                   <HelpTip>
                     {IS_MAC
                       ? "mps — GPU Apple (Metal), быстро на M1–M4. cpu — работает везде, но в разы медленнее."
@@ -341,7 +429,7 @@ export function SettingsScreen() {
               </div>
               <div>
                 <div className="mb-1.5 flex items-center gap-1.5">
-                  <Label className="mb-0">compute_type</Label>
+                  <Label className="mb-0">Точность вычислений</Label>
                   <HelpTip>
                     Точность вычислений. float16 — быстро, нужно 8+ GB VRAM.
                     int8 — влезает в 4–6 GB. float32 — эталон, для CPU или
@@ -424,6 +512,72 @@ export function SettingsScreen() {
             </Card>
           )}
 
+          {/* Провайдеры ИИ — ключи в keychain, конфиг в settings.json */}
+          </div>
+          <div hidden={section !== "providers"}><AiProvidersCard /></div>
+          <div hidden={section !== "projects"} className="settings-group">
+
+          {/* Именование проектов — переименование в настоящий тайтл с Twitch */}
+          <Card variant="elevated">
+            <div className="mb-4 flex items-start gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-brand/10 text-brand-from">
+                <Sparkles className="h-4 w-4" />
+              </div>
+              <div>
+                <CardTitle>Название проекта</CardTitle>
+                <CardDescription>
+                  При детекте оффтопа подтягивать настоящий тайтл стрима с Twitch
+                  (по id из <code>vod_&lt;id&gt;</code>) и показывать его вместо
+                  технического имени папки. Название хранится в проекте — файлы и
+                  папки на диске не переименовываются.
+                </CardDescription>
+              </div>
+            </div>
+            <label className="flex items-center gap-2 text-sm text-muted">
+              <input
+                type="checkbox"
+                checked={known.rename_project_to_title}
+                onChange={(e) => set("rename_project_to_title", e.target.checked)}
+                className="h-4 w-4 rounded border-white/10 bg-black/30 accent-brand-from"
+              />
+              Переименовывать проект в название стрима с Twitch (при детекте оффтопа)
+            </label>
+          </Card>
+
+          {/* Журнал правок — диагностика качества детекции по ручным правкам */}
+          <Card variant="elevated">
+            <div className="mb-4 flex items-start gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-brand/10 text-brand-from">
+                <NotebookPen className="h-4 w-4" />
+              </div>
+              <div>
+                <CardTitle>Журнал правок</CardTitle>
+                <CardDescription>
+                  Записывать каждое сохранение из «Правки» в отдельный файл{" "}
+                  <code>decisions.edits.json</code> рядом с проектом: что ты
+                  добавил, снял или сдвинул относительно того, что решила
+                  программа. Сам <code>decisions.json</code> не меняется.
+                  <br />
+                  Нужно, чтобы разобрать «как должно быть» против «как сделала
+                  программа»: команда <code>twitch-cut audit</code> добавляет по
+                  этому журналу раздел с диагнозом на каждую правку — где дыра в
+                  словаре, где ASR услышал не то, где границы поехали.
+                </CardDescription>
+              </div>
+            </div>
+            <label className="flex items-center gap-2 text-sm text-muted">
+              <input
+                type="checkbox"
+                checked={known.edit_journal}
+                onChange={(e) => set("edit_journal", e.target.checked)}
+                className="h-4 w-4 rounded border-white/10 bg-black/30 accent-brand-from"
+              />
+              Вести журнал ручных правок
+            </label>
+          </Card>
+
+          </div>
+          <div hidden={section !== "application"} className="settings-group">
           {/* Информация / логи */}
           <Card variant="surface">
             <div className="mb-4 flex items-start gap-3">
@@ -500,8 +654,11 @@ export function SettingsScreen() {
               </pre>
             </Card>
           )}
+          </div>
         </>
       )}
+        </div>
+      </div>
     </div>
   );
 }

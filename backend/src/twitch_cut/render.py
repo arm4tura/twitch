@@ -191,9 +191,53 @@ def invert_segments(
     return [(s, e) for s, e in keeps if e - s > 1e-3]
 
 
+def _project_mutes_to_output(
+    mutes: list[tuple[float, float]],
+    keeps: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """Спроецировать диапазоны-«заглушки» (координаты ИСХОДНИКА) на выходной таймлайн.
+
+    В отличие от `segments_to_remove`, заглушки НЕ удаляют кадры — их аудио гасим
+    в ноль, а видео остаётся. Но в итоговом файле время сжато вырезами (keeps —
+    это то, что реально склеивается), поэтому мат [ms,me] в координатах исходника
+    надо пересчитать в позицию внутри склеенного выхода, где t начинается с 0.
+
+    Для каждого keep-сегмента (в порядке склейки) берём пересечение с мьютом и
+    отображаем в выходное время: base + (overlap_start - keep_start). Мьют,
+    целиком попавший в вырезанный участок, проекции не даёт (его там уже нет);
+    мьют, пересекающий рез, даёт два выходных куска — это корректно. keeps уже
+    обрезаны диапазоном (см. _clamp_keeps_to_range), поэтому проекция сама
+    учитывает range_in/range_out — выход начинается с первого keep'а.
+    """
+    out: list[tuple[float, float]] = []
+    base = 0.0
+    for ks, ke in keeps:
+        for ms, me in mutes:
+            os_ = max(ms, ks)
+            oe = min(me, ke)
+            if oe - os_ > 1e-3:
+                out.append((base + (os_ - ks), base + (oe - ks)))
+        base += ke - ks
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _volume_mute_filter(mute_out: list[tuple[float, float]]) -> str:
+    """ffmpeg audio-фильтр: гасит громкость в ноль на выходных диапазонах mute_out.
+
+    enable-выражение — сумма `between(t,a,b)`; ненулевое значение = фильтр активен
+    (volume=0), иначе аудио проходит без изменений. Одинарные кавычки защищают
+    запятые внутри between() при разборе filtergraph (аргумент уходит одним argv,
+    без шелла, — их интерпретирует сам ffmpeg).
+    """
+    betweens = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in mute_out)
+    return f"volume=enable='{betweens}':volume=0"
+
+
 def _build_concat_inputs(
     input_path: Path,
     keeps: list[tuple[float, float]],
+    mute_out_ranges: Optional[list[tuple[float, float]]] = None,
 ) -> tuple[list[str], str]:
     """Строит seeked-инпуты и concat-фильтр для склейки keep-интервалов.
 
@@ -220,6 +264,13 @@ def _build_concat_inputs(
         input_args += ["-ss", f"{s:.3f}", "-t", f"{e - s:.3f}", "-i", src]
         labels += f"[{i}:v][{i}:a]"
     filter_complex = f"{labels}concat=n={len(keeps)}:v=1:a=1[v][a]"
+    if mute_out_ranges:
+        # Маты не режем — гасим их аудио в ноль: concat отдаёт [a0], затем
+        # volume=0 на выходных диапазонах матов → [a]. Видео [v] не трогаем.
+        filter_complex = (
+            f"{labels}concat=n={len(keeps)}:v=1:a=1[v][a0];"
+            f"[a0]{_volume_mute_filter(mute_out_ranges)}[a]"
+        )
     return input_args, filter_complex
 
 
@@ -228,6 +279,7 @@ def render_video(
     output_path: Path,
     segments_to_remove: list[tuple[float, float]],
     *,
+    segments_to_mute: Optional[list[tuple[float, float]]] = None,
     total_duration: Optional[float] = None,
     encoder: Optional[str] = None,
     audio_bitrate: str = "192k",
@@ -243,6 +295,9 @@ def render_video(
         input_path: исходное видео
         output_path: куда писать результат
         segments_to_remove: [(start, end), ...] в секундах — что убрать
+        segments_to_mute: [(start, end), ...] в секундах — заглушить аудио в ноль,
+            КАДРЫ ОСТАВИТЬ (для матов: слово не слышно, но видео на месте). None/[]
+            → ничего не глушим. Координаты — исходника, как у segments_to_remove.
         total_duration: длительность исходника (сек); если None — пробим ffmpeg'ом
         encoder: имя H.264-энкодера; если None — get_best_encoder()
         audio_bitrate: битрейт аудио
@@ -283,7 +338,10 @@ def render_video(
     kept_duration = sum(e - s for s, e in keeps)
     enc = encoder or get_best_encoder()
     enc_args = _encoder_args(enc, quality)
-    input_args, filter_complex = _build_concat_inputs(input_path, keeps)
+    # Маты (segments_to_mute) не режем — проецируем на выходной таймлайн и гасим
+    # их аудио в ноль поверх склейки keeps.
+    mute_out = _project_mutes_to_output(segments_to_mute or [], keeps)
+    input_args, filter_complex = _build_concat_inputs(input_path, keeps, mute_out)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     emit(0.0, f"render start: {len(keeps)} segments, encoder={enc}, quality={quality}")

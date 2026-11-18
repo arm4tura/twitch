@@ -1,7 +1,7 @@
 {
   "name": "twitch-cut-desktop",
   "productName": "Twitch Cut",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Desktop UI for twitch-reaction-cutter (stream → Vegas mutes + highlights).",
   "private": true,
   "main": "electron/dist/main.js",
@@ -16,11 +16,12 @@
     "build:main": "tsc -p electron/tsconfig.json",
     "start": "electron electron/dist/main.js",
     "typecheck": "tsc --noEmit && tsc -p electron/tsconfig.json --noEmit",
+    "build:backend": "node scripts/build-backend.js",
     "prepare-tdcli": "node scripts/prepare-tdcli.js",
     "prepare-tdcli:all": "node scripts/prepare-tdcli.js --all",
-    "predist": "node scripts/prepare-tdcli.js",
+    "predist": "node scripts/prepare-tdcli.js && node scripts/build-backend.js",
     "dist": "npm run build && electron-builder --publish never",
-    "predist:publish": "node scripts/prepare-tdcli.js --all",
+    "predist:publish": "node scripts/prepare-tdcli.js --all && node scripts/build-backend.js",
     "dist:publish": "npm run build && electron-builder --publish always"
   },
   "build": {
@@ -44,16 +45,13 @@
         "to": "icon.png"
       },
       {
-        "from": "../backend",
+        "from": "public/icon-macos.png",
+        "to": "icon-macos.png"
+      },
+      {
+        "from": "../backend/dist/${arch}/twitch-cut-backend",
         "to": "backend",
-        "filter": [
-          "src/**",
-          "requirements*.txt",
-          "pyproject.toml",
-          "banwords*.txt",
-          "!**/__pycache__/**",
-          "!**/*.pyc"
-        ]
+        "filter": ["**/*"]
       }
     ],
     "win": {
@@ -68,10 +66,7 @@
       ]
     },
     "mac": {
-      "target": [
-        { "target": "dmg", "arch": ["arm64", "x64"] },
-        { "target": "zip", "arch": ["arm64", "x64"] }
-      ],
+      "target": ["dmg", "zip"],
       "icon": "build/icon.icns",
       "category": "public.app-category.utilities",
       "hardenedRuntime": true,

@@ -9,10 +9,10 @@ import {
   Loader2,
   Terminal,
 } from "lucide-react";
-import { cancelJob, createProcessJob, type JobState } from "../api";
+import { cancelJob, createProcessJob, getDefaultSensitivity, type JobState } from "../api";
 import { useJobEvents, type JobLogEntry } from "../hooks/useJobEvents";
 import { Button } from "../components/ui/Button";
-import { Card, CardTitle } from "../components/ui/Card";
+import { Card } from "../components/ui/Card";
 import {
   Dialog,
   DialogContent,
@@ -21,10 +21,10 @@ import {
   DialogHeader,
   DialogTitle,
 } from "../components/ui/Dialog";
-import { ProgressRing } from "../components/ui/ProgressBar";
+import { ProgressBar } from "../components/ui/ProgressBar";
 import { ScrollArea } from "../components/ui/ScrollArea";
 import { StatusBadge } from "../components/ui/StatusBadge";
-import { Stepper, stepsForKind } from "../components/ui/Stepper";
+import { Stepper, stepsForKind, stageLabel } from "../components/ui/Stepper";
 import { fmtDurationMs, fmtRelativeMs } from "../lib/format";
 
 /**
@@ -41,10 +41,18 @@ import { fmtDurationMs, fmtRelativeMs } from "../lib/format";
 export function JobScreen({
   jobId,
   onDone,
+  onReady,
   onChainJob,
 }: {
   jobId: string;
   onDone: (decisionsPath: string | null) => void;
+  /**
+   * Джоба завершилась и оставила decisions.json. В отличие от `onDone` (клик
+   * по «Открыть таймлайн») НЕ переключает экран — только сообщает родителю
+   * путь, чтобы тот разблокировал «Правку»/«Экспорт». Иначе вкладки оставались
+   * бы серыми до клика, хотя всё уже готово.
+   */
+  onReady?: (decisionsPath: string) => void;
   /**
    * Цепочка: download_vod по завершении сам стартует process-джобу и просит
    * родителя перецепить экран на неё. Один поток «скачал → обработал →
@@ -63,6 +71,19 @@ export function JobScreen({
   const [chaining, setChaining] = useState(false);
   const [chainError, setChainError] = useState<string | null>(null);
   const chainStartedRef = useRef(false);
+  // onChainJob тоже в ref, и по той же причине: App передаёт инлайн-стрелку,
+  // новую на каждый свой рендер. В deps эффекта цепочки она была фитилём —
+  // старт process-джобы менял activeJobId → App ре-рендерился → новая стрелка →
+  // эффект перезапускался, а гард как раз обнулялся сменой jobId. Итог: цепочка
+  // стартовала заново, пока не доезжал GET нового состояния — десятки
+  // process-джоб на один скачанный VOD.
+  const onChainJobRef = useRef(onChainJob);
+  onChainJobRef.current = onChainJob;
+  // onReady в ref: App передаёт инлайн-стрелку, она новая на каждый его рендер.
+  // Через ref эффект «готово» зависит только от статуса джобы, а не от
+  // идентичности пропа.
+  const onReadyRef = useRef(onReady);
+  onReadyRef.current = onReady;
 
   // Оценка «сколько осталось». Наивная формула elapsed/progress от старта job'а
   // дёргается вверх на прогреве (ffmpeg инициализирует энкодер, первые time=
@@ -133,7 +154,13 @@ export function JobScreen({
   // один сквозной поток (скачал → распознал → мат → правки → таймлайн).
   useEffect(() => {
     if (state?.kind !== "download_vod" || state.status !== "done") return;
-    if (!onChainJob || chainStartedRef.current) return;
+    // Снапшот обязан относиться к ТЕКУЩЕЙ джобе. Хук сбрасывает state при смене
+    // jobId, но эта сверка — дешёвый структурный замок: она делает эффект
+    // невосприимчивым к любому чужому/устаревшему снапшоту, а не только к тому
+    // одному случаю, который мы уже починили в useJobEvents.
+    if (state.id !== jobId) return;
+    const chain = onChainJobRef.current;
+    if (!chain || chainStartedRef.current) return;
     const stream =
       ((state.result as any)?.stream as string) ||
       ((state.result as any)?.output as string) ||
@@ -149,15 +176,22 @@ export function JobScreen({
     setChainError(null);
     (async () => {
       try {
-        const next = await createProcessJob({ stream });
-        onChainJob(next.id);
+        // Уровень чувствительности из настроек — цепочка «скачал → обработал»
+        // это обычный режим работы, и настройка обязана действовать и здесь,
+        // а не только в форме новой обработки.
+        const sensitivity = await getDefaultSensitivity();
+        const next = await createProcessJob({
+          stream,
+          ...(sensitivity ? { sensitivity } : {}),
+        });
+        chain(next.id);
       } catch (err) {
         chainStartedRef.current = false;
         setChaining(false);
         setChainError(err instanceof Error ? err.message : String(err));
       }
     })();
-  }, [state?.kind, state?.status, state?.result, onChainJob]);
+  }, [state?.id, state?.kind, state?.status, state?.result, jobId]);
 
   const doCancel = async () => {
     setCancelling(true);
@@ -171,48 +205,35 @@ export function JobScreen({
 
   const decisionsPath = (state?.result as any)?.decisions_path ?? null;
 
+  // Готово и есть разметка → сразу отпускаем вкладки «Правка»/«Экспорт», не
+  // дожидаясь клика по «Открыть таймлайн». Ref-гард: `state` обновляется на
+  // каждом WS-событии, а дёрнуть родителя достаточно один раз на джобу —
+  // повторные вызовы плодили бы лишние re-render'ы всего приложения.
+  const readyNotifiedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (state?.status !== "done" || !decisionsPath) return;
+    if (readyNotifiedRef.current === jobId) return;
+    readyNotifiedRef.current = jobId;
+    onReadyRef.current?.(decisionsPath);
+  }, [state?.status, decisionsPath, jobId]);
+
   return (
-    <div className="mx-auto flex max-w-6xl flex-col gap-6 p-8">
+    <div className="screen-page flex flex-col gap-5">
       <Header state={state} wsReady={wsReady} />
 
-      {/* Hero + Stepper + Log */}
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[280px_minmax(0,1fr)]">
-        {/* Hero: ProgressRing — по центру по вертикали относительно Stepper'а справа */}
-        <div className="flex flex-col items-center justify-center gap-4">
-          <ProgressRing value={state?.progress ?? 0} size={200} stroke={10}>
-            <div className="flex flex-col items-center">
-              <div className="font-mono-tabular text-4xl font-semibold text-fg tabular-nums">
-                {Math.round(state?.progress ?? 0)}
-                <span className="ml-0.5 text-xl text-subtle">%</span>
-              </div>
-              <div className="mt-1 max-w-[150px] truncate text-center text-[11px] uppercase tracking-wider text-subtle">
-                {state?.stage || "запуск…"}
-              </div>
-            </div>
-          </ProgressRing>
-          <div className="w-full max-w-[220px] text-center text-xs text-muted">
-            {state?.message || "Ждём событий с backend…"}
+      <Card variant="surface" padding="lg" className="processing-panel">
+        <Stepper className="processing-steps" steps={stepsForKind(state?.kind)} currentStage={state?.stage ?? ""} completed={state?.status === "done"} failed={state?.status === "failed"} />
+        <div className="my-7 border-t border-white/10" />
+        <div className="mb-4 flex items-end justify-between gap-4">
+          <div>
+            <p className="mb-2 text-sm text-muted">{stageLabel(state?.kind, state?.stage)}</p>
+            <p className="text-sm text-fg">{state?.message || "Ожидаем начало обработки…"}</p>
           </div>
-          {etaMs != null && (
-            <div className="text-[11px] text-subtle">
-              осталось ≈ {fmtDurationMs(etaMs)}
-            </div>
-          )}
+          <span className="font-mono-tabular text-4xl text-fg">{Math.round(state?.progress ?? 0)}<span className="text-xl text-muted">%</span></span>
         </div>
-
-        {/* Stepper — набор стадий зависит от типа job'а (process/render/detect). */}
-        <Card variant="surface" padding="lg">
-          <div className="mb-4 flex items-center justify-between">
-            <CardTitle>Стадии</CardTitle>
-          </div>
-          <Stepper
-            steps={stepsForKind(state?.kind)}
-            currentStage={state?.stage ?? ""}
-            completed={state?.status === "done"}
-            failed={state?.status === "failed"}
-          />
-        </Card>
-      </div>
+        <ProgressBar value={state?.progress ?? 0} label="Прогресс обработки" />
+        <p className="mt-4 text-xs text-muted">{etaMs != null ? `Примерно осталось: ${fmtDurationMs(etaMs)}` : "Оценка времени появится по ходу обработки"}</p>
+      </Card>
 
       {/* Live-log */}
       <Card variant="surface" padding="none">
@@ -589,14 +610,6 @@ function LogRow({ entry }: { entry: JobLogEntry }) {
       <span className={`min-w-0 break-words ${color}`}>{entry.message || "—"}</span>
     </div>
   );
-}
-
-function stageLabel(kind: string | undefined, stage: string | undefined) {
-  if (!stage) return "Обработка";
-  const step = stepsForKind(kind).find(
-    (s) => s.key === stage || s.aliases?.includes(stage)
-  );
-  return step?.title ?? "Обработка";
 }
 
 function firstLine(s: string | null | undefined) {

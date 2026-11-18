@@ -4,31 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "twitch-reaction-cutter"
-version = "0.4.0"
+version = "0.5.0"
 description = "Phase 1 CLI core for Twitch reaction stream profanity markers and Vegas export."
 requires-python = ">=3.10,<3.13"
 
-# Прямые (top-level) зависимости. Транзитивные пиннятся в requirements-gpu.txt.
-# Версии здесь совпадают с lock — patch-функции в transcription.py написаны
-# ПОД ЭТИ версии pyannote/torch/speechbrain. Не двигай мажоры без пересмотра
-# transcription.py / smoke-теста.
+# Прямые (top-level) зависимости ядра. БЕЗ torch: GigaAM и VAD идут через
+# onnxruntime (см. src/twitch_cut/onnx_models.py). Точные версии для сборки
+# приложения — в requirements-mac.txt / requirements-win.txt.
 #
-# ВАЖНО: torch указан БЕЗ +cu126 суффикса — pip install по этому pyproject
-# без extra-index-url поставит CPU-версию. Для GPU используйте
-#   pip install -r requirements-gpu.txt
-# (там первая строка --extra-index-url PyTorch CUDA).
+# onnxruntime по платформе: на Windows — сборка с DirectML (GPU любой марки
+# без CUDA/cuDNN), на macOS/Linux — обычная (на macOS в ней есть CoreML).
+# Ставить обе в одно окружение нельзя: они делят модуль onnxruntime.
 dependencies = [
-    "whisperx==3.4.5",
-    "faster-whisper==1.2.1",
-    "ctranslate2==4.4.0",
-    "torch==2.6.0",
-    "torchaudio==2.6.0",
-    "pyannote.audio==3.4.0",
-    "speechbrain==1.1.0",
-    "pytorch-lightning==2.6.5",
-    "transformers==5.12.1",
-    "huggingface_hub==1.21.0",
-    "omegaconf==2.3.1",
+    "numpy>=2.0,<3",
+    "onnxruntime>=1.20,<2; sys_platform != 'win32'",
+    "onnxruntime-directml>=1.20,<2; sys_platform == 'win32'",
     "imageio-ffmpeg==0.6.0",
     "pymorphy3==2.0.6",
     "pymorphy3-dicts-ru==2.4.417150.4580142",
@@ -46,6 +36,46 @@ dependencies = [
 dev = [
     "pytest==9.1.1",
     "httpx==0.28.1",
+]
+# AI-детекция оффтопа (llm_offtopic). Опционально: SDK импортируются лениво,
+# ядро/ASR работает без них. Ставить: pip install -e ".[ai]".
+ai = [
+    "anthropic==0.121.0",
+    "openai==2.53.0",
+]
+# Необязательный движок WhisperX (faster-whisper + pyannote на torch). В сборку
+# приложения НЕ входит. patch-функции в transcription.py написаны ПОД ЭТИ
+# версии — не двигай мажоры без пересмотра transcription.py / smoke-теста.
+# torch здесь CPU-шный; для CUDA — колёса с download.pytorch.org/whl/cu126.
+whisperx = [
+    "whisperx==3.4.5",
+    "faster-whisper==1.2.1",
+    "ctranslate2==4.4.0",
+    "torch==2.6.0",
+    "torchaudio==2.6.0",
+    "pyannote.audio==3.4.0",
+    "speechbrain==1.1.0",
+    "pytorch-lightning==2.6.5",
+    "transformers==5.12.1",
+    "huggingface_hub==1.21.0",
+    "omegaconf==2.3.1",
+]
+# Только для разработчика: пересобрать ONNX-модели из torch-чекпоинтов
+# (tools/export_onnx.py) и сверить их с torch-путём (tools/onnx_parity.py).
+# gigaam ставить отдельно: pip install --no-deps git+https://github.com/salute-developers/GigaAM.git
+export = [
+    "torch==2.6.0",
+    "torchaudio==2.6.0",
+    "pyannote.audio==3.4.0",
+    "onnx>=1.17",
+    "hydra-core==1.3.*",
+    "omegaconf==2.3.1",
+    "sentencepiece",
+    "soundfile",
+]
+# Сборка бэкенда в самостоятельный исполняемый каталог (backend/packaging/).
+build = [
+    "pyinstaller>=6.10,<7",
 ]
 
 [project.scripts]

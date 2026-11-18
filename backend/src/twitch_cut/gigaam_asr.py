@@ -4,17 +4,27 @@
 --------------------------------------------
 GigaAM (Salute) на русском ловит мат точнее и даёт более узкие пословные
 тайминги, чем faster-whisper (WhisperX растягивает mute-слово на 1–5 c —
-см. сравнительный пробник examples/compare_asr.py). Плюс он не тянет за собой
-хрупкий CTranslate2/cuDNN-стек, который на Windows постоянно падает на
-`cudnn_ops_infer64_8.dll`. Поэтому это движок по умолчанию.
+см. сравнительный пробник examples/compare_asr.py). Поэтому это движок по
+умолчанию.
+
+КАК ЗАПУСКАЕТСЯ. Без torch: модель и VAD экспортированы в ONNX
+(`tools/export_onnx.py`) и идут через onnxruntime (`onnx_models.py`).
+Раньше здесь жила пачка monkey-patch'ей поверх пакета gigaam (блэнк на MPS,
+путь к VAD-весам, ffmpeg в PATH, перехват `_decode` ради таймингов и
+прогресса). Теперь весь long-form путь написан явно и по шагам:
+
+  1. аудио → float32 16 кГц (`ffmpeg_tools.load_audio_16k`);
+  2. VAD pyannote segmentation-3.0 → участки речи → куски 15–22 с
+     (`vad.py`, повтор `gigaam.vad_utils.segment_audio_file`);
+  3. куски батчами по 16 → лог-мел → энкодер+CTC → greedy-декод
+     (`gigaam_onnx.py`);
+  4. границы слов — forced alignment по тем же log-probs (`alignment.py`),
+     отсюда и `score` слова; не выровнялось — кадры эмиссии CTC.
 
 Модель по умолчанию — `v3_ctc`: CTC-декодер (не e2e) даёт «сырой» фонетический
-текст без нормализации-цензуры, что важно для детекта мата. `transcribe_longform`
-сам режет длинное аудио по VAD и возвращает сегменты с АБСОЛЮТНЫМИ пословными
-таймингами (start/end уже сдвинуты на начало сегмента) — ровно та форма, что
-нужна detect_profanity / build_decisions.
+текст без нормализации-цензуры, что важно для детекта мата.
 
-Выход этой функции идентичен по форме transcribe_audio (WhisperX):
+Выход идентичен по форме transcribe_audio (WhisperX):
     {"segments": [{"id", "start", "end", "words": [{"word","start","end","score"}]}]}
 чтобы downstream (iter_words, detect_profanity, decisions) работал без изменений.
 """
@@ -22,365 +32,271 @@ GigaAM (Salute) на русском ловит мат точнее и даёт �
 from __future__ import annotations
 
 import logging
-import os
-import shutil
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 
+from .alignment import align_words
 from .cache import file_fingerprint, read_json, stable_hash, write_json
-from .config import MODELS_DIR
+from .posteriors import posteriors_path, to_float16, write_posteriors
 
 logger = logging.getLogger(__name__)
 
-# Кэш загруженной модели в пределах процесса: веса GigaAM ~1–2 GB, грузить их
-# на каждый прогон дорого. Ключ — (model_name, device).
-_MODEL_CACHE: dict[tuple[str, str], Any] = {}
+# Колбэк дробного прогресса транскрибации: (fraction 0..1, message).
+# Дробь считается по АУДИО-СЕКУНДАМ обработанных VAD-сегментов, а не по их
+# количеству: сегменты неравной длины, и счёт «сегмент из N» даёт рваную
+# оценку на записи, где в начале много коротких реплик.
+TranscribeProgressFn = Callable[[float, str], None]
+
+ASR_BATCH_SIZE = 16
+"""Кусков за один прогон энкодера — как `fr_batch_size` у gigaam."""
+
+SUPPORTED_MODELS = ("v3_ctc",)
+"""Что есть в ONNX. RNN-T/e2e не экспортированы: декодер у них — цикл по
+кадрам с состоянием LSTM, а детекту мата нужен именно сырой CTC-текст."""
+
+# Кэш загруженных сессий в пределах процесса: открыть 400 МБ модели —
+# секунды, делать это на каждый прогон незачем. Ключ — (model_name, device).
+_MODEL_CACHE: dict[tuple[str, str], "_Engine"] = {}
 
 
 def _normalize_gigaam_model(model_name: str) -> str:
-    """Приводим короткие/пользовательские имена к каноничным для gigaam.load_model.
+    """Приводим короткие/пользовательские имена к каноничным.
 
-    UI и дефолты оперируют 'v3_ctc'. Разрешаем также короткое 'ctc'/'rnnt'
-    (gigaam сам достроит до v3_*), и на всякий случай прогоняем 'large-v3'
-    (дефолт WhisperX-поля) в 'v3_ctc', чтобы случайно прокинутое значение
-    из расширённого режима не роняло прогон.
+    UI и дефолты оперируют 'v3_ctc'. Разрешаем также короткое 'ctc', и на
+    всякий случай прогоняем 'large-v3' (дефолт WhisperX-поля) в 'v3_ctc',
+    чтобы случайно прокинутое значение из расширенного режима не роняло прогон.
     """
     name = (model_name or "").strip()
-    if not name or name in {"large-v3", "gigaam", "default"}:
+    if not name or name in {"large-v3", "gigaam", "default", "ctc"}:
         return "v3_ctc"
     return name
 
 
-# Перехощенные веса pyannote segmentation-3.0 (лицензия MIT). Лежат в
-# GitHub-релизе проекта, чтобы не тянуть с HuggingFace: там segmentation-3.0
-# gated и требует принять условия + auth-токен, что ломает офлайн-прогон у
-# пользователей. GitHub отдаёт файл по прямой ссылке без токена.
-VAD_SEGMENTATION_URL = (
-    "https://github.com/arm4tura/twitch/releases/download/models-v1/pytorch_model.bin"
-)
-VAD_SEGMENTATION_PATH = (MODELS_DIR / "vad" / "segmentation-3.0.bin").resolve()
+@dataclass
+class _Engine:
+    """Открытые ONNX-сессии: VAD + GigaAM."""
+
+    vad: Any
+    asr: Any
+    accelerator: str
 
 
-def _ensure_vad_segmentation() -> str | None:
-    """Скачать веса pyannote segmentation-3.0 из GitHub-релиза (один раз, с кэшем).
-
-    Возвращает путь к локальному .bin или None, если скачать не удалось — тогда
-    вызывающий код падает обратно на оригинальный резолвер gigaam (он попробует
-    HF). Файл — pytorch-lightning чекпоинт segmentation-3.0; pyannote
-    Model.from_pretrained принимает его напрямую как ФАЙЛ, без config.yaml.
-    """
-    target = VAD_SEGMENTATION_PATH
-    if target.exists() and target.stat().st_size > 0:
-        return str(target)
-    try:
-        import urllib.request
-
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # Качаем во временный .part и атомарно переименовываем — чтобы битый
-        # (оборванный) файл не выглядел как валидный кэш при следующем запуске.
-        tmp = target.with_name(target.name + ".part")
-        logger.info("Скачиваю VAD segmentation-3.0: %s", VAD_SEGMENTATION_URL)
-        urllib.request.urlretrieve(VAD_SEGMENTATION_URL, tmp)
-        if tmp.stat().st_size == 0:
-            tmp.unlink(missing_ok=True)
-            raise OSError("скачанный файл пуст")
-        tmp.replace(target)
-        logger.info("VAD segmentation-3.0 готов: %s", target)
-        return str(target)
-    except Exception as exc:  # noqa: BLE001 — сеть/диск; fallback на HF-резолвер
-        logger.warning(
-            "Не удалось скачать VAD-веса из GitHub (%s) — fallback на HuggingFace", exc
+def _load_engine(model_name: str, device: str) -> _Engine:
+    if model_name not in SUPPORTED_MODELS:
+        raise RuntimeError(
+            f"Модель GigaAM '{model_name}' не поддерживается: доступна только "
+            f"{', '.join(SUPPORTED_MODELS)}."
         )
-        return None
-
-
-def _patch_gigaam_blank_token_crash() -> None:
-    """Фиксим ДВЕ болячки CTC-декодера GigaAM на MPS (Apple Metal).
-
-    (A) КРАШ: на device='mps' булева маска `labels[skip_mask]` в CTCGreedyDecoding
-        (decoding.py) иногда пропускает blank_id=33, и он доходит до
-        tokenizer.decode → vocab[33] → ConfigIndexError на 33-элементном vocab.
-
-    (B) МУСОРНЫЙ ТЕКСТ (главное): даже когда краша нет, boolean-indexing в torch
-        MPS (2.6, macOS) на реальных log_probs модели даёт НЕВЕРНУЮ выборку
-        токенов — `labels[skip_mask]` возвращает не те элементы, что на CPU.
-        Слова получаются перемешанной кашей («вооббеввююч»), а детектор мата
-        лепит ложные заглушки там, где мата нет. На CPU та же маска корректна
-        (проверено: транскрипт читаемый).
-
-    Решение:
-      1. Оборачиваем `CTCGreedyDecoding.decode` так, чтобы весь ПОСТ-энкодерный
-         счёт (argmax → skip_mask → выборка токенов) шёл на CPU. Тяжёлый энкодер
-         остаётся на MPS; сюда приходит уже маленький `encoded` ([B, T, D]),
-         перенос на CPU дешёвый, а результат совпадает с чистым CPU-прогоном.
-      2. Страховка от краша (A): фильтруем токены >= len(vocab) и коэрсим vocab
-         ListConfig→list в Tokenizer.decode/id_to_str.
-
-    Патч живёт в проектном слое (устойчив к pip reinstall), идемпотентен.
-    """
-    try:
-        from gigaam.decoding import CTCGreedyDecoding, Tokenizer
-    except Exception:  # noqa: BLE001
-        return
-
-    if getattr(Tokenizer, "_twitchcut_blank_patched", False):
-        return
-
-    # --- (1) CTC greedy decode на CPU: чинит мусорный текст + краш разом -------
-    _orig_ctc_decode = CTCGreedyDecoding.decode
-
-    def cpu_ctc_decode(self, head, encoded, lengths):
-        """Считаем декод на CPU: MPS boolean-indexing выбирает не те токены.
-
-        Переносим сам модуль head и входы на CPU на время декода, потом
-        возвращаем head обратно на исходное устройство (модель может
-        переиспользоваться между прогонами). encoded здесь уже маленький.
-        """
-        try:
-            import torch  # noqa: F401
-        except Exception:  # noqa: BLE001
-            return _orig_ctc_decode(self, head, encoded, lengths)
-
-        enc_dev = getattr(encoded, "device", None)
-        if enc_dev is None or enc_dev.type != "mps":
-            # Не MPS — оригинальный путь без накладных расходов.
-            return _orig_ctc_decode(self, head, encoded, lengths)
-
-        head_was = next(head.parameters()).device if any(True for _ in head.parameters()) else None
-        try:
-            head_cpu = head.to("cpu")
-            enc_cpu = encoded.detach().to("cpu")
-            len_cpu = lengths.detach().to("cpu")
-            return _orig_ctc_decode(self, head_cpu, enc_cpu, len_cpu)
-        finally:
-            if head_was is not None:
-                head.to(head_was)
-
-    CTCGreedyDecoding.decode = cpu_ctc_decode
-
-    # --- (2) Страховка Tokenizer: отсекаем out-of-vocab токены (краш A) --------
-    _orig_decode = Tokenizer.decode
-    _orig_id_to_str = Tokenizer.id_to_str
-
-    def safe_decode(self, tokens: list[int]) -> str:
-        """Отсекаем out-of-vocab токены (включая blank) перед декодом."""
-        if self.charwise:
-            # Конвертируем OmegaConf ListConfig в обычный list — защита от
-            # ConfigIndexError при любой ошибке индексации.
-            if not isinstance(self.vocab, list):
-                self.vocab = list(self.vocab)
-            # Фильтруем токены >= len(vocab): blank_id всегда == len(vocab),
-            # любые id выше — тоже битые (не должны доходить сюда по идее).
-            clean = [t for t in tokens if 0 <= t < len(self.vocab)]
-            return _orig_decode(self, clean)
-        return _orig_decode(self, tokens)
-
-    def safe_id_to_str(self, token_id: int) -> str:
-        """Заглушка на случай, если frames_to_words пытается конвертить blank."""
-        if self.charwise:
-            if not isinstance(self.vocab, list):
-                self.vocab = list(self.vocab)
-            if token_id < 0 or token_id >= len(self.vocab):
-                return ""  # blank или out-of-vocab → пустая строка
-            return self.vocab[token_id]
-        return _orig_id_to_str(self, token_id)
-
-    Tokenizer.decode = safe_decode
-    Tokenizer.id_to_str = safe_id_to_str
-    Tokenizer._twitchcut_blank_patched = True
-
-
-def _patch_gigaam_vad_segmentation() -> None:
-    """Чиним загрузку VAD-модели pyannote внутри gigaam.transcribe_longform.
-
-    gigaam.vad_utils.resolve_local_segmentation_path возвращает директорию
-    снапшота HF (`.../snapshots/<sha>/`), и эта директория уходит в
-    pyannote `Model.from_pretrained`. Но тот принимает только ФАЙЛ-чекпоинт:
-    директорию он не распознаёт (`os.path.isfile` == False) и трактует как
-    HF repo_id → `validate_repo_id` падает с HFValidationError на Windows-пути
-    (двоеточие, бэкслеши, длина > 96).
-
-    Оборачиваем резолвер так, чтобы он возвращал путь к самому файлу весов
-    (`pytorch_model.bin` / `model.safetensors`) внутри снапшота. Идемпотентно.
-    """
-    try:
-        from gigaam import vad_utils
-    except Exception:  # noqa: BLE001 — gigaam может не иметь vad_utils в старых сборках
-        return
-
-    if getattr(vad_utils, "_twitchcut_seg_patched", False):
-        return
-
-    _orig_resolve = vad_utils.resolve_local_segmentation_path
-
-    def _resolve_to_file(model_id: str) -> str:
-        # 1) Наши перехощенные веса из GitHub-релиза (MIT, без HF-токена).
-        #    Если скачались/уже в кэше — отдаём их и HF не трогаем вовсе.
-        hosted = _ensure_vad_segmentation()
-        if hosted:
-            logger.info("VAD segmentation checkpoint (GitHub): %s", hosted)
-            return hosted
-        # 2) Fallback: оригинальный резолвер gigaam (снапшот HF). Чиним
-        #    «папка→файл», как раньше.
-        resolved = Path(_orig_resolve(model_id=model_id))
-        if resolved.is_dir():
-            for name in ("pytorch_model.bin", "model.safetensors", "model.bin"):
-                candidate = resolved / name
-                if candidate.exists():
-                    logger.info("VAD segmentation checkpoint (HF): %s", candidate)
-                    return str(candidate)
-        return str(resolved)
-
-    vad_utils.resolve_local_segmentation_path = _resolve_to_file
-    vad_utils._twitchcut_seg_patched = True
-
-
-def _ensure_ffmpeg_on_path() -> None:
-    """Даём gigaam найти ffmpeg по голой команде `"ffmpeg"`.
-
-    ЗАЧЕМ. gigaam.preprocess.load_audio (её зовёт vad_utils.segment_audio_file
-    внутри transcribe_longform) вызывает ffmpeg как `subprocess.run(["ffmpeg", ...])`,
-    т.е. резолвит бинарь через PATH. На Windows ffmpeg обычно в PATH — работает.
-    На macOS Electron-приложение стартует с урезанным PATH (без Homebrew /opt/homebrew/bin),
-    поэтому голый вызов падает с FileNotFoundError: 'ffmpeg'.
-
-    Наш собственный код (ffmpeg_tools.py) от этого не страдает — он берёт бандл
-    через imageio_ffmpeg.get_ffmpeg_exe(). Тот же бандл-бинарь подкладываем и для
-    gigaam: делаем симлинк с именем `ffmpeg` на versioned-бинарь
-    (ffmpeg-macos-aarch64-v7.1) и добавляем его каталог в начало PATH. Идемпотентно.
-    """
-    # Если ffmpeg уже резолвится (Windows, или пользователь поставил его в PATH) —
-    # ничего не трогаем.
-    if shutil.which("ffmpeg"):
-        return
-
-    try:
-        import imageio_ffmpeg
-
-        exe = Path(imageio_ffmpeg.get_ffmpeg_exe())
-    except Exception as exc:  # noqa: BLE001 — imageio_ffmpeg может отсутствовать
-        logger.warning("Не удалось получить бандл ffmpeg из imageio_ffmpeg: %s", exc)
-        return
-
-    if not exe.exists():
-        logger.warning("Бандл ffmpeg не найден по пути: %s", exe)
-        return
-
-    # Каталог для симлинка держим рядом с весами, чтобы не мусорить в temp и
-    # переиспользовать между прогонами.
-    bin_dir = (MODELS_DIR / "ffmpeg_bin").resolve()
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    link = bin_dir / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
-
-    try:
-        # Пересоздаём симлинк, если он битый или указывает не туда.
-        if link.is_symlink() or link.exists():
-            if link.is_symlink() and Path(os.readlink(link)) == exe and link.exists():
-                pass  # уже правильный — оставляем
-            else:
-                link.unlink()
-                link.symlink_to(exe)
-        else:
-            link.symlink_to(exe)
-    except OSError as exc:
-        # На некоторых системах симлинки запрещены (напр. Windows без прав).
-        # Фолбэк: просто добавим каталог самого бандла в PATH — но там имя
-        # versioned, поэтому голый `ffmpeg` так не найдётся. Пробуем копию.
-        logger.warning("Симлинк ffmpeg не создан (%s), пробую копию", exc)
-        try:
-            shutil.copy2(exe, link)
-        except OSError as copy_exc:  # noqa: BLE001
-            logger.warning("Не удалось подготовить ffmpeg для gigaam: %s", copy_exc)
-            return
-
-    os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
-    logger.info("ffmpeg для gigaam подготовлен: %s -> %s", link, exe)
-
-
-def _resolve_device(requested: str) -> str:
-    """Пробуем MPS; если недоступен или падает — фолбэк на CPU с варнингом."""
-    if requested != "mps":
-        return requested
-    try:
-        import torch
-        if not torch.backends.mps.is_available():
-            raise RuntimeError("MPS недоступен на этом устройстве")
-        # Быстрый smoke-test: если ядра не компилируются — узнаем сразу
-        torch.zeros(1, device="mps")
-        return "mps"
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("MPS недоступен, переключаюсь на CPU: %s", exc)
-        return "cpu"
-
-
-def _load_gigaam_model(model_name: str, device: str) -> Any:
-    device = _resolve_device(device)
     cache_key = (model_name, device)
     cached = _MODEL_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    import gigaam  # локальный импорт: тяжёлый, нужен только при реальном прогоне
+    from .gigaam_onnx import GigaAMOnnx
+    from .onnx_models import GIGAAM_MODEL, VAD_MODEL, create_session, ensure_model, read_meta
+    from .vad import SpeechDetector
 
-    # torch 2.6+: gigaam грузит checkpoint через torch.load; наши патчи ставят
-    # weights_only=False и регистрируют safe globals, иначе unpickle падает.
-    from .transcription import apply_whisperx_patches
-
-    apply_whisperx_patches()
-    # Чиним blank-токен на MPS: булева индексация в torch 2.6 MPS пропускает
-    # blank_id=33 через skip_mask, и он доходит до vocab[33] → ConfigIndexError.
-    _patch_gigaam_blank_token_crash()
-    # Чиним pyannote-VAD путь (директория снапшота → файл весов), иначе
-    # transcribe_longform падает на HFValidationError.
-    _patch_gigaam_vad_segmentation()
-    # Кладём бандл-ffmpeg в PATH: gigaam зовёт `"ffmpeg"` голой командой, а на
-    # macOS Electron PATH урезан → FileNotFoundError: 'ffmpeg'.
-    _ensure_ffmpeg_on_path()
-
-    # Держим веса GigaAM в общем models/ рядом с HF-кэшем, а не в ~/.cache/gigaam,
-    # чтобы пользователь видел все веса в одном месте (и prefetch клал туда же).
-    download_root = str((MODELS_DIR / "gigaam").resolve())
-    (MODELS_DIR / "gigaam").mkdir(parents=True, exist_ok=True)
-
-    logger.info("Загружаю GigaAM model=%s device=%s (download_root=%s)", model_name, device, download_root)
-    try:
-        model = gigaam.load_model(model_name, device=device, download_root=download_root)
-    except TypeError:
-        # Очень старые сборки gigaam без download_root/device kwargs.
-        model = gigaam.load_model(model_name)
-
-    _MODEL_CACHE[cache_key] = model
-    return model
+    vad_path = ensure_model(VAD_MODEL)
+    asr_path = ensure_model(GIGAAM_MODEL)
+    logger.info("Загружаю GigaAM %s (onnxruntime, device=%s)", model_name, device)
+    # VAD гоняет КАЖДУЮ секунду аудио десять раз (окно 10 с, шаг 1 с) — на
+    # трёхчасовом стриме это минуты CPU, поэтому на GPU он едет вместе с ASR.
+    # Решение у VAD жёсткое (argmax по классам), поэтому погрешность GPU его
+    # почти не двигает. CoreML — исключение: LSTM он не берёт (из 50 узлов
+    # графа поддержаны 16), граф рвётся на куски и выходит медленнее CPU.
+    vad_session = create_session(vad_path, "cpu" if device == "mps" else device)
+    asr_session = create_session(asr_path, device)
+    engine = _Engine(
+        vad=SpeechDetector(vad_session, read_meta(vad_session)),
+        asr=GigaAMOnnx(asr_session, read_meta(asr_session)),
+        accelerator=asr_session.get_providers()[0].replace("ExecutionProvider", ""),
+    )
+    _MODEL_CACHE[cache_key] = engine
+    return engine
 
 
-def _to_transcript(longform_result: Any) -> dict[str, Any]:
-    """LongformTranscriptionResult -> dict формата WhisperX (segments/words)."""
-    segments: list[dict[str, Any]] = []
-    for seg_index, seg in enumerate(getattr(longform_result, "segments", []) or []):
-        words: list[dict[str, Any]] = []
-        for w in getattr(seg, "words", None) or []:
-            words.append(
-                {
-                    "word": w.text,
-                    "start": float(w.start),
-                    "end": float(w.end),
-                    # У GigaAM нет confidence-скора на слово — оставляем None,
-                    # downstream это переносит (score опционален).
-                    "score": None,
-                }
-            )
-        # Если у сегмента нет пословных таймингов (word_timestamps выключен или
-        # пустой сегмент) — всё равно кладём сам сегмент с его границами.
-        segments.append(
-            {
-                "id": f"seg_{seg_index:06d}",
-                "start": float(getattr(seg, "start", 0.0) or 0.0),
-                "end": float(getattr(seg, "end", 0.0) or 0.0),
-                "text": getattr(seg, "text", "") or "",
-                "words": words,
-            }
+class _SpeechProgress:
+    """Дробный прогресс распознавания по аудио-секундам речи.
+
+    ЗАЧЕМ. Распознавание — это 90% времени обработки, и без тиков UI
+    показывает «12%» весь час: ETA считать не из чего (нужны минимум две
+    точки), а пользователь не понимает, живой процесс или подвис.
+
+    `found` зовётся после VAD (знаем ОБЩИЙ объём работы в секундах речи),
+    `advance` — после каждого батча. Дробь = обработанные секунды / общие:
+    сегменты сильно разной длины, счёт по штукам врёт на записях, где в
+    начале много коротких реплик. Без речи не тикаем вовсе — делить не на что.
+    """
+
+    def __init__(
+        self,
+        on_progress: Optional[TranscribeProgressFn],
+        on_status: Optional[Callable[[str], None]] = None,
+    ):
+        self._emit = on_progress
+        self._status = on_status
+        self._durations: list[float] = []
+        self._total = 0.0
+        self._done_idx = 0
+        self._done_sec = 0.0
+        self._last_emit = 0.0
+
+    def searching(self, done: int, total: int) -> None:
+        """Тик во время VAD — в `on_status`, а не в дробь: на длинном стриме
+        поиск речи идёт минутами, и видно должно быть, что процесс жив, но
+        ETA распознавания по нему считать нельзя (UI ставит якорь скорости на
+        первом тике дроби — см. TRANSCRIBE_ENTER_PCT в pipeline.py)."""
+        if self._status is None or not total:
+            return
+        now = time.monotonic()
+        if done < total and now - self._last_emit < 0.5:
+            return
+        self._last_emit = now
+        self._status(f"поиск речи: {done * 100 // total}%")
+
+    def found(self, boundaries: list[tuple[float, float]]) -> None:
+        self._durations = [max(0.0, float(end) - float(start)) for start, end in boundaries]
+        self._total = sum(self._durations)
+        if self._emit is not None and self._total > 0:
+            self._emit(0.0, f"речь найдена: {len(self._durations)} фрагментов")
+
+    def advance(self, batch_len: int) -> None:
+        if self._emit is None or not self._total:
+            return
+        idx = self._done_idx
+        self._done_sec += sum(self._durations[idx : idx + batch_len])
+        self._done_idx = idx + batch_len
+        fraction = min(1.0, self._done_sec / self._total)
+        # Троттлим до ~2 событий в секунду: батч короткой речи может проходить
+        # за миллисекунды, а каждый emit — это WS-пуш всем подписчикам.
+        now = time.monotonic()
+        if fraction >= 1.0 or now - self._last_emit >= 0.5:
+            self._last_emit = now
+            done_min = self._done_sec / 60.0
+            total_min = self._total / 60.0
+            self._emit(fraction, f"распознано {done_min:.1f} / {total_min:.1f} мин речи")
+
+
+def _write_posteriors_for(
+    path: Path,
+    chunks: list[tuple[Any, float]],
+    transcript: dict[str, Any],
+    vocab: list[str],
+    blank_id: int,
+) -> None:
+    """Сложить собранные посториоры в `.npz` рядом с транскриптом.
+
+    Начала сегментов берём из ГОТОВОГО транскрипта, порядок сегментов у
+    сборщика и у транскрипта один. Сегменты, для которых log-probs получить
+    не удалось, выпадают — по ним просто не будет спотинга.
+    """
+    if not chunks:
+        logger.warning("посториоры: сборщик пуст — спотинга по этому прогону не будет")
+        return
+    segments = transcript.get("segments") or []
+    if len(chunks) != len(segments):
+        logger.warning(
+            "посториоры: %d сегментов у декода против %d в транскрипте — не сохраняю",
+            len(chunks),
+            len(segments),
         )
-    return {"segments": segments}
+        return
+    pairs = [
+        (chunk, shift, float(seg.get("start") or 0.0))
+        for (chunk, shift), seg in zip(chunks, segments)
+        if chunk is not None
+    ]
+    if not pairs:
+        return
+    written = write_posteriors(
+        path,
+        [(chunk, shift) for chunk, shift, _ in pairs],
+        starts=[start for _, _, start in pairs],
+        vocab=vocab,
+        blank_id=blank_id,
+    )
+    if written is not None:
+        size_mb = written.stat().st_size / (1024 * 1024)
+        logger.info(
+            "Посториоры сохранены: %d сегментов, %.1f МБ (%s)",
+            len(pairs),
+            size_mb,
+            written.name,
+        )
+
+
+def _emission_words(
+    asr: Any, token_ids: list[int], token_frames: list[int], frame_shift: float
+) -> list[tuple[str, float, float]]:
+    """Слова по кадрам эмиссии — запасной путь, если выравнивание не сошлось
+    (`gigaam.timestamps_utils.frames_to_words`)."""
+    words: list[tuple[str, float, float]] = []
+    chars: list[str] = []
+    frames: list[int] = []
+
+    def commit() -> None:
+        text = "".join(chars).strip()
+        if text:
+            words.append((text, frames[0] * frame_shift, (frames[-1] + 1) * frame_shift))
+        chars.clear()
+        frames.clear()
+
+    for token_id, frame in zip(token_ids, token_frames):
+        char = asr.id_to_str(token_id)
+        if char.startswith("▁"):
+            commit()
+            char = char[1:]
+        elif char == " ":
+            commit()
+            continue
+        chars.append(char)
+        frames.append(frame)
+    commit()
+    return words
+
+
+def _segment_entry(
+    index: int, decoded: Any, asr: Any, seg_start: float, seg_end: float
+) -> dict[str, Any]:
+    """Один сегмент транскрипта: слова с АБСОЛЮТНЫМИ таймингами и скором."""
+    aligned = None
+    if decoded.log_probs.shape[0] > 0:
+        aligned = align_words(
+            decoded.log_probs,
+            decoded.token_ids,
+            blank_id=asr.blank_id,
+            to_char=asr.id_to_str,
+            frame_shift=decoded.frame_shift,
+        )
+    if aligned is not None:
+        # Скор — средняя вероятность букв слова на пути forced alignment.
+        raw = [(w.text, w.start, w.end, w.score) for w in aligned]
+    else:
+        # Не выровнялось — тайминги по кадрам эмиссии, скора нет (downstream
+        # это переносит: неверный confidence хуже отсутствующего).
+        raw = [
+            (text, start, end, None)
+            for text, start, end in _emission_words(
+                asr, decoded.token_ids, decoded.token_frames, decoded.frame_shift
+            )
+        ]
+    return {
+        "id": f"seg_{index:06d}",
+        "start": float(seg_start),
+        "end": float(seg_end),
+        "text": decoded.text,
+        "words": [
+            {
+                "word": text,
+                "start": float(round(start + seg_start, 3)),
+                "end": float(round(end + seg_start, 3)),
+                "score": score,
+            }
+            for text, start, end, score in raw
+        ],
+    }
 
 
 def transcribe_with_gigaam(
@@ -389,6 +305,9 @@ def transcribe_with_gigaam(
     model_name: str = "v3_ctc",
     device: str = "cuda",
     force: bool = False,
+    on_progress: Optional[TranscribeProgressFn] = None,
+    keep_posteriors: bool = False,
+    on_status: Optional[Callable[[str], None]] = None,
 ) -> tuple[dict[str, Any], str, Path]:
     """Транскрипция через GigaAM v3 с пословными таймингами.
 
@@ -396,8 +315,19 @@ def transcribe_with_gigaam(
     возвращает (transcript_dict, cache_key, cache_path). Кэш инвалидируется по
     отпечатку аудио + модели + устройства.
 
-    device: 'cuda' | 'cpu'. compute_type WhisperX-а тут не нужен — GigaAM сам
-    выбирает fp16 на GPU / fp32 на CPU.
+    device: 'cuda' | 'mps' | 'cpu' — см. `onnx_models` (GPU через CUDA/DirectML,
+    Apple через CoreML). Не поднялся ускоритель — считаем на CPU.
+
+    on_progress: необязательный колбэк (fraction 0..1, message) — тикает по мере
+    прохода VAD-сегментов, чтобы UI мог показать ETA самой длинной стадии.
+
+    keep_posteriors: сохранить log-probs рядом с транскриптом (`posteriors_<key>.npz`,
+    см. `posteriors.py`) — их читает поиск мата по посториорам. Если файла нет, а
+    он нужен, транскрипт из кэша НЕ берём: посториоры второй раз без прогона
+    модели не получить.
+
+    on_status: необязательный колбэк строки состояния ДО распознавания (поиск
+    речи) — без дроби, чтобы не попасть в замер скорости для ETA.
     """
     model_name = _normalize_gigaam_model(model_name)
 
@@ -408,45 +338,63 @@ def transcribe_with_gigaam(
             "model": model_name,
             "device": device,
             "word_timestamps": True,
+            # Версия способа получить границы слова: forced alignment по
+            # log-probs вместо кадров эмиссии CTC (alignment.py). Меняется —
+            # старые транскрипты в кэше должны стать невалидными, иначе прогон
+            # тихо останется на прежних таймингах. Переезд torch → onnxruntime
+            # ключ НЕ меняет: граф, признаки, VAD и выравнивание те же, и
+            # пересчитывать уже распознанные стримы незачем.
+            "timings": "forced_align_v1",
         }
     )
     cache_path = workdir / "cache" / f"transcript_{key}.json"
+    npz_path = posteriors_path(workdir, key)
 
-    if cache_path.exists() and not force:
+    if cache_path.exists() and not force and (npz_path.exists() or not keep_posteriors):
         logger.info("GigaAM-транскрипт уже есть в cache: %s", cache_path)
         return read_json(cache_path), key, cache_path
 
-    try:
-        import gigaam  # noqa: F401
-    except ImportError as exc:
-        raise RuntimeError(
-            "GigaAM не установлен. Обычно его ставит установщик приложения при "
-            "первом запуске — если этой ошибки не должно быть, перезапустите "
-            "подготовку окружения (кнопка «Повторить» в окне первого запуска).\n"
-            "Ручная установка (git-версия — только она умеет пословные тайминги):\n"
-            "  pip install hydra-core onnx\n"
-            "  pip install --no-deps git+https://github.com/salute-developers/GigaAM.git\n"
-            "или переключите движок на WhisperX."
-        ) from exc
+    from .ffmpeg_tools import load_audio_16k
+    from .vad import segment_audio
 
-    model = _load_gigaam_model(model_name, device)
+    engine = _load_engine(model_name, device)
+    asr = engine.asr
+    progress = _SpeechProgress(on_progress, on_status)
 
-    logger.info("Запускаю GigaAM transcribe_longform (word_timestamps=True): %s", audio_path.name)
-    try:
-        result = model.transcribe_longform(str(audio_path), word_timestamps=True)
-    except TypeError as exc:
-        # PyPI-релиз 0.2.0 без word-timestamps: transcribe(wav) -> str.
-        raise RuntimeError(
-            "Установленная версия GigaAM не поддерживает пословные тайминги "
-            "(нужна git-версия). Переставьте: pip install --no-deps "
-            "git+https://github.com/salute-developers/GigaAM.git"
-        ) from exc
+    logger.info("GigaAM (%s): %s", engine.accelerator, audio_path.name)
+    audio = load_audio_16k(audio_path, asr.sample_rate)
+    regions = engine.vad.speech_regions(audio, on_chunk=progress.searching)
+    pieces, boundaries = segment_audio(audio, regions, asr.sample_rate)
+    del audio
+    progress.found(boundaries)
 
-    transcript = _to_transcript(result)
+    segments: list[dict[str, Any]] = []
+    # Посториоры нужны только когда их просят сохранить (иначе это десятки
+    # мегабайт в памяти впустую). float16 — сразу на выходе декода.
+    chunks: list[tuple[Any, float]] = []
+    for batch_start in range(0, len(pieces), ASR_BATCH_SIZE):
+        batch = pieces[batch_start : batch_start + ASR_BATCH_SIZE]
+        for offset, decoded in enumerate(asr.decode_batch(batch)):
+            index = batch_start + offset
+            seg_start, seg_end = boundaries[index]
+            segments.append(_segment_entry(index, decoded, asr, seg_start, seg_end))
+            if keep_posteriors:
+                chunk = to_float16(decoded.log_probs) if decoded.log_probs.shape[0] else None
+                chunks.append((chunk, decoded.frame_shift))
+        progress.advance(len(batch))
 
-    n_segments = len(transcript["segments"])
-    n_words = sum(len(s["words"]) for s in transcript["segments"])
-    logger.info("GigaAM: %d сегментов, %d слов с таймингами", n_segments, n_words)
+    transcript = {"segments": segments}
+    if keep_posteriors:
+        _write_posteriors_for(npz_path, chunks, transcript, asr.vocab, asr.blank_id)
+
+    n_words = sum(len(s["words"]) for s in segments)
+    n_scored = sum(1 for s in segments for w in s["words"] if w.get("score") is not None)
+    logger.info(
+        "GigaAM: %d сегментов, %d слов с таймингами (forced alignment: %d)",
+        len(segments),
+        n_words,
+        n_scored,
+    )
 
     write_json(cache_path, transcript)
     return transcript, key, cache_path

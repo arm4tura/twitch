@@ -1,9 +1,10 @@
 # =============================================================================
-# УСТАРЕЛО. Используйте requirements-gpu.txt (см. README → Установка).
+# Какой lock-файл ставить:
+#   - Windows:        requirements-win.txt  (onnxruntime-directml, GPU любой марки)
+#   - macOS / Linux:  requirements-mac.txt  (onnxruntime)
+#   - + WhisperX:     requirements-whisperx-gpu.txt (torch + CUDA, необязательно)
 #
-# Причина: тут были неpin-нутые версии, из-за которых у пользователей ставились
-# разные наборы torch/pyannote/speechbrain, что ломало monkey-patches в
-# transcription.py. Полный воспроизводимый lock — в requirements-gpu.txt.
+# Этот файл по умолчанию ведёт на macOS/Linux-набор.
 # =============================================================================
 
--r requirements-gpu.txt
+-r requirements-mac.txt

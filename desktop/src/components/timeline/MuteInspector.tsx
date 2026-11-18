@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import { Play, Pause, Trash2, Volume2, VolumeX } from "lucide-react";
 import { cn } from "../../lib/cn";
 import { fmtMs } from "../../lib/format";
@@ -10,6 +11,14 @@ import type { ContextWord } from "../../lib/transcript";
  * раскрывающуюся часть прежнего MuteRow). Это не список, а контекст текущего
  * выбора: статус, глушить/оставить, точная подстройка краёв, превью и
  * транскрипт-контекст со снапом к словам.
+ *
+ * В шапке ДВА текста, и это не дубль: `word` — что ПОЙМАЛ детектор (лежит в
+ * decisions.json и не меняется от правки границ), «накрыто» — что реально попадает
+ * под текущее окно. Второе считается здесь из тех же слов, что подсвечены красным
+ * ниже, а не хранится: производную от границ и транскрипта нельзя держать в файле,
+ * иначе она разъезжается с границами (см. useMuteEditing — раньше она затирала
+ * слово детектора). Расходятся эти два текста ровно тогда, когда человек сдвинул
+ * окно, — и тогда оба видны.
  *
  * Всё в ЛОКАЛЬНЫХ секундах (как start/end мьюта и транскрипт). Границы правятся
  * тремя путями, как и раньше:
@@ -26,6 +35,7 @@ export interface MuteInspectorProps {
   total: number;
   start: number; // локальные секунды
   end: number;
+  /** Что поймал детектор (matched-токены). Правка границ его не меняет. */
   word?: string;
   /** true → будет заглушено (accepted); false → оставлено (rejected). */
   muted: boolean;
@@ -71,10 +81,26 @@ export function MuteInspector({
   onNudge,
   className,
 }: MuteInspectorProps) {
+  // Реально накрытый текст — из тех же слов, что TranscriptContext подсветит
+  // красным ниже: один источник, поэтому шапка и транскрипт не могут разойтись.
+  const covered = useMemo(
+    () =>
+      contextWords
+        .filter((w) => w.inMute)
+        .map((w) => w.word)
+        .join(" ")
+        .trim(),
+    [contextWords]
+  );
+  const caught = word?.trim() ?? "";
+  // Пустое «накрыто» не печатаем: окно в тишине и так видно по транскрипту, где
+  // ни одно слово не подсвечено.
+  const showCovered = covered !== "" && covered !== caught;
+
   return (
     <div
       className={cn(
-        "space-y-3 rounded-xl border border-white/8 bg-surface/50 p-3",
+        "mute-inspector space-y-3 rounded-xl border border-white/[0.08] bg-surface/50 p-3",
         className
       )}
     >
@@ -90,8 +116,16 @@ export function MuteInspector({
           )}
           title={word}
         >
-          {word?.trim() || "— без слова —"}
+          {caught || "— без слова —"}
         </span>
+        {showCovered && (
+          <span
+            className="min-w-0 truncate text-[11px] text-subtle"
+            title={`Под окном сейчас: ${covered}`}
+          >
+            накрыто: {covered}
+          </span>
+        )}
         <span className="font-mono text-[11px] tabular-nums text-subtle">
           {fmtMs(start * 1000)} · {Math.round((end - start) * 1000)} мс
         </span>
@@ -101,48 +135,12 @@ export function MuteInspector({
           </span>
         )}
 
-        <div className="ml-auto flex items-center gap-2">
-          <Button
-            size="sm"
-            variant={playing ? "primary" : "secondary"}
-            onClick={onPlayExport}
-            aria-label="Прослушать как в экспорте"
-          >
-            {playing ? <Pause className="mr-1.5 h-3.5 w-3.5" /> : <Play className="mr-1.5 h-3.5 w-3.5" />}
-            Как в экспорте
-          </Button>
-          <Button size="sm" variant="ghost" onClick={onPlayOriginal} aria-label="Прослушать оригинал">
-            <Play className="mr-1.5 h-3.5 w-3.5" /> Оригинал
-          </Button>
-        </div>
-      </div>
 
-      {/* Транскрипт-контекст (снап к словам) */}
-      <TranscriptContext
-        words={contextWords}
-        muteStart={start}
-        muteEnd={end}
-        currentS={currentS}
-        onAdjust={onAdjust}
-        onPlayRange={onPlayRange}
-      />
+      </div>
 
       {/* Подстройка краёв + глушить/оставить + удалить */}
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-        <EdgeNudge
-          label="Начало"
-          time={start}
-          onMinus={() => onNudge(-NUDGE, 0)}
-          onPlus={() => onNudge(NUDGE, 0)}
-        />
-        <EdgeNudge
-          label="Конец"
-          time={end}
-          onMinus={() => onNudge(0, -NUDGE)}
-          onPlus={() => onNudge(0, NUDGE)}
-        />
-
-        <div className="ml-auto flex items-center gap-2">
+        <div className="inspector-actions flex items-center gap-2">
           <Button
             size="sm"
             variant={muted ? "secondary" : "ghost"}
@@ -169,7 +167,45 @@ export function MuteInspector({
             <Trash2 className="mr-1.5 h-3.5 w-3.5" /> Удалить
           </Button>
         </div>
+        <EdgeNudge
+          label="Начало"
+          time={start}
+          onMinus={() => onNudge(-NUDGE, 0)}
+          onPlus={() => onNudge(NUDGE, 0)}
+        />
+        <EdgeNudge
+          label="Конец"
+          time={end}
+          onMinus={() => onNudge(0, -NUDGE)}
+          onPlus={() => onNudge(0, NUDGE)}
+        />
+
+
       </div>
+        <div className="ml-auto flex items-center gap-2">
+          <Button
+            size="sm"
+            variant={playing ? "primary" : "secondary"}
+            onClick={onPlayExport}
+            aria-label="Прослушать как в экспорте"
+          >
+            {playing ? <Pause className="mr-1.5 h-3.5 w-3.5" /> : <Play className="mr-1.5 h-3.5 w-3.5" />}
+            Как в экспорте
+          </Button>
+          <Button size="sm" variant="ghost" onClick={onPlayOriginal} aria-label="Прослушать оригинал">
+            <Play className="mr-1.5 h-3.5 w-3.5" /> Оригинал
+          </Button>
+        </div>
+      {/* Транскрипт-контекст (снап к словам) */}
+      <TranscriptContext
+        words={contextWords}
+        muteStart={start}
+        muteEnd={end}
+        currentS={currentS}
+        onAdjust={onAdjust}
+        onPlayRange={onPlayRange}
+      />
+
     </div>
   );
 }

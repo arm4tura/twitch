@@ -71,6 +71,13 @@ export function useJobEvents(
     let alive = true;
     let unsub: (() => void) | null = null;
     setError(null);
+    // Сбрасываем снапшот ПРЕДЫДУЩЕЙ джобы. Без этого между сменой jobId и
+    // ответом GET наружу торчит чужой state (статус/kind/result старой джобы),
+    // а эффекты потребителя видят «джоба уже done» для только что созданной.
+    // Именно так авто-цепочка download→process зацикливалась и плодила десятки
+    // process-джоб (см. JobScreen: там ещё и сверка state.id === jobId).
+    setState(null);
+    setWsReady(false);
     // Восстанавливаем накопленный лог из кэша (возврат на экран job'а) и
     // пере-сеедим dedup-ключ последней строкой, чтобы не задублировать её.
     const cached = LOG_CACHE.get(jobId) ?? [];

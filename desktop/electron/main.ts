@@ -2,8 +2,10 @@
  * Electron main process.
  *
  * Ответственности:
- *   1. Найти Python из backend/.venv и запустить `twitch-cut serve --port 0`
- *      как child_process. Порт выбирается uvicorn'ом сам; мы грепаем stdout
+ *   1. Запустить бэкенд `serve --port 0` как child_process: в собранном
+ *      приложении это готовый исполняемый файл resources/backend/twitch-cut-backend
+ *      (PyInstaller, Python внутри), в dev — python из backend/.venv.
+ *      Порт выбирается uvicorn'ом сам; мы грепаем stdout
  *      на маркер `TWITCH_CUT_PORT=NNNN` и передаём его в renderer через
  *      preload → window.twitchCut.backendPort.
  *   2. Создать BrowserWindow с загрузкой либо http://localhost:5173 (dev),
@@ -14,14 +16,16 @@
  *   4. Гарантированно убить backend при закрытии окна (else zombie uvicorn).
  */
 
-import { app, BrowserWindow, dialog, ipcMain, nativeImage, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeImage, safeStorage, shell } from "electron";
 import { spawn, ChildProcessWithoutNullStreams } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
 import {
   runBootstrap,
   isBootstrapped,
+  savedAccel,
   BootstrapError,
+  type Accel,
   type Paths,
   type BootstrapProgress,
 } from "./bootstrap";
@@ -30,7 +34,7 @@ import {
 
 /**
  * Writable корень данных. В упакованном приложении сам код read-only
- * (внутри установки), поэтому venv/models/логи живут отдельно:
+ * (внутри установки), поэтому модели/логи/настройки живут отдельно:
  *   - portable: папка <exe_dir>/TwitchCutter-Data, если она писабельна;
  *   - обычная установка: app.getPath("userData") (%APPDATA%\Twitch Cutter).
  * В dev (не упаковано) — тоже userData, чтобы отделить от исходников.
@@ -50,7 +54,10 @@ function resolveDataDir(): string {
   return app.getPath("userData");
 }
 
-/** Каталог backend: в prod — resources/backend (extraResources), в dev — <repo>/backend. */
+/**
+ * Каталог backend: в prod — resources/backend (собранный PyInstaller-каталог,
+ * кладётся через extraResources), в dev — <repo>/backend.
+ */
 function resolveBackendDir(): string {
   if (app.isPackaged) return path.join(process.resourcesPath, "backend");
   return path.resolve(__dirname, "..", "..", "..", "backend");
@@ -84,8 +91,15 @@ function resolveTdcliDir(): string | null {
  * ненадёжно, поэтому держим на диске рядом, как backend. В dev — desktop/build.
  */
 function resolveIconPath(): string {
+  if (process.platform === "darwin") return resolveMacIconPath();
+  if (process.platform !== "win32") return resolveDragIconPath();
   if (app.isPackaged) return path.join(process.resourcesPath, "icon.ico");
   return path.resolve(__dirname, "..", "..", "build", "icon.ico");
+}
+
+function resolveMacIconPath(): string {
+  if (app.isPackaged) return path.join(process.resourcesPath, "icon-macos.png");
+  return path.resolve(__dirname, "..", "..", "public", "icon-macos.png");
 }
 
 /**
@@ -103,67 +117,53 @@ function resolveDragIconPath(): string {
 }
 
 /**
- * Собрать все пути окружения.
+ * Собрать все пути окружения и команду запуска бэкенда.
  *
- * В prod venv живёт в writable dataDir/env (его создаёт bootstrap).
- * В dev, если у разработчика уже есть рабочий backend/.venv — используем его
- * напрямую и пропускаем bootstrap (иначе `npm run dev` качал бы Python и 4 ГБ
- * моделей заново в userData, игнорируя готовое окружение).
+ * В prod бэкенд — собранный исполняемый файл в resources/backend (Python и
+ * зависимости внутри), модели докачивает bootstrap в dataDir/models.
+ * В dev — python из backend/.venv (`python -m twitch_cut.cli`); без venv —
+ * `python` из PATH, а подскажет, чего не хватает, `twitch-cut doctor`.
  */
 function resolvePaths(): Paths {
   const dataDir = resolveDataDir();
+  const backendDir = resolveBackendDir();
+  const common = { dataDir, logsDir: path.join(dataDir, "logs"), backendDir };
 
-  // dev: предпочитаем существующий backend/.venv.
-  if (!app.isPackaged) {
-    const devVenv = path.join(resolveBackendDir(), ".venv");
-    const devPython =
-      process.platform === "win32"
-        ? path.join(devVenv, "Scripts", "python.exe")
-        : path.join(devVenv, "bin", "python");
-    if (fs.existsSync(devPython)) {
-      return {
-        dataDir,
-        envDir: devVenv,
-        binDir: path.join(dataDir, "bin"),
-        logsDir: path.join(dataDir, "logs"),
-        backendDir: resolveBackendDir(),
-        venvPython: devPython,
-      };
-    }
+  if (app.isPackaged) {
+    const exe = process.platform === "win32" ? "twitch-cut-backend.exe" : "twitch-cut-backend";
+    return { ...common, backendCmd: path.join(backendDir, exe), backendArgs: [], venvRoot: null };
   }
 
-  const envDir = path.join(dataDir, "env");
-  const venvPython =
+  const devVenv = path.join(backendDir, ".venv");
+  const devPython =
     process.platform === "win32"
-      ? path.join(envDir, "Scripts", "python.exe")
-      : path.join(envDir, "bin", "python");
-  return {
-    dataDir,
-    envDir,
-    binDir: path.join(dataDir, "bin"),
-    logsDir: path.join(dataDir, "logs"),
-    backendDir: resolveBackendDir(),
-    venvPython,
-  };
+      ? path.join(devVenv, "Scripts", "python.exe")
+      : path.join(devVenv, "bin", "python");
+  if (fs.existsSync(devPython)) {
+    return { ...common, backendCmd: devPython, backendArgs: ["-m", "twitch_cut.cli"], venvRoot: devVenv };
+  }
+  return { ...common, backendCmd: "python", backendArgs: ["-m", "twitch_cut.cli"], venvRoot: null };
 }
 
 let PATHS: Paths;
 let GPU_MODE = true; // уточняется после bootstrap; показываем бейдж в UI.
 
-// --- helpers ----------------------------------------------------------------
-
-/** Python из bootstrap-окружения (dataDir/env), fallback на `python` из PATH. */
-function findPython(): { cmd: string; args: string[]; venvRoot: string | null } {
-  if (fs.existsSync(PATHS.venvPython)) {
-    return { cmd: PATHS.venvPython, args: ["-m", "twitch_cut.cli"], venvRoot: PATHS.envDir };
-  }
-  // Fallback — полагаемся на PATH. Пользователю подскажет doctor.
-  return { cmd: "python", args: ["-m", "twitch_cut.cli"], venvRoot: null };
+/**
+ * Показывать ли предупреждающий бейдж «CPU». На macOS — нет: там CPU и есть
+ * режим по умолчанию (GigaAM на Apple Silicon быстрый), а CoreML включают руками.
+ */
+function gpuModeFor(accel: Accel | null): boolean {
+  if (process.platform === "darwin") return true;
+  return accel !== "cpu";
 }
 
+// --- helpers ----------------------------------------------------------------
+
 /**
- * Собрать PATH для backend-процесса: включить `nvidia\...\bin` из venv, чтобы
- * ctranslate2/whisperx нашли `cudnn_ops_infer64_8.dll`, `cublas64_12.dll` и т.д.
+ * Собрать PATH для backend-процесса (только dev-venv с WhisperX): включить
+ * `nvidia\...\bin`, чтобы ctranslate2/whisperx нашли `cudnn_ops_infer64_8.dll`,
+ * `cublas64_12.dll` и т.д. Движку по умолчанию (GigaAM на onnxruntime) это не
+ * нужно, а у собранного бэкенда venv нет вовсе — тогда venvRoot = null.
  *
  * Проблема: torch 2.6 (cu126) тянет cuDNN 9 в собственную папку torch\lib и её
  * же прописывает в DLL-путь через `os.add_dll_directory`. Но ctranslate2
@@ -192,12 +192,8 @@ function buildBackendEnv(venvRoot: string | null): NodeJS.ProcessEnv {
   // и бэкенд ищет бинарник в PATH.
   const tdcliDir = resolveTdcliDir();
   if (tdcliDir) env.TWITCH_CUT_TDCLI_DIR = tdcliDir;
-  // GPU_MODE отражает наличие NVIDIA (bootstrap.detectGpu грепает nvidia-smi).
-  // На macOS NVIDIA нет по определению, но там есть MPS (Apple Metal) — поэтому
-  // НЕ форсим CPU на darwin: backend сам детектит MPS в default_device() и
-  // ускоряет GigaAM. TWITCH_CUT_CPU=1 ставим только на Win/Linux без CUDA —
-  // там альтернативы CPU нет, и флаг гасит FAIL doctor'а на отсутствие CUDA.
-  if (!GPU_MODE && process.platform !== "darwin") env.TWITCH_CUT_CPU = "1";
+  // Ускоритель бэкенд выбирает сам (onnxruntime: DirectML/CUDA/CoreML, нет —
+  // CPU), поэтому TWITCH_CUT_CPU больше не выставляем.
   if (!venvRoot) return env;
 
   const sitePkgs = process.platform === "win32"
@@ -235,10 +231,10 @@ const portListeners: Array<(p: number) => void> = [];
 
 function startBackend(): Promise<number> {
   return new Promise((resolve, reject) => {
-    const { cmd, args, venvRoot } = findPython();
+    const cmd = PATHS.backendCmd;
     const staticDir = resolveStaticDir();
     const fullArgs = [
-      ...args,
+      ...PATHS.backendArgs,
       "serve",
       "--host", "127.0.0.1",
       "--port", "0",
@@ -248,7 +244,7 @@ function startBackend(): Promise<number> {
 
     const proc = spawn(cmd, fullArgs, {
       cwd: PATHS.backendDir,
-      env: buildBackendEnv(venvRoot),
+      env: buildBackendEnv(PATHS.venvRoot),
       windowsHide: true,
     });
     backendProc = proc;
@@ -302,8 +298,8 @@ function stopBackend() {
 /**
  * Остановить backend и дождаться, пока процесс реально умрёт.
  *
- * Нужно перед удалением дата-каталога: на Windows нельзя удалить `python.exe`
- * и DLL внутри env, пока их держит живой процесс (иначе EBUSY/EPERM). kill()
+ * Нужно перед удалением дата-каталога: на Windows нельзя удалить файлы,
+ * которые держит живой процесс (модели, логи — иначе EBUSY/EPERM). kill()
  * сам по себе асинхронный — ждём событие exit (или таймаут как страховку).
  */
 function stopBackendAndWait(timeoutMs = 8000): Promise<void> {
@@ -337,6 +333,10 @@ function createWindow() {
     width: 1200,
     height: 800,
     show: false,
+    backgroundColor: "#161719",
+    ...(process.platform === "darwin"
+      ? { titleBarStyle: "hidden" as const, trafficLightPosition: { x: 16, y: 14 } }
+      : {}),
     icon: fs.existsSync(iconPath) ? iconPath : undefined,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -394,12 +394,12 @@ function createSplash(): BrowserWindow {
  */
 async function ensureEnvironment(): Promise<boolean> {
   // dev: если рабочий backend/.venv уже есть — считаем окружение готовым и НЕ
-  // запускаем bootstrap (не качаем Python/модели поверх готового venv).
-  const devVenvReady = !app.isPackaged && fs.existsSync(PATHS.venvPython);
+  // запускаем bootstrap (модели бэкенд докачает сам при первом распознавании).
+  const devVenvReady = !app.isPackaged && PATHS.venvRoot !== null;
 
   if (devVenvReady || isBootstrapped(PATHS)) {
-    // Окружение уже есть — GPU-режим определяем по наличию флага .cpu-mode.
-    GPU_MODE = !fs.existsSync(path.join(PATHS.dataDir, ".cpu-mode"));
+    // Окружение уже есть — ускоритель знаем из прошлого bootstrap (.accel).
+    GPU_MODE = gpuModeFor(savedAccel(PATHS));
     return true;
   }
 
@@ -415,15 +415,10 @@ async function ensureEnvironment(): Promise<boolean> {
   };
 
   try {
-    const { gpu } = await runBootstrap(PATHS, send);
-    GPU_MODE = gpu;
-    // Запоминаем режим, чтобы при следующих запусках знать без повторного детекта.
-    try {
-      if (gpu) fs.rmSync(path.join(PATHS.dataDir, ".cpu-mode"), { force: true });
-      else fs.writeFileSync(path.join(PATHS.dataDir, ".cpu-mode"), "1", "utf-8");
-    } catch {
-      /* best-effort */
-    }
+    // Ускоритель bootstrap сам запоминает в .accel — при следующих запусках
+    // он известен без повторной проверки.
+    const { accel } = await runBootstrap(PATHS, send);
+    GPU_MODE = gpuModeFor(accel);
     return true;
   } catch (err) {
     const logPath = err instanceof BootstrapError ? err.logPath : "";
@@ -563,6 +558,192 @@ ipcMain.handle("shell:openExternal", async (_e, url: string) => {
   }
 });
 
+// --- AI-ключи (Electron safeStorage) ---------------------------------------
+//
+// API-ключи провайдеров ИИ шифруются через OS keychain (safeStorage) и лежат
+// в ai-keys.enc внутри PATHS.dataDir (тот же корень, что стирает data:wipe).
+// Расшифровка происходит ТОЛЬКО здесь, в main-процессе: renderer никогда не
+// получает открытый ключ обратно (мост не отдаёт `get`). Для запуска джобы /
+// теста соединения main сам достаёт ключ, вставляет его в тело loopback-POST
+// и делает fetch — открытый ключ не покидает main.
+//
+// Формат файла: JSON-словарь { [ref]: base64(safeStorage.encryptString) }.
+// `ref` — символическая ссылка (не секрет): её можно хранить в settings.json.
+
+/** Путь к зашифрованному хранилищу ключей. */
+function aiKeysFile(): string {
+  return path.join(PATHS.dataDir, "ai-keys.enc");
+}
+
+/**
+ * Санитизация ref: только [A-Za-z0-9:_-]. Иначе renderer мог бы протащить
+ * `../` (path traversal нам не грозит — ref это ключ JSON, не путь — но так же
+ * отсекаем инъекцию произвольных JSON-ключей) или пустую строку.
+ */
+function sanitizeKeyRef(ref: unknown): string | null {
+  if (typeof ref !== "string") return null;
+  const trimmed = ref.trim();
+  if (!trimmed || trimmed.length > 200) return null;
+  if (!/^[A-Za-z0-9:_-]+$/.test(trimmed)) return null;
+  return trimmed;
+}
+
+/** Прочитать словарь ключей. Отсутствующий/битый файл → пустой словарь. */
+function readKeyStore(): Record<string, string> {
+  const file = aiKeysFile();
+  try {
+    if (!fs.existsSync(file)) return {};
+    const raw = fs.readFileSync(file, "utf-8");
+    const data = JSON.parse(raw);
+    if (data && typeof data === "object" && !Array.isArray(data)) {
+      return data as Record<string, string>;
+    }
+    return {};
+  } catch (e) {
+    console.warn("[ai-keys] store read failed:", e);
+    return {};
+  }
+}
+
+/** Атомарно записать словарь ключей (tmp → rename). */
+function writeKeyStore(store: Record<string, string>): void {
+  const file = aiKeysFile();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = file + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(store), { encoding: "utf-8", mode: 0o600 });
+  fs.renameSync(tmp, file);
+}
+
+/**
+ * Достать открытый ключ по ref (только для main-side использования: run/test).
+ * Возвращает null, если ref не сохранён или шифрование недоступно. НЕ
+ * экспонируется в renderer.
+ */
+function decryptKey(ref: string): string | null {
+  if (!safeStorage.isEncryptionAvailable()) return null;
+  const store = readKeyStore();
+  const b64 = store[ref];
+  if (typeof b64 !== "string" || !b64) return null;
+  try {
+    return safeStorage.decryptString(Buffer.from(b64, "base64"));
+  } catch (e) {
+    console.warn("[ai-keys] decrypt failed:", e);
+    return null;
+  }
+}
+
+ipcMain.handle("ai-keys:set", async (_e, ref: unknown, plaintextKey: unknown) => {
+  const cleanRef = sanitizeKeyRef(ref);
+  if (!cleanRef) return { ok: false, error: "невалидный ref ключа" };
+  if (typeof plaintextKey !== "string" || !plaintextKey) {
+    return { ok: false, error: "пустой ключ" };
+  }
+  if (!safeStorage.isEncryptionAvailable()) {
+    return { ok: false, error: "шифрование недоступно в этой ОС (нет keychain)" };
+  }
+  try {
+    const encrypted = safeStorage.encryptString(plaintextKey);
+    const store = readKeyStore();
+    store[cleanRef] = encrypted.toString("base64");
+    writeKeyStore(store);
+    return { ok: true };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[ai-keys] set failed:", msg);
+    return { ok: false, error: msg };
+  }
+});
+
+ipcMain.handle("ai-keys:has", async (_e, ref: unknown) => {
+  const cleanRef = sanitizeKeyRef(ref);
+  if (!cleanRef) return { ok: false, error: "невалидный ref ключа" };
+  const store = readKeyStore();
+  return { ok: true, present: typeof store[cleanRef] === "string" && !!store[cleanRef] };
+});
+
+ipcMain.handle("ai-keys:list", async () => {
+  const store = readKeyStore();
+  // Только refs — никогда значения.
+  return { ok: true, refs: Object.keys(store) };
+});
+
+ipcMain.handle("ai-keys:delete", async (_e, ref: unknown) => {
+  const cleanRef = sanitizeKeyRef(ref);
+  if (!cleanRef) return { ok: false, error: "невалидный ref ключа" };
+  try {
+    const store = readKeyStore();
+    if (cleanRef in store) {
+      delete store[cleanRef];
+      writeKeyStore(store);
+    }
+    return { ok: true };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[ai-keys] delete failed:", msg);
+    return { ok: false, error: msg };
+  }
+});
+
+// --- AI-операции через loopback (ключ вставляется main-side) ----------------
+//
+// Renderer вызывает эти хендлеры БЕЗ api_key: он передаёт только api_key_ref
+// (символическую ссылку). main достаёт открытый ключ из safeStorage, вставляет
+// его в тело запроса и делает loopback-fetch на backend. Так открытый ключ
+// физически не появляется в renderer (и в его devtools network-табе).
+
+/** Дождаться порта backend (тот же механизм, что get-backend-port). */
+function awaitBackendPort(): Promise<number> {
+  if (backendPort !== null) return Promise.resolve(backendPort);
+  return new Promise<number>((resolve) => portListeners.push(resolve));
+}
+
+/**
+ * Общий помощник: взять тело запроса от renderer (с api_key_ref, без ключа),
+ * достать ключ, POST на backend по loopback, вернуть распарсенный JSON.
+ * Возвращает { ok, status, data } или { ok:false, error }.
+ */
+async function loopbackAiPost(
+  route: string,
+  body: Record<string, unknown>,
+): Promise<{ ok: boolean; status?: number; data?: unknown; error?: string }> {
+  if (!body || typeof body !== "object") {
+    return { ok: false, error: "невалидное тело запроса" };
+  }
+  // api_key_ref → расшифрованный ключ (main-side). Сам ref в тело backend не идёт.
+  const ref = sanitizeKeyRef((body as { api_key_ref?: unknown }).api_key_ref);
+  const { api_key_ref: _drop, ...rest } = body as Record<string, unknown>;
+  const payload: Record<string, unknown> = { ...rest };
+  if (ref) {
+    const key = decryptKey(ref);
+    if (!key) {
+      return { ok: false, error: "ключ не найден или не расшифровывается — сохраните ключ заново в настройках" };
+    }
+    payload.api_key = key;
+  }
+  try {
+    const port = await awaitBackendPort();
+    const res = await fetch(`http://127.0.0.1:${port}${route}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => null);
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`[ai] loopback ${route} failed:`, msg);
+    return { ok: false, error: msg };
+  }
+}
+
+ipcMain.handle("ai:testConnection", async (_e, req: Record<string, unknown>) => {
+  return loopbackAiPost("/ai/test-connection", req);
+});
+
+ipcMain.handle("ai:detectOfftopic", async (_e, req: Record<string, unknown>) => {
+  return loopbackAiPost("/jobs/detect-offtopic", req);
+});
+
 /**
  * Иконка курсора для drag-out (webContents.startDrag). startDrag на macOS
  * кидает исключение, если icon пустой/невалидный (тогда drag «даже не тянется»),
@@ -642,9 +823,9 @@ ipcMain.on("shell:startDrag", (event, filePath: string) => {
 });
 
 /**
- * Полное удаление скачанных данных (~10 ГБ): env (venv), python, models,
- * uv-cache, bin, logs — всё, что bootstrap докачал ПОСЛЕ установки и что
- * штатный деинсталлятор не отслеживает.
+ * Полное удаление скачанных данных: модели, логи, настройки — всё, что
+ * появилось в дата-каталоге ПОСЛЕ установки и что штатный деинсталлятор не
+ * отслеживает (у старых версий там же лежали venv с torch, python, uv-cache).
  *
  * Сам код программы (в Program Files / Applications) НЕ трогаем — его удаляет
  * системный деинсталлятор. После wipe при следующем запуске снова пройдёт
@@ -652,7 +833,7 @@ ipcMain.on("shell:startDrag", (event, filePath: string) => {
  * окружение; при quit=true — просто выходим (пользователь дальше деинсталлит).
  *
  * Порядок важен: сперва глушим backend и ЖДЁМ его смерти, иначе на Windows
- * python.exe/DLL заняты и rmSync падает EBUSY.
+ * файлы моделей заняты и rmSync падает EBUSY.
  */
 ipcMain.handle("data:wipe", async (_e, opts?: { quit?: boolean }) => {
   const target = PATHS?.dataDir;
@@ -676,7 +857,7 @@ ipcMain.handle("data:wipe", async (_e, opts?: { quit?: boolean }) => {
     title: "Полное удаление данных",
     message: "Удалить все скачанные данные Twitch Cut?",
     detail:
-      "Будут удалены Python, модели распознавания и виртуальное окружение (~10 ГБ) из:\n" +
+      "Будут удалены модели распознавания, логи и настройки из:\n" +
       target +
       "\n\nСама программа останется — удалите её отдельно через системный деинсталлятор. " +
       "При следующем запуске всё скачается заново.",
@@ -724,6 +905,9 @@ ipcMain.handle("data:wipe", async (_e, opts?: { quit?: boolean }) => {
 // --- app lifecycle ----------------------------------------------------------
 app.whenReady().then(async () => {
   PATHS = resolvePaths();
+  if (process.platform === "darwin") {
+    app.dock?.setIcon(nativeImage.createFromPath(resolveMacIconPath()));
+  }
 
   // Windows: без явного AppUserModelID система не связывает окна процесса с
   // иконкой/ярлыком приложения и показывает дефолтную иконку Electron в

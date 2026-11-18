@@ -128,7 +128,7 @@ const api = {
   platform: process.platform as string,
 
   /**
-   * Полное удаление скачанных данных (Python, модели, venv — ~10 ГБ).
+   * Полное удаление скачанных данных (модели, логи, настройки).
    * Показывает нативный диалог подтверждения. По умолчанию после удаления
    * перезапускает приложение (заново пройдёт bootstrap); с { quit: true }
    * — просто закрывает. Возвращает { ok } | { ok:false, error|cancelled }.
@@ -139,6 +139,59 @@ const api = {
     cancelled?: boolean;
   }> {
     return ipcRenderer.invoke("data:wipe", opts);
+  },
+
+  // --- AI-ключи и операции --------------------------------------------------
+  //
+  // ВАЖНО: `get` (расшифровка ключа) намеренно НЕ экспонируется. Открытый ключ
+  // никогда не возвращается в renderer. Мы отдаём только set/has/list/delete
+  // (управление) и testConnection/detectOfftopic (main сам достаёт ключ по ref
+  // и вставляет в loopback-запрос). Renderer оперирует только api_key_ref.
+
+  /**
+   * Сохранить (зашифровать через OS keychain) API-ключ под символическим ref.
+   * `ref` — не секрет (напр. "builtin:anthropic"); plaintextKey шифруется в main
+   * и в renderer обратно не возвращается.
+   */
+  aiKeySet(ref: string, plaintextKey: string): Promise<{ ok: boolean; error?: string }> {
+    return ipcRenderer.invoke("ai-keys:set", ref, plaintextKey);
+  },
+
+  /** Есть ли сохранённый ключ под этим ref (без раскрытия значения). */
+  aiKeyHas(ref: string): Promise<{ ok: boolean; present?: boolean; error?: string }> {
+    return ipcRenderer.invoke("ai-keys:has", ref);
+  },
+
+  /** Список ref'ов сохранённых ключей (никогда — значений). */
+  aiKeyList(): Promise<{ ok: boolean; refs?: string[]; error?: string }> {
+    return ipcRenderer.invoke("ai-keys:list");
+  },
+
+  /** Удалить сохранённый ключ по ref. */
+  aiKeyDelete(ref: string): Promise<{ ok: boolean; error?: string }> {
+    return ipcRenderer.invoke("ai-keys:delete", ref);
+  },
+
+  /**
+   * Проверить соединение с провайдером. Тело содержит api_key_ref (НЕ ключ);
+   * main достаёт ключ, делает loopback-POST на /ai/test-connection и возвращает
+   * { ok, status, data } | { ok:false, error }.
+   */
+  aiTestConnection(
+    req: Record<string, unknown>
+  ): Promise<{ ok: boolean; status?: number; data?: unknown; error?: string }> {
+    return ipcRenderer.invoke("ai:testConnection", req);
+  },
+
+  /**
+   * Запустить джобу AI-детекции оффтопа. Тело содержит api_key_ref (НЕ ключ);
+   * main вставляет ключ и делает loopback-POST на /jobs/detect-offtopic.
+   * Возвращает { ok, status, data } — где data это снапшот джобы (JobResponse).
+   */
+  aiDetectOfftopic(
+    req: Record<string, unknown>
+  ): Promise<{ ok: boolean; status?: number; data?: unknown; error?: string }> {
+    return ipcRenderer.invoke("ai:detectOfftopic", req);
   },
 };
 

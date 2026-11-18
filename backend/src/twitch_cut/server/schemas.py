@@ -14,7 +14,9 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from ..config import SENSITIVITY_DEFAULT, SENSITIVITY_LEVELS
 
 
 # --- Job request bodies ------------------------------------------------------
@@ -55,11 +57,44 @@ class ProcessJobRequest(BaseModel):
     vad_filter: bool = True
     vad_method: str = "pyannote"
 
-    mute_padding_before_ms: int = Field(80, ge=0)
-    mute_padding_after_ms: int = Field(120, ge=0)
+    # Чувствительность детекции — одна ручка на числа ниже (padding, склейка,
+    # поджим по RMS, расширение окна на тишине, допуск голове зайти на соседа,
+    # порог спотинга); см. config.SENSITIVITY_LEVELS. Сами эти поля — Optional:
+    # None означает
+    # «взять из уровня», а не «оставить как было». Числа здесь НЕ дублируются
+    # намеренно: раньше те же 80/120/600 лежали и тут, и в CLI, и в
+    # PipelineConfig, и разъезжались.
+    sensitivity: str = SENSITIVITY_DEFAULT
+
+    mute_padding_before_ms: Optional[int] = Field(None, ge=0)
+    mute_padding_after_ms: Optional[int] = Field(None, ge=0)
     mute_extend_mode: str = "word"
     mute_max_seconds: float = Field(6.0, gt=0)
-    mute_join_gap_ms: int = Field(600, ge=0)
+    mute_join_gap_ms: Optional[int] = Field(None, ge=0)
+    # Потолок длительности ОДНОГО слова: защита от битого word-timing, когда
+    # ASR ставит слову end = конец сегмента. Раньше не пробрасывался из API
+    # вообще (жёстко 1.5 с в PipelineConfig). Уровнем чувствительности НЕ
+    # управляется — это предохранитель, а не выбор «шире/уже».
+    mute_max_word_seconds: float = Field(1.5, gt=0)
+    # Подгонка границ мьюта по энергии аудио (см. mute_refine). Выключение
+    # возвращает старое поведение «границы только из ASR».
+    mute_trim_to_audio: bool = True
+    mute_trim_peak_ratio: Optional[float] = Field(None, gt=0.0, lt=1.0)
+    mute_trim_guard_ms: Optional[int] = Field(None, ge=0)
+    mute_trim_min_ms: int = Field(150, ge=0)
+    # Расширение назад окна, стоящего на тишине (см.
+    # config.mute_expand_on_silence_ms): единственная операция, которая делает
+    # окно ШИРЕ. 0 — выключить.
+    mute_expand_on_silence_ms: Optional[int] = Field(None, ge=0)
+    # Допуск головному отступу зайти на разметку предыдущего слова (см.
+    # config.mute_head_cross_prev_ms). 0 — запрет, как было: в связной речи
+    # клэмп по соседу схлопывает mute_padding_before_ms в ноль.
+    mute_head_cross_prev_ms: Optional[int] = Field(None, ge=0)
+
+    # Поиск мата в посториорах CTC (только gigaam) — находки идут как
+    # review-кандидаты. Раньше из API не пробрасывались вообще.
+    spot_posteriors: bool = True
+    spot_min_score: Optional[float] = Field(None, gt=0.0, le=1.0)
 
     force_extract: bool = False
     force_transcribe: bool = False
@@ -68,6 +103,17 @@ class ProcessJobRequest(BaseModel):
     # Smoke-mode: пропустить extract+transcribe, взять готовый JSON.
     # Используется в тестах И как быстрый способ прогнать пайплайн без CUDA.
     mock_transcript: Optional[str] = None
+
+    # Имя уровня проверяем на границе API, а не внутри джобы: иначе опечатка в
+    # запросе превращается в упавшую джобу (и человек видит её в списке как
+    # ошибку обработки), вместо 422 со списком допустимых значений.
+    @field_validator("sensitivity")
+    @classmethod
+    def _known_sensitivity(cls, value: str) -> str:
+        if value not in SENSITIVITY_LEVELS:
+            known = ", ".join(SENSITIVITY_LEVELS)
+            raise ValueError(f"sensitivity must be one of: {known}")
+        return value
 
 
 class ExportVegasRequest(BaseModel):
@@ -152,6 +198,10 @@ class RenderRequest(BaseModel):
     segments_to_remove: list[tuple[float, float]] = Field(
         ..., description="[(start, end), ...] в секундах — что удалить"
     )
+    segments_to_mute: list[tuple[float, float]] = Field(
+        default_factory=list,
+        description="[(start, end), ...] в секундах — заглушить аудио в ноль, кадры оставить (маты)",
+    )
     encoder: Optional[str] = Field(None, description="H.264-энкодер; None → авто")
     audio_bitrate: str = Field("192k", description="Битрейт аудио")
     quality: Literal["fast", "balanced", "max"] = Field(
@@ -192,6 +242,97 @@ class ExportVegasHighlightsRequest(BaseModel):
     vegas: str = Field(..., description="Куда записать .cs скрипт маркеров")
 
 
+class DetectOfftopicRequest(BaseModel):
+    """AI-детекция оффтоп-сегментов: транскрипт → decisions['offtopic'].
+
+    `api_key` — ТРАНЗИТНЫЙ секрет: Electron main расшифровывает его из
+    safeStorage и кладёт в тело запроса на loopback. Бэкенд использует ключ
+    на время джобы и НИКОГДА не пишет его на диск / в лог / в result. Здесь он
+    просто поле запроса — не сохраняется в settings.json.
+
+    `provider`/`topic_template`/`classification_template` — полные dict'ы
+    кастомных клонов (валидируются в runner через AIProvider/PromptTemplate).
+    Если не заданы — берётся встроенный пресет по `provider_id` / дефолтные
+    шаблоны. Поля тюнинга (window_s и т.п.) None → классификатор берёт свои
+    дефолты (см. llm_offtopic.classifier).
+
+    Путь классификации выбирает `method` (см. llm_offtopic.classifier):
+      None            — авто: есть исходник → source, иначе → windows (не меняем
+                        поведение старых вызовов, у которых источника нет);
+      "source"        — по исходнику (нужен source_audio ИЛИ source_transcript);
+      "single-pass"   — один проход без исходника;
+      "windows"       — старый оконный путь.
+    `source_audio` — локальный файл исходного видео (URL не поддерживается,
+    см. source.resolve_source_path); его путь эндпоинт заносит в whitelist
+    (`store.allow_media`), как вход остальных джоб. `source_transcript` —
+    готовый JSON транскрипта исходника, если он уже посчитан.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    decisions: str
+    output: str = Field(..., description="Куда записать decisions.json с ключом 'offtopic'")
+    transcript: Optional[str] = None
+
+    provider_id: str = Field("builtin:anthropic", description="ID провайдера (builtin:* или кастомного)")
+    provider: Optional[dict[str, Any]] = Field(
+        None, description="Полный dict кастомного AIProvider (если provider_id не встроенный)"
+    )
+    api_key: Optional[str] = Field(
+        None, description="ТРАНЗИТНЫЙ API-ключ из safeStorage. Не персистится."
+    )
+
+    cheap_model: Optional[str] = Field(None, description="[windows] Модель 1-й ступени; None → дефолт провайдера")
+    expensive_model: Optional[str] = Field(None, description="[windows] Модель 2-й ступени каскада; None → без каскада")
+    # LLM-модель пути по исходнику / одного прохода (у windows своя пара cheap/expensive).
+    model: Optional[str] = Field(None, description="[source/single-pass] Модель LLM; None → дефолт провайдера")
+
+    # Путь классификации и исходник (Фаза 4). Все опциональны — без них джоба
+    # ведёт себя как раньше (оконный путь).
+    method: Optional[str] = Field(
+        None, description="None|source|single-pass|windows (см. docstring)"
+    )
+    source_audio: Optional[str] = Field(
+        None, description="Локальный файл исходника — распознаём и используем как ground truth"
+    )
+    source_transcript: Optional[str] = Field(
+        None, description="Готовый JSON транскрипта исходника (вместо распознавания source_audio)"
+    )
+    source_model: Optional[str] = Field(
+        None, description="Модель ASR исходника; должна совпадать с моделью стрима. None → дефолт"
+    )
+    source_device: Optional[str] = Field(
+        None, description="Устройство ASR исходника (cpu безопаснее). None → дефолт"
+    )
+
+    topic_template: Optional[dict[str, Any]] = Field(None, description="Кастомный шаблон определения темы")
+    classification_template: Optional[dict[str, Any]] = Field(
+        None, description="Кастомный шаблон классификации оффтопа"
+    )
+
+    # Тюнинг пайплайна. None → дефолт классификатора (не переопределяем).
+    window_s: Optional[float] = Field(None, gt=0, description="Длина окна классификации (сек)")
+    overlap_s: Optional[float] = Field(None, ge=0, description="Перекрытие окон (сек)")
+    chunk_s: Optional[float] = Field(None, gt=0, description="Размер чанка пере-извлечения темы (сек)")
+    merge_gap_s: Optional[float] = Field(None, ge=0, description="Склеивать оффтоп-окна с зазором ≤ N сек")
+    cascade_threshold: Optional[float] = Field(
+        None, ge=0.0, le=1.0, description="Ниже этого confidence — дозапрос дорогой модели"
+    )
+
+
+class TestConnectionRequest(BaseModel):
+    """Проверка доступности провайдера из UI настроек.
+
+    Как и в DetectOfftopicRequest, `api_key` — транзитный секрет, не персистится.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider_id: str = Field("builtin:anthropic", description="ID провайдера (builtin:* или кастомного)")
+    provider: Optional[dict[str, Any]] = Field(None, description="Полный dict кастомного AIProvider")
+    api_key: Optional[str] = Field(None, description="ТРАНЗИТНЫЙ API-ключ. Не персистится.")
+
+
 # --- Job responses / events --------------------------------------------------
 
 
@@ -206,6 +347,7 @@ JobKindLiteral = Literal[
     "detect_silence",
     "render",
     "download_vod",
+    "detect_offtopic",
 ]
 
 

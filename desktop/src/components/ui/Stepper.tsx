@@ -235,6 +235,38 @@ export const DETECT_SILENCE_STEPS: StepDef[] = [
   },
 ];
 
+/** Стадии AI-детекта оффтопа — под runner._run_detect_offtopic_sync.
+ * Backend эмитит init/read → [read_source|transcribe_source] → classify →
+ * merge → write. Транскрипция исходника (путь по источнику) — самая долгая
+ * стадия (минуты ASR, 10–70%), поэтому у неё свой шаг; чтение готового
+ * транскрипта (read_source) сворачиваем туда же. `read`/`init` и `merge` —
+ * в «Подготовку»/«Запись», чтобы не плодить шаги ради секунд. */
+export const DETECT_OFFTOPIC_STEPS: StepDef[] = [
+  {
+    key: "read",
+    title: "Подготовка",
+    description: "Читаем decisions и транскрипт",
+    aliases: ["init"],
+  },
+  {
+    key: "transcribe_source",
+    title: "Транскрипция исходника",
+    description: "Распознаём видео-первоисточник (ground truth)",
+    aliases: ["read_source"],
+  },
+  {
+    key: "classify",
+    title: "Классификация",
+    description: "LLM размечает оффтоп по репликам",
+  },
+  {
+    key: "write",
+    title: "Запись",
+    description: "Мержим сегменты в decisions.json",
+    aliases: ["merge"],
+  },
+];
+
 /** Выбор набора стадий по типу job'а (JobState.kind). */
 export function stepsForKind(kind: string | undefined): StepDef[] {
   switch (kind) {
@@ -244,7 +276,21 @@ export function stepsForKind(kind: string | undefined): StepDef[] {
       return DETECT_SILENCE_STEPS;
     case "download_vod":
       return DOWNLOAD_STEPS;
+    case "detect_offtopic":
+      return DETECT_OFFTOPIC_STEPS;
     default:
       return PROCESS_STEPS;
   }
+}
+
+/** Человекочитаемый заголовок текущей стадии (по kind+stage, через aliases). */
+export function stageLabel(
+  kind: string | undefined,
+  stage: string | undefined
+): string {
+  if (!stage) return "Обработка";
+  const step = stepsForKind(kind).find(
+    (s) => s.key === stage || s.aliases?.includes(stage)
+  );
+  return step?.title ?? "Обработка";
 }

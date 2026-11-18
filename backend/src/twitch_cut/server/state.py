@@ -45,6 +45,7 @@ class JobKind(str, Enum):
     DETECT_SILENCE = "detect_silence"
     RENDER = "render"
     DOWNLOAD_VOD = "download_vod"
+    DETECT_OFFTOPIC = "detect_offtopic"
 
 
 def _now_iso() -> str:

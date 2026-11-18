@@ -1,3 +1,4 @@
+import { SourcePoster } from "../components/SourcePoster";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Clapperboard,
@@ -10,7 +11,6 @@ import {
   Package,
   Pause,
   Play,
-  Scissors,
   Sparkles,
 } from "lucide-react";
 import {
@@ -20,6 +20,7 @@ import {
   createRenderHighlightsJob,
   getPrompt,
   mediaUrl,
+  thumbnailUrl,
   readDecisions,
   type Highlight,
   type HighlightsExportResult,
@@ -127,6 +128,7 @@ export function AiTiktokScreen({ decisionsPath, onJobStarted }: AiTiktokScreenPr
 
   // Превью-плеер.
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [previewIdx, setPreviewIdx] = useState<number | null>(null);
   const [playingIdx, setPlayingIdx] = useState<number | null>(null);
   const stopAtRef = useRef<number>(0);
   const mediaAllowedRef = useRef<string | null>(null);
@@ -219,6 +221,7 @@ export function AiTiktokScreen({ decisionsPath, onJobStarted }: AiTiktokScreenPr
     if (!el || !stream) return;
     if (playingIdx === idx) { el.pause(); setPlayingIdx(null); return; }
     const [s, e] = absBounds(h);
+    setPreviewIdx(idx);
     stopAtRef.current = e;
     if (mediaAllowedRef.current !== stream) {
       mediaAllowedRef.current = stream;
@@ -317,18 +320,22 @@ export function AiTiktokScreen({ decisionsPath, onJobStarted }: AiTiktokScreenPr
   const stream = summary?.stream ?? null;
 
   return (
-    <div className="space-y-5 p-6">
-      <video ref={videoRef} onTimeUpdate={onTimeUpdate} onEnded={() => setPlayingIdx(null)} className="hidden" />
+    <div className="screen-page clips-page">
+      <header className="clips-heading"><h1 className="text-2xl font-semibold tracking-tight">Клипы</h1><p className="mt-1 text-sm text-muted">От транскрипта к готовым моментам — через NotebookLM.</p></header>
+      <ol className="clip-stages"><li data-complete={!!packageFiles}>01 <span>Подготовить транскрипт</span></li><li data-complete={hasHighlights}>02 <span>Импортировать ответ</span></li><li data-complete={!!clips}>03 <span>Нарезать клипы</span></li></ol>
+      <div className="clip-preview">
+        <div className="mb-3 text-sm font-medium">Предпросмотр {previewIdx != null ? `· ${summary?.highlights[previewIdx]?.title ?? ""}` : "момента"}</div>
+        {previewIdx == null && <SourcePoster key={stream} path={stream} />}
+        <video hidden={previewIdx == null} ref={videoRef} poster={stream ? thumbnailUrl(stream) ?? undefined : undefined} onPlay={() => setPlayingIdx(previewIdx)} controls={previewIdx != null} onTimeUpdate={onTimeUpdate} onPause={() => setPlayingIdx(null)} onEnded={() => setPlayingIdx(null)} className="aspect-video w-full rounded-md bg-black" />
+        <p className="mt-3 text-xs text-muted">{hasHighlights ? "Нажмите ▶ у момента, чтобы просмотреть его в исходной записи." : "После импорта здесь появится предпросмотр выбранного клипа."}</p>
+      </div>
 
       {/* ── Шаг 1: Подготовить транскрипт для ИИ ── */}
-      <Card variant="elevated" padding="md">
-        <div className="mb-3 inline-flex h-9 w-9 items-center justify-center rounded-lg bg-gradient-to-br from-violet-500/25 to-violet-500/0 text-brand-from">
-          <Package className="h-4 w-4" />
-        </div>
-        <CardTitle>1. Подготовить транскрипт</CardTitle>
+      <Card variant="elevated" padding="md" className="clip-prepare">
+        <details open={!hasHighlights}><summary className="cursor-pointer text-sm font-semibold">1. Подготовить транскрипт</summary>
+
         <CardDescription className="mt-1">
-          Разобьём расшифровку стрима на файлы-источники для NotebookLM. После
-          сборки перетащите их в NotebookLM и попросите ИИ выбрать лучшие моменты.
+          Подготовьте файлы для NotebookLM, загрузите их и отправьте промпт для поиска моментов.
         </CardDescription>
 
         {/* Пока файлы не собраны — компактная настройка + одна кнопка. */}
@@ -375,8 +382,7 @@ export function AiTiktokScreen({ decisionsPath, onJobStarted }: AiTiktokScreenPr
               </div>
               <p className="mb-3 flex items-center gap-1.5 text-[11px] text-subtle">
                 <MousePointer2 className="h-3 w-3" />
-                Зажмите файл и тяните в открытое окно NotebookLM (кнопка ниже).
-                Не получилось перетащить — нажмите «Открыть папку» и загрузите их там.
+                Перетащите файл в NotebookLM или загрузите его из папки проекта.
               </p>
               <div className="space-y-2">
                 {packageFiles.sources.map((f) => (
@@ -419,8 +425,7 @@ export function AiTiktokScreen({ decisionsPath, onJobStarted }: AiTiktokScreenPr
                 Скопируйте промпт и вставьте его в чат NotebookLM
               </div>
               <p className="mb-3 text-[11px] text-subtle">
-                Когда файлы загружены — вставьте этот промпт в чат. ИИ вернёт JSON
-                с моментами, который нужно вставить в шаге&nbsp;2.
+                Вставьте промпт в чат NotebookLM. Полученный ответ импортируйте в шаге 2.
               </p>
               <Button size="sm" variant="secondary" onClick={copyPrompt} loading={copyingPrompt}>
                 <ClipboardCopy className="h-3.5 w-3.5" /> Скопировать промпт
@@ -436,14 +441,13 @@ export function AiTiktokScreen({ decisionsPath, onJobStarted }: AiTiktokScreenPr
             </button>
           </div>
         )}
+        </details>
       </Card>
 
       {/* ── Шаг 2: Вставить ответ ── */}
-      <Card variant="elevated" padding="md">
-        <div className="mb-3 inline-flex h-9 w-9 items-center justify-center rounded-lg bg-gradient-to-br from-emerald-500/25 to-emerald-500/0 text-ok">
-          <Scissors className="h-4 w-4" />
-        </div>
-        <CardTitle>2. Вставить ответ ИИ</CardTitle>
+      <Card variant="elevated" padding="md" className="clip-import">
+        <details open={!hasHighlights}><summary className="cursor-pointer text-sm font-semibold">2. Вставить ответ ИИ</summary>
+
         <CardDescription className="mt-1">
           Скопируйте ответ модели целиком — JSON с пояснениями принимается.
           Частично битый ответ разберём по годным моментам.
@@ -460,11 +464,12 @@ export function AiTiktokScreen({ decisionsPath, onJobStarted }: AiTiktokScreenPr
             Импортировать
           </Button>
         </div>
+        </details>
       </Card>
 
       {/* ── Список моментов ── */}
       {hasHighlights ? (
-        <Card variant="elevated" padding="md">
+        <Card variant="elevated" padding="md" className="clip-moments">
           <div className="mb-4 flex items-center justify-between">
             <div>
               <CardTitle>Моменты ({summary!.highlights.length})</CardTitle>
@@ -503,7 +508,7 @@ export function AiTiktokScreen({ decisionsPath, onJobStarted }: AiTiktokScreenPr
                     <div className="flex items-center gap-2">
                       <div className="h-1 flex-1 overflow-hidden rounded-full bg-white/8">
                         <div
-                          className="h-full rounded-full bg-gradient-to-r from-brand-from to-brand-to"
+                          className="h-full rounded-full bg-brand"
                           style={{ width: `${Math.round(h.score * 100)}%` }}
                         />
                       </div>
@@ -526,7 +531,7 @@ export function AiTiktokScreen({ decisionsPath, onJobStarted }: AiTiktokScreenPr
           </div>
         </Card>
       ) : (
-        <Card variant="surface" padding="lg" className="text-center">
+        <Card variant="surface" padding="lg" className="clip-moments text-center">
           <Sparkles className="mx-auto mb-2 h-6 w-6 text-subtle" />
           <div className="text-sm font-medium text-muted">Хайлайтов пока нет</div>
           <div className="mt-1 text-xs text-subtle">
@@ -537,8 +542,8 @@ export function AiTiktokScreen({ decisionsPath, onJobStarted }: AiTiktokScreenPr
 
       {/* ── Шаг 3: Нарезать клипы ── */}
       {hasHighlights && (
-        <Card variant="elevated" padding="md" className="flex flex-col">
-          <div className="mb-3 inline-flex h-9 w-9 items-center justify-center rounded-lg bg-gradient-to-br from-violet-500/25 to-violet-500/0 text-brand-from">
+        <Card variant="elevated" padding="md" className="clip-render flex flex-col">
+          <div className="mb-3 inline-flex h-9 w-9 items-center justify-center rounded-lg bg-brand-from/10 text-brand-from">
             <Clapperboard className="h-4 w-4" />
           </div>
           <CardTitle>3. Нарезать клипы</CardTitle>

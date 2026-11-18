@@ -1,0 +1,56 @@
+# =============================================================================
+# Lock-файл ядра для Windows. БЕЗ torch и без CUDA.
+#
+# GigaAM v3 и VAD работают через onnxruntime-directml: DirectML ускоряет
+# распознавание на ЛЮБОЙ видеокарте под Windows 10/11 (NVIDIA, AMD, Intel) и
+# не требует ни CUDA, ни cuDNN-DLL. Нет видеокарты — onnxruntime сам считает
+# на CPU. Из этого набора собирается исполняемый бэкенд приложения
+# (backend/packaging/twitch-cut-backend.spec).
+#
+# Установка (dev):
+#   pip install -r requirements-win.txt && pip install -e . --no-deps
+#
+# onnxruntime-directml указан диапазоном, а не точной версией: его релизы
+# выходят не синхронно с основным onnxruntime. Ставить вместе с обычным
+# onnxruntime нельзя — они делят модуль `onnxruntime`.
+# WhisperX сюда не входит — для него requirements-whisperx-gpu.txt.
+# =============================================================================
+
+numpy==2.4.6
+onnxruntime-directml>=1.20,<2
+flatbuffers==25.12.19
+protobuf==7.35.1
+sympy==1.13.1
+mpmath==1.3.0
+packaging==26.2
+
+imageio-ffmpeg==0.6.0
+
+pymorphy3==2.0.6
+pymorphy3-dicts-ru==2.4.417150.4580142
+DAWG2-Python==0.9.0
+RapidFuzz==3.14.5
+
+pydantic==2.13.4
+pydantic_core==2.46.4
+annotated-types==0.7.0
+typing_extensions==4.15.0
+typing-inspection==0.4.2
+
+typer==0.25.1
+click==8.4.2
+colorama==0.4.6
+shellingham==1.5.4
+rich==15.0.0
+markdown-it-py==4.2.0
+mdurl==0.1.2
+Pygments==2.20.0
+
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+websockets==14.1
+python-multipart==0.0.20
+anyio==4.14.1
+h11==0.16.0
+idna==3.18
+PyYAML==6.0.3

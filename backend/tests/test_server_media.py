@@ -1,8 +1,8 @@
-"""Тесты для новых Timeline-эндпоинтов: /waveform, /media (Range), /waveform/allow.
+"""Тесты Timeline-эндпоинтов: /waveform, /waveform/range, /media (Range), /waveform/allow.
 
 Стратегия — не гоняем реальный ffmpeg (медленно, требует бинарь), а мокаем
-`_run_ffmpeg_pcm`, возвращая контролируемый PCM. Для теста Range достаточно
-plain-файла без аудио-контента.
+`_run_ffmpeg_pcm` / `_run_ffmpeg_pcm_range`, возвращая контролируемый PCM. Для
+теста Range достаточно plain-файла без аудио-контента.
 """
 
 from __future__ import annotations
@@ -33,6 +33,19 @@ def _make_pcm_sine(duration_s: float, sample_rate: int = 8000, amp: int = 20000)
     return arr.tobytes()
 
 
+def _make_pcm_asymmetric(
+    duration_s: float, sample_rate: int = 8000, hi: int = 24000, lo: int = -6000
+) -> bytes:
+    """PCM с РАЗНЫМ верхом и низом — проверяем что контур несимметричный.
+
+    Ради этого и появился format=3: настоящие min/max вместо зеркального
+    ±max(|.|). На таком сигнале max≈0.73, а min≈-0.18 — зеркало бы их сравняло.
+    """
+    total = int(duration_s * sample_rate)
+    arr = array.array("h", [hi if (i % 2 == 0) else lo for i in range(total)])
+    return arr.tobytes()
+
+
 # --- /waveform --------------------------------------------------------------
 
 
@@ -59,6 +72,33 @@ def test_waveform_returns_normalized_peaks(tmp_path: Path):
     assert body["duration_s"] == pytest.approx(1.0, rel=0.01)
     peak = max(abs(x) for x in body["peaks"])
     assert 0.55 < peak < 0.70  # amp=20000 → 20000/32768 ≈ 0.61
+
+
+def test_waveform_includes_rms(tmp_path: Path):
+    """Ответ несёт rms[] той же длины, каждый rms ≤ peak, энергия > 0.
+
+    Пила ±amp: в каждом бакете max(abs)=amp и RMS=amp → rms[i]≈peaks[i]≈0.61.
+    Ключевой инвариант формы Audacity — ядро (rms) не вылезает за контур (peak).
+    """
+    src = tmp_path / "sine.wav"
+    src.write_bytes(b"placeholder")
+    cache = tmp_path / "cache"
+
+    fake_pcm = _make_pcm_sine(duration_s=1.0)
+    client = TestClient(create_app())
+    client.app.state.store.allow_media(str(src))
+
+    with patch.object(waveform_mod, "_run_ffmpeg_pcm", return_value=fake_pcm), \
+         patch.object(waveform_mod, "_default_cache_root", return_value=cache):
+        r = client.get(f"/waveform?path={src}&peaks=128")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert isinstance(body["rms"], list)
+    assert len(body["rms"]) == len(body["peaks"]) == 128
+    # RMS ≤ пик в каждом бакете (иначе ядро вылезло бы за контур).
+    assert all(rm <= pk + 1e-4 for rm, pk in zip(body["rms"], body["peaks"]))
+    assert max(body["rms"]) > 0.5  # энергия присутствует (не нули)
 
 
 def test_waveform_caches_second_call(tmp_path: Path):
@@ -100,6 +140,176 @@ def test_waveform_404_when_missing(tmp_path: Path):
     client.app.state.store.allow_media(str(src))  # в whitelist, но файла нет
     r = client.get(f"/waveform?path={src}&peaks=128")
     assert r.status_code == 404
+
+
+# --- /waveform/range (слой детали для зума) ---------------------------------
+
+
+def test_waveform_range_returns_window(tmp_path: Path):
+    """Окно [10, 12] при res=256 → 256 бакетов, границы = фактически покрытые."""
+    src = tmp_path / "clip.wav"
+    src.write_bytes(b"placeholder")
+    client = TestClient(create_app())
+    client.app.state.store.allow_media(str(src))
+
+    # span=2.0, res=256 → _range_sample_rate = clamp(256*8/2) = 8000.
+    fake_pcm = _make_pcm_sine(duration_s=2.0, sample_rate=8000)
+    with patch.object(waveform_mod, "_run_ffmpeg_pcm_range", return_value=fake_pcm):
+        r = client.get(f"/waveform/range?path={src}&start=10&end=12&res=256")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["min"]) == len(body["max"]) == len(body["rms"]) == 256
+    assert len(body["peaks"]) == 256
+    assert body["start_s"] == pytest.approx(10.0)
+    assert body["end_s"] == pytest.approx(12.0, rel=0.01)
+    assert body["sample_rate"] == 8000
+    # Контур: min ≤ 0 ≤ max в каждом бакете (иначе форма перевернётся).
+    assert all(mn <= 0.0 for mn in body["min"])
+    assert all(mx >= 0.0 for mx in body["max"])
+    # Ядро не вылезает за контур.
+    assert all(rm <= pk + 1e-4 for rm, pk in zip(body["rms"], body["peaks"]))
+
+
+def test_waveform_range_contour_is_asymmetric(tmp_path: Path):
+    """min и max независимы: сигнал +24000/-6000 не должен стать зеркальным."""
+    src = tmp_path / "clip.wav"
+    src.write_bytes(b"placeholder")
+    client = TestClient(create_app())
+    client.app.state.store.allow_media(str(src))
+
+    fake_pcm = _make_pcm_asymmetric(duration_s=1.0, sample_rate=8000)
+    with patch.object(waveform_mod, "_run_ffmpeg_pcm_range", return_value=fake_pcm):
+        r = client.get(f"/waveform/range?path={src}&start=0&end=1&res=64")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert max(body["max"]) == pytest.approx(24000 / 32768, rel=0.01)
+    assert min(body["min"]) == pytest.approx(-6000 / 32768, rel=0.01)
+    # Именно это ломало вид: зеркало ±max(|.|) сделало бы обе границы 0.73.
+    assert abs(body["max"][0]) - abs(body["min"][0]) > 0.4
+
+
+def test_waveform_range_raises_sample_rate_on_deep_zoom(tmp_path: Path):
+    """Узкое окно → ffmpeg зовётся с поднятым sample rate (≥8 семплов/бакет)."""
+    src = tmp_path / "clip.wav"
+    src.write_bytes(b"placeholder")
+    client = TestClient(create_app())
+    client.app.state.store.allow_media(str(src))
+
+    fake_pcm = _make_pcm_sine(duration_s=0.5, sample_rate=32768)
+    with patch.object(
+        waveform_mod, "_run_ffmpeg_pcm_range", return_value=fake_pcm
+    ) as m_ffmpeg:
+        r = client.get(f"/waveform/range?path={src}&start=100&end=100.5&res=2048")
+
+    assert r.status_code == 200, r.text
+    # span=0.5, buckets=2048 → 2048*8/0.5 = 32768 (в коридоре [8000, 48000]).
+    _path, start_arg, span_arg, sr_arg = m_ffmpeg.call_args.args
+    assert start_arg == pytest.approx(100.0)
+    assert span_arg == pytest.approx(0.5)
+    assert sr_arg == 32768
+    assert r.json()["sample_rate"] == 32768
+
+
+def test_waveform_range_reports_actual_span(tmp_path: Path):
+    """У конца файла ffmpeg отдаёт меньше — end_s должен сказать правду.
+
+    Иначе фронт растянет 2 секунды данных на 10-секундное окно и волна съедет.
+    """
+    src = tmp_path / "clip.wav"
+    src.write_bytes(b"placeholder")
+    client = TestClient(create_app())
+    client.app.state.store.allow_media(str(src))
+
+    # Просим 10 с, ffmpeg «упёрся в конец» и вернул 2 с при 8000 Hz.
+    short_pcm = _make_pcm_sine(duration_s=2.0, sample_rate=8000)
+    with patch.object(waveform_mod, "_run_ffmpeg_pcm_range", return_value=short_pcm):
+        r = client.get(f"/waveform/range?path={src}&start=0&end=10&res=128")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["end_s"] == pytest.approx(2.0, rel=0.01)
+    assert len(body["max"]) == 128  # res соблюдается независимо от объёма PCM
+
+
+def test_waveform_range_caps_buckets_to_sample_budget(tmp_path: Path):
+    """На максимальном зуме бакетов отдаётся меньше запрошенного — но честных.
+
+    span=0.54 с при потолке 48 kHz = 25920 семплов. На 8192 бакета это ~3 семпла
+    на бакет вместо обещанных 8 — раньше потолок выигрывал молча. Теперь число
+    бакетов урезается до обеспеченного (~0.54*48000/8 ≈ 3240; точное значение
+    зависит от float-вычитания границ, поэтому проверяем инвариант, а не число),
+    и фронт по разнице «просили/получили» понимает, что глубже детализации нет.
+    """
+    src = tmp_path / "clip.wav"
+    src.write_bytes(b"placeholder")
+    client = TestClient(create_app())
+    client.app.state.store.allow_media(str(src))
+
+    fake_pcm = _make_pcm_sine(duration_s=0.54, sample_rate=48000)
+    with patch.object(
+        waveform_mod, "_run_ffmpeg_pcm_range", return_value=fake_pcm
+    ) as m_ffmpeg:
+        r = client.get(f"/waveform/range?path={src}&start=10&end=10.54&res=8192")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["sample_rate"] == 48000  # упёрлись в потолок
+    n = len(body["max"])
+    assert n < 8192  # запрос урезан — фронт увидит это и не пойдёт по кругу
+    assert n == pytest.approx(3240, abs=2)
+    assert len(body["min"]) == len(body["rms"]) == len(body["peaks"]) == n
+    # Инвариант держится: ≥8 семплов на бакет.
+    _p, _s, span_arg, sr_arg = m_ffmpeg.call_args.args
+    assert span_arg * sr_arg / n >= 8.0
+    # Диапазон не пострадал — урезали детализацию, а не окно.
+    assert body["start_s"] == pytest.approx(10.0)
+    assert body["end_s"] == pytest.approx(10.54, rel=0.01)
+
+
+def test_range_buckets_keeps_request_when_affordable():
+    """Если семплов хватает — число бакетов не трогаем."""
+    # 2 с при 8000 Hz = 16000 семплов; 256 бакетов по 62 семпла — с запасом.
+    assert waveform_mod._range_buckets(2.0, 256, 8000) == 256
+    # 0.5 с при 32768 Hz = 16384 семпла → ровно 2048 бакетов по 8.
+    assert waveform_mod._range_buckets(0.5, 2048, 32768) == 2048
+    # Просят больше, чем обеспечено → урезаем.
+    assert waveform_mod._range_buckets(0.5, 8192, 48000) == 3000
+    # Мусор на входе не должен ронять расчёт.
+    assert waveform_mod._range_buckets(0.0, 512, 48000) == 512
+    assert waveform_mod._range_buckets(1.0, 512, 0) == 512
+
+
+def test_waveform_range_rejects_inverted_window(tmp_path: Path):
+    """end ≤ start → 422, а не пустой массив или 500."""
+    src = tmp_path / "clip.wav"
+    src.write_bytes(b"placeholder")
+    client = TestClient(create_app())
+    client.app.state.store.allow_media(str(src))
+    r = client.get(f"/waveform/range?path={src}&start=5&end=3&res=128")
+    assert r.status_code == 422
+
+
+def test_waveform_range_requires_whitelist(tmp_path: Path):
+    """Диапазонные пики — тоже приватные данные: путь не в whitelist → 403."""
+    src = tmp_path / "leaked.wav"
+    src.write_bytes(b"x")
+    client = TestClient(create_app())  # allow_media НЕ вызван
+    r = client.get(f"/waveform/range?path={src}&start=0&end=1&res=128")
+    assert r.status_code == 403
+
+
+def test_range_sample_rate_scales_with_zoom():
+    """Адаптивный sample rate: растёт на зуме, зажат в [8000, 48000]."""
+    # Широкое окно — базовых 8 kHz с запасом хватает.
+    assert waveform_mod._range_sample_rate(600.0, 2000) == 8000
+    # Глубокий зум — поднимаем до нужного (2000*8/0.4 = 40000).
+    assert waveform_mod._range_sample_rate(0.4, 2000) == 40000
+    # Ещё глубже — упираемся в потолок, а не декодируем 96 kHz зря.
+    assert waveform_mod._range_sample_rate(0.1, 2000) == 48000
+    # Мусор на входе не должен делить на ноль.
+    assert waveform_mod._range_sample_rate(0.0, 2000) == 8000
 
 
 # --- /media -----------------------------------------------------------------

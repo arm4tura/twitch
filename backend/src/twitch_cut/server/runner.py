@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import traceback
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,7 @@ from ..vegas_export import (
 )
 from .projects import register_project
 from .schemas import (
+    DetectOfftopicRequest,
     DetectSilenceRequest,
     DownloadVodRequest,
     ExportVegasHighlightsRequest,
@@ -89,6 +91,43 @@ def _finalize(store: JobStore, state: JobState, status: JobStatus, *, error: str
     store.close_stream(state.id)
 
 
+# --- тяжёлые джобы: ровно одна за раз ---------------------------------------
+
+HEAVY_JOB_SLOTS = 1
+"""Сколько ASR-обработок разрешено крутить одновременно.
+
+Одна. GigaAM грузит ~2 ГБ весов на MPS/CUDA, и N параллельных сессий не
+ускоряют работу, а отбирают друг у друга GPU и память: на 16 ГБ Mac десяток
+инстансов уводит машину в swap, и НИ ОДИН не доезжает.
+
+Хуже того, без этого лимита переполняется дефолтный пул `asyncio.to_thread`
+(min(32, cpu+4) — на 10-ядерном Mac это 14 воркеров). Джоба номер 15 висит в
+очереди executor'а: статус running, стадия init, 0 %, ни строчки в логе — с
+виду «застряло на Подготовке» навсегда. Ждать в семафоре честнее: мы хотя бы
+можем сказать пользователю, что он в очереди.
+"""
+
+_heavy_gates: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _heavy_gate() -> asyncio.Semaphore:
+    """Семафор тяжёлых джоб, привязанный к ТЕКУЩЕМУ event-loop.
+
+    Не модульная константа: `asyncio.Semaphore` привязывается к первому
+    использовавшему его loop'у, а тесты гоняют каждый прогон через свой
+    `asyncio.run(...)` — общий объект падал бы с «bound to a different event
+    loop». В проде loop один, так что словарь всегда из одной записи.
+    """
+    loop = asyncio.get_running_loop()
+    gate = _heavy_gates.get(loop)
+    if gate is None:
+        gate = asyncio.Semaphore(HEAVY_JOB_SLOTS)
+        _heavy_gates[loop] = gate
+    return gate
+
+
 # --- process job -------------------------------------------------------------
 
 
@@ -128,11 +167,26 @@ def _run_process_sync(req: ProcessJobRequest, progress: Progress) -> dict[str, A
         vad_filter=req.vad_filter,
         vad_method=req.vad_method,
         asr_options=dict(DEFAULT_ASR_OPTIONS),
+        sensitivity=req.sensitivity,
         mute_padding_before_ms=req.mute_padding_before_ms,
         mute_padding_after_ms=req.mute_padding_after_ms,
         mute_extend_mode=req.mute_extend_mode,
         mute_max_seconds=req.mute_max_seconds,
         mute_join_gap_ms=req.mute_join_gap_ms,
+        mute_max_word_seconds=req.mute_max_word_seconds,
+        mute_trim_to_audio=req.mute_trim_to_audio,
+        mute_trim_peak_ratio=req.mute_trim_peak_ratio,
+        mute_trim_guard_ms=req.mute_trim_guard_ms,
+        mute_trim_min_ms=req.mute_trim_min_ms,
+        mute_expand_on_silence_ms=req.mute_expand_on_silence_ms,
+        # Без этой строки поле есть в схеме, видно в UI и не работает: конфиг тут
+        # собирается перечислением. Страж — test_sensitivity.py::
+        # test_every_knob_from_the_request_reaches_the_pipeline.
+        mute_head_cross_prev_ms=req.mute_head_cross_prev_ms,
+        # Спотинг по посториорам: из API не пробрасывался вообще, то есть
+        # выключить его или сдвинуть порог из UI было нельзя.
+        spot_posteriors=req.spot_posteriors,
+        spot_min_score=req.spot_min_score,
     )
     config = config.normalized()
     config.validate()
@@ -156,17 +210,65 @@ def _run_process_sync(req: ProcessJobRequest, progress: Progress) -> dict[str, A
     )
 
 
+def _start_edit_journal(decisions_path: str | Path) -> None:
+    """Снять базовый снимок для журнала правок — решение ПАЙПЛАЙНА.
+
+    Только когда журнал включён в настройках. Best-effort: диагностика не имеет
+    права ронять только что успешно завершённую обработку.
+    """
+    try:
+        from .settings import load_settings
+
+        if not bool(load_settings().get("edit_journal")):
+            return
+        from ..edit_journal import start_journal
+
+        path = Path(decisions_path)
+        start_journal(path, read_json(path))
+    except Exception:  # noqa: BLE001
+        logger.warning("edit journal baseline failed for %s", decisions_path, exc_info=True)
+
+
+def _refresh_edit_journal(
+    decisions_path: str | Path, doc: dict[str, Any], layers: tuple[str, ...], note: str
+) -> None:
+    """Записать в baseline журнала слои, которые только что посчитала машина.
+
+    Джоба дописывает сегменты в decisions.json напрямую, минуя PUT /decisions;
+    без этого они попали бы в отчёт как «человек добавил». Best-effort и только
+    при включённом журнале — как и `_start_edit_journal`.
+    """
+    try:
+        from .settings import load_settings
+
+        if not bool(load_settings().get("edit_journal")):
+            return
+        from ..edit_journal import refresh_baseline
+
+        refresh_baseline(Path(decisions_path), doc, layers, note=note)
+    except Exception:  # noqa: BLE001
+        logger.warning("edit journal refresh failed for %s", decisions_path, exc_info=True)
+
+
 async def run_process_job(store: JobStore, state: JobState, req: ProcessJobRequest) -> None:
     progress = Progress(store, state)
     state.status = JobStatus.RUNNING
     progress.emit("init", 0.0, "starting process job")
+    gate = _heavy_gate()
     try:
-        result = await asyncio.to_thread(_run_process_sync, req, progress)
+        # Ждём своей очереди ВНУТРИ try: отмена стоящей в очереди джобы должна
+        # давать 'cancelled', а не тихо висеть.
+        if gate.locked():
+            progress.emit("init", 0.0, "в очереди: уже идёт другая обработка")
+        async with gate:
+            progress.emit("init", 0.0, "starting process job")
+            result = await asyncio.to_thread(_run_process_sync, req, progress)
         # Регистрируем в реестре Recent Projects — best-effort, ошибку глотает
         # сама register_project. Делаем это ПОСЛЕ успешного write_decisions,
         # чтобы битые/незавершённые пути в Dashboard не всплывали. Берём путь
         # из результата (req.decisions мог быть None — простой режим).
         register_project(result["decisions_path"])
+        _start_edit_journal(result["decisions_path"])
         _finalize(store, state, JobStatus.DONE, result=result)
     except asyncio.CancelledError:
         _finalize(store, state, JobStatus.CANCELLED, error="cancelled by user")
@@ -554,6 +656,7 @@ def _run_render_sync(req: RenderRequest, progress: Progress) -> dict[str, Any]:
         input_path,
         output_path,
         req.segments_to_remove,
+        segments_to_mute=req.segments_to_mute,
         total_duration=total_duration,
         encoder=req.encoder,
         audio_bitrate=req.audio_bitrate,
@@ -572,6 +675,7 @@ def _run_render_sync(req: RenderRequest, progress: Progress) -> dict[str, Any]:
         "output_path": str(output_path),
         "output_size": output_size,
         "removed_count": len(req.segments_to_remove),
+        "muted_count": len(req.segments_to_mute),
         "kept_duration": kept_duration,
     }
 
@@ -669,3 +773,250 @@ async def run_download_vod_job(
     except Exception as exc:  # noqa: BLE001
         logger.exception("download_vod job failed")
         _finalize(store, state, JobStatus.FAILED, error=f"{type(exc).__name__}: {exc}")
+
+
+# --- detect_offtopic job -----------------------------------------------------
+
+
+def _run_detect_offtopic_sync(
+    req: DetectOfftopicRequest, progress: Progress
+) -> dict[str, Any]:
+    """AI-классификация оффтопа: транскрипт → decisions['offtopic'].
+
+    Зеркалит _run_highlights_import_sync: читаем decisions + транскрипт,
+    прогоняем через классификатор, мержим в свой ключ, пишем output.
+
+    Путь выбирает req.method (см. _resolve_offtopic_method): по исходнику
+    (нужен source_audio/source_transcript), один проход или старый оконный.
+
+    Секрет (req.api_key) используется только для конструирования LLMClient и
+    НИКОГДА не попадает в progress-сообщения, логи или result.
+    """
+    # Ленивый импорт: SDK anthropic/openai опциональны ([ai] extra). Так
+    # runner импортируется без них — падаем только при реальном вызове LLM.
+    from ..llm_offtopic import (
+        AIProvider,
+        LLMClient,
+        PromptTemplate,
+        builtin_provider,
+        classify_single_pass,
+        classify_transcript,
+    )
+    from ..llm_offtopic import merge_into_decisions as merge_offtopic
+
+    if req.source_audio and req.source_transcript:
+        raise ValueError("pass either source_audio or source_transcript, not both")
+
+    progress.emit("read", 8.0, "read decisions + transcript")
+    decisions_doc = read_json(Path(req.decisions))
+    transcript_path = _resolve_transcript_path(decisions_doc, req.transcript)
+    transcript_doc = read_json(transcript_path)
+    transcript_hash = file_content_hash(transcript_path)
+
+    # Провайдер: встроенный пресет по id, иначе — кастомный dict из запроса.
+    provider = builtin_provider(req.provider_id)
+    if provider is None:
+        if not req.provider:
+            raise ValueError(
+                f"unknown provider_id={req.provider_id!r} and no custom `provider` supplied"
+            )
+        provider = AIProvider.model_validate(req.provider)
+
+    topic_tpl = (
+        PromptTemplate.model_validate(req.topic_template) if req.topic_template else None
+    )
+    class_tpl = (
+        PromptTemplate.model_validate(req.classification_template)
+        if req.classification_template
+        else None
+    )
+
+    client = LLMClient(provider, api_key=req.api_key)
+
+    have_source = bool(req.source_audio or req.source_transcript)
+    method = _resolve_offtopic_method(req.method, have_source)
+
+    if method == "source":
+        # Кастомные шаблоны из запроса — под ОКОННЫЙ путь (topic/classification);
+        # у пути по исходнику другие виды шаблонов, поэтому берём встроенные.
+        result = _classify_source_path(
+            req,
+            progress,
+            client=client,
+            transcript_doc=transcript_doc,
+            transcript_hash=transcript_hash,
+        )
+    elif method == "single-pass":
+        progress.emit("classify", 15.0, f"classify offtopic (single-pass) via {provider.id}")
+        result = classify_single_pass(
+            transcript_doc,
+            client=client,
+            model=req.model,
+            transcript_hash=transcript_hash,
+        )
+    else:  # windows — старый оконный путь
+        # Тюнинг: пробрасываем только non-None, чтобы классификатор держал дефолты.
+        tuning: dict[str, Any] = {}
+        for name in ("window_s", "overlap_s", "chunk_s", "merge_gap_s", "cascade_threshold"):
+            val = getattr(req, name)
+            if val is not None:
+                tuning[name] = val
+        progress.emit("classify", 15.0, f"classify offtopic via {provider.id}")
+        result = classify_transcript(
+            transcript_doc,
+            client=client,
+            topic_template=topic_tpl,
+            classification_template=class_tpl,
+            cheap_model=req.cheap_model,
+            expensive_model=req.expensive_model,
+            transcript_hash=transcript_hash,
+            **tuning,
+        )
+
+    progress.emit("merge", 90.0, "merge into decisions.json")
+    merged = merge_offtopic(decisions_doc, result)
+
+    progress.emit("write", 95.0, "write output")
+    write_json(Path(req.output), merged)
+    # Оффтоп посчитала МАШИНА и записала мимо PUT /decisions — обновляем базовый
+    # снимок журнала, иначе следующее сохранение выглядело бы как «человек
+    # добавил N сегментов оффтопа».
+    _refresh_edit_journal(
+        req.output,
+        merged,
+        ("offtopic",),
+        note=f"AI-детект оффтопа ({result.method}) — сегменты посчитала программа",
+    )
+    progress.emit(
+        "write",
+        100.0,
+        f"{len(result.segments)} offtopic segments ({result.total_offtopic_s:.1f}s)",
+    )
+
+    # Отдаём обогащённые сегменты (со stream_start_s/stream_end_s из merge),
+    # чтобы будущая UI-панель рендерила без повторного чтения decisions.json.
+    # api_key СОЗНАТЕЛЬНО отсутствует в result — секрет не покидает процесс.
+    return {
+        "output": req.output,
+        "method": result.method,
+        "segments_count": len(result.segments),
+        "total_offtopic_s": result.total_offtopic_s,
+        "offtopic": merged["offtopic"]["segments"],
+    }
+
+
+_VALID_OFFTOPIC_METHODS = ("source", "single-pass", "windows")
+
+
+def _resolve_offtopic_method(requested: str | None, have_source: bool) -> str:
+    """Выбрать путь классификации.
+
+    None → авто: есть исходник → по исходнику, иначе → оконный (не меняем
+    поведение старых вызовов без исходника). Явный метод честно валидируем.
+    """
+    if requested is None:
+        return "source" if have_source else "windows"
+    if requested not in _VALID_OFFTOPIC_METHODS:
+        raise ValueError(
+            f"unknown method={requested!r}; expected one of {list(_VALID_OFFTOPIC_METHODS)}"
+        )
+    if requested == "source" and not have_source:
+        raise ValueError("method=source requires source_audio or source_transcript")
+    return requested
+
+
+def _classify_source_path(
+    req: DetectOfftopicRequest,
+    progress: Progress,
+    *,
+    client: Any,
+    transcript_doc: dict[str, Any],
+    transcript_hash: str,
+) -> Any:
+    """Путь по исходнику: получить транскрипт исходника и классифицировать.
+
+    Транскрипция исходника — единственная долгая стадия здесь (минуты GPU/CPU),
+    поэтому прогресс GigaAM пробрасываем в джоб-progress, иначе UI выглядит
+    зависшим. Готовый source_transcript эту стадию пропускает.
+    """
+    from ..llm_offtopic import classify_with_source
+    from ..llm_offtopic.source import DEFAULT_SOURCE_MODEL, SourceError, transcribe_source
+
+    if req.source_transcript:
+        progress.emit("read_source", 12.0, "read source transcript")
+        src_path = Path(req.source_transcript)
+        if not src_path.exists():
+            raise ValueError(f"source transcript not found: {src_path}")
+        source_doc = read_json(src_path)
+        source_hash: str | None = file_content_hash(src_path)
+        # Чем распознан готовый транскрипт — не знаем; сохраняем, что передали.
+        source_model = req.source_model
+    else:
+        src_model = req.source_model or DEFAULT_SOURCE_MODEL
+        src_device = req.source_device or "cpu"
+        workdir = Path(req.decisions).resolve().parent
+
+        def _tick(fraction: float, message: str = "") -> None:
+            # 10..70% джобы — на распознавание исходника.
+            progress.emit(
+                "transcribe_source",
+                10.0 + max(0.0, min(1.0, fraction)) * 60.0,
+                message or "распознаю исходник",
+            )
+
+        try:
+            src = transcribe_source(
+                req.source_audio,
+                workdir,
+                model_name=src_model,
+                device=src_device,
+                on_progress=_tick,
+            )
+        except SourceError as exc:
+            # Внятная причина (ссылка вместо файла, пустой ASR) — наружу как ValueError.
+            raise ValueError(f"source transcription failed: {exc}") from exc
+        source_doc = src.transcript
+        source_hash = src.key
+        source_model = src_model
+
+    progress.emit("classify", 72.0, f"classify offtopic (source) via {client.provider.id}")
+    return classify_with_source(
+        transcript_doc,
+        source_doc,
+        client=client,
+        model=req.model,
+        transcript_hash=transcript_hash,
+        source_transcript_hash=source_hash,
+        source_model=source_model,
+    )
+
+
+async def run_detect_offtopic_job(
+    store: JobStore, state: JobState, req: DetectOfftopicRequest
+) -> None:
+    from ..logging_setup import job_file_log
+
+    progress = Progress(store, state)
+    state.status = JobStatus.RUNNING
+    progress.emit("init", 0.0, "starting detect-offtopic")
+    # Лог джобы лежит рядом с её decisions.json. Классификатор пишет туда тему
+    # каждого чанка и каждое окно, оставшееся без вердикта; без файла эти записи
+    # в серверном процессе просто исчезали.
+    workdir = Path(req.decisions).resolve().parent
+    with job_file_log(workdir, name=f"offtopic_{state.id}") as log_path:
+        if log_path is not None:
+            logger.info("detect_offtopic job %s → log %s", state.id, log_path)
+        try:
+            result = await asyncio.to_thread(_run_detect_offtopic_sync, req, progress)
+            if log_path is not None:
+                # Путь в result — чтобы UI мог открыть лог прогона, а не искать его.
+                result["log"] = str(log_path)
+            _finalize(store, state, JobStatus.DONE, result=result)
+        except asyncio.CancelledError:
+            _finalize(store, state, JobStatus.CANCELLED, error="cancelled by user")
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # Логируем тип+сообщение исключения. Секрет в них не попадает: LLMClient
+            # не кладёт ключ в текст ошибок (см. llm_offtopic.client).
+            logger.exception("detect_offtopic job failed")
+            _finalize(store, state, JobStatus.FAILED, error=f"{type(exc).__name__}: {exc}")

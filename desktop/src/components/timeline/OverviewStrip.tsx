@@ -1,5 +1,6 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import { cn } from "../../lib/cn";
+import { drawWaveTile, SHOW_RMS_CORE, type WaveTile } from "./waveTile";
 
 /**
  * OverviewStrip — обзорная полоса всей записи (архетип «Overview» из
@@ -24,7 +25,13 @@ export interface OverviewMarker {
 
 export interface OverviewStripProps {
   durationS: number;
-  peaks: number[];
+  /**
+   * ВСЕГДА базовый тайл (весь стрим). Мини-карта не зумится, поэтому крошку
+   * видимого окна ей подгружать незачем — она показывает целое.
+   */
+  tile: WaveTile;
+  /** Глобальная нормировка амплитуды — та же, что у главного канваса. */
+  norm: number;
   markers: OverviewMarker[];
   currentS?: number;
   currentRef?: React.MutableRefObject<number>;
@@ -40,7 +47,8 @@ const VBH = 56;
 
 function OverviewStripImpl({
   durationS,
-  peaks,
+  tile,
+  norm,
   markers,
   currentS,
   currentRef,
@@ -52,31 +60,10 @@ function OverviewStripImpl({
   const dur = Math.max(durationS, 0.001);
   const timeToX = (t: number) => (t / dur) * VBW;
 
-  // Даунсэмпл peaks до ~500 столбиков — плотнее глаз не различает на этой ширине.
-  const bars = useMemo(() => {
-    if (!peaks.length) return [];
-    const N = Math.min(500, peaks.length);
-    const step = peaks.length / N;
-    const out: number[] = [];
-    for (let i = 0; i < N; i++) {
-      // max по окну — сохраняем пики, а не среднее (иначе волна «проваливается»).
-      let m = 0;
-      const from = Math.floor(i * step);
-      const to = Math.floor((i + 1) * step);
-      for (let j = from; j < to && j < peaks.length; j++) {
-        const v = Math.abs(peaks[j]);
-        if (v > m) m = v;
-      }
-      out.push(m);
-    }
-    return out;
-  }, [peaks]);
-
-  const maxPeak = useMemo(() => bars.reduce((a, b) => Math.max(a, b), 0.0001), [bars]);
-
-  // Волну (500 столбиков) рисуем на <canvas>: как SVG-rect она реконсилилась на
-  // каждый зум-кадр рамки и на каждую правку мьюта. Canvas статичен — перерисов
-  // только при смене peaks/размера. Маркеры/рамка/плейхед остаются SVG.
+  // Волну рисуем на <canvas>: как SVG-rect она реконсилилась на каждый зум-кадр
+  // рамки и на каждую правку мьюта. Canvas статичен — перерисовка только при
+  // смене тайла/размера. Маркеры/рамка/плейхед остаются SVG.
+  // Даунсэмпл не нужен: drawWaveTile сам агрегирует бакеты в столбик на пиксель.
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const boxRef = useRef<HTMLDivElement | null>(null);
   const drawWave = useCallback(() => {
@@ -97,17 +84,20 @@ function OverviewStripImpl({
     }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
-    if (!bars.length) return;
-    const bw = w / bars.length;
-    const barVis = Math.max(bw - 0.4 * (w / VBW), 0.4);
-    ctx.fillStyle = "rgba(148,163,184,0.4)";
-    ctx.beginPath();
-    for (let i = 0; i < bars.length; i++) {
-      const bh = (bars[i] / maxPeak) * (h - 8 * (h / VBH));
-      ctx.rect(i * bw, (h - bh) / 2, barVis, bh);
-    }
-    ctx.fill();
-  }, [bars, maxPeak]);
+    drawWaveTile(ctx, tile, {
+      w,
+      h,
+      viewStart: 0,
+      viewEnd: dur, // мини-карта всегда показывает целое
+      norm,
+      padPx: 4 * (h / VBH),
+      // Приглушённее главного канваса — обзорная полоса не должна перетягивать
+      // внимание. Ядро RMS, как и на главном канвасе, отключено.
+      contourColor: "rgba(139,153,173,0.55)",
+      coreColor: SHOW_RMS_CORE ? "rgba(181,195,214,0.6)" : undefined,
+      minHalfPx: 0.4,
+    });
+  }, [tile, norm, dur]);
 
   useLayoutEffect(() => {
     const box = boxRef.current;
@@ -152,7 +142,7 @@ function OverviewStripImpl({
     <div
       ref={boxRef}
       className={cn(
-        "relative block h-14 w-full overflow-hidden rounded-lg border border-white/8 bg-black/30",
+        "relative block h-14 w-full overflow-hidden rounded-lg border border-white/[0.08] bg-black/30",
         className
       )}
     >

@@ -273,6 +273,9 @@ def _project_meta(decisions_path: Path) -> Optional[dict[str, Any]]:
     return {
         "decisions_path": str(decisions_path),
         "name": decisions_path.stem or decisions_path.parent.name,
+        # Настоящий тайтл стрима, если фронт его сохранил (переименование по
+        # тумблеру во время детекта оффтопа). None → UI берёт имя папки vod_<id>.
+        "title": doc.get("title") if isinstance(doc.get("title"), str) else None,
         "workdir": workdir,
         "stream_path": stream_path,
         "updated_at_ms": int(stat.st_mtime * 1000),

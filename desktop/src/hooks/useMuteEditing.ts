@@ -1,19 +1,23 @@
 import { useCallback } from "react";
 import type { Undoable } from "./useUndoable";
-import {
-  snapToWordBoundary,
-  wordsInRange,
-  type WordIndex,
-} from "../lib/transcript";
+import { snapToWordBoundary, type WordIndex } from "../lib/transcript";
 import { KEPT, MIN_MUTE_S, SILENCED, type UiMute } from "../lib/mutes";
 
 /**
  * useMuteEditing — чистые правки списка заглушек поверх undoable-стора.
  *
- * Всё здесь — правки границ/статуса/слова-подписи ОДНОГО мьюта, без UI-побочек
- * (без выделения, центрирования окна, тостов — это оркестрирует экран). Слово-
- * подпись всегда пересчитывается из транскрипта по новым границам, чтобы
- * инспектор показывал реально накрытый текст.
+ * Всё здесь — правки границ/статуса ОДНОГО мьюта, без UI-побочек (без выделения,
+ * центрирования окна, тостов — это оркестрирует экран).
+ *
+ * Чего здесь НЕТ и быть не должно: правки `word`. `word` — то, что ПОЙМАЛ
+ * детектор (matched-токены), и сдвиг окна его не меняет. Раньше слово-подпись
+ * пересчитывалась из транскрипта на каждую правку границ, и человек, поправив
+ * окно, затирал слово детектора накрытым текстом («бля» → «с этим»). Затёртое
+ * уезжало в decisions.json, в журнал правок и в audit.md, где мьют уже назывался
+ * чужим словом, — то есть правка окна уничтожала единственную запись о том, что
+ * тут вообще нашли. Реально накрытый текст — величина ПРОИЗВОДНАЯ от границ и
+ * транскрипта, поэтому он не хранится, а считается при показе (MuteInspector,
+ * из тех же слов, что подсвечены красным).
  *
  * Координаты — ЛОКАЛЬНЫЕ секунды (как хранит UiMute). Индекс слов приходит
  * ref'ом: транскрипт грузится асинхронно и может смениться.
@@ -23,19 +27,12 @@ export interface MuteEditing {
   updateMute: (id: string, patch: Partial<UiMute>) => void;
   /** Переключить глушим/оставляем (снимает флаг review). */
   toggleMuted: (m: UiMute) => void;
-  /** Клик по слову в транскрипте: снап границ к словам + пересчёт слова-подписи. */
+  /** Клик по слову в транскрипте: снап границ к границам слов. */
   adjustMute: (id: string, start: number, end: number) => void;
   /** Точный сдвиг границ на дельту (сек), БЕЗ снапа — для кнопок −0.1/+0.1с. */
   nudgeMute: (id: string, dStart: number, dEnd: number) => void;
   /** Свободная правка границ ТОЧНО как задал пользователь (драг по волне), БЕЗ снапа. */
   adjustMuteFree: (id: string, start: number, end: number) => void;
-}
-
-function coveredWord(idx: WordIndex, s: number, e: number): string {
-  return wordsInRange(idx, s, e)
-    .map((w) => w.word)
-    .join(" ")
-    .trim();
 }
 
 export function useMuteEditing(
@@ -62,8 +59,7 @@ export function useMuteEditing(
       const s = snapToWordBoundary(idx, start);
       const e = snapToWordBoundary(idx, end);
       if (e - s < MIN_MUTE_S) return; // защита от схлопывания
-      const covered = coveredWord(idx, s, e);
-      updateMute(id, { start: s, end: e, word: covered || undefined });
+      updateMute(id, { start: s, end: e });
     },
     [updateMute, wordIndexRef]
   );
@@ -72,7 +68,6 @@ export function useMuteEditing(
     (id: string, dStart: number, dEnd: number) => {
       const m = store.present.find((x) => x.id === id);
       if (!m) return;
-      const idx = wordIndexRef.current;
       let s = Math.max(0, m.start + dStart);
       let e = m.end + dEnd;
       if (e - s < MIN_MUTE_S) {
@@ -80,22 +75,19 @@ export function useMuteEditing(
         if (dEnd !== 0) e = s + MIN_MUTE_S;
         else s = e - MIN_MUTE_S;
       }
-      const covered = coveredWord(idx, s, e);
-      updateMute(id, { start: s, end: e, word: covered || undefined });
+      updateMute(id, { start: s, end: e });
     },
-    [store, updateMute, wordIndexRef]
+    [store, updateMute]
   );
 
   const adjustMuteFree = useCallback(
     (id: string, start: number, end: number) => {
-      const idx = wordIndexRef.current;
       let s = Math.max(0, start);
       let e = end;
       if (e - s < MIN_MUTE_S) e = s + MIN_MUTE_S;
-      const covered = coveredWord(idx, s, e);
-      updateMute(id, { start: s, end: e, word: covered || undefined });
+      updateMute(id, { start: s, end: e });
     },
-    [updateMute, wordIndexRef]
+    [updateMute]
   );
 
   return { updateMute, toggleMuted, adjustMute, nudgeMute, adjustMuteFree };

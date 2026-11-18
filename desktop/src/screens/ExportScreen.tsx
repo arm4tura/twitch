@@ -1,10 +1,11 @@
+import { SourcePoster } from "../components/SourcePoster";
+import { mergeIntervals } from "../lib/intervals";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Download,
   FileCode2,
   FolderOpen,
   Loader2,
-  Send,
   Sparkles,
   Video,
 } from "lucide-react";
@@ -35,7 +36,7 @@ import { fmtMs, parseTimecode } from "../lib/format";
  * заглушки + опц. тишину).
  *
  * Нарезка на клипы и весь NotebookLM-конвейер переехали в отдельную вкладку
- * «AI Tiktok» (AiTiktokScreen) — здесь остаётся только напоминание-ссылка.
+ * «Клипы» (AiTiktokScreen) — здесь остаётся только напоминание-ссылка.
  *
  * Каждая карточка — самодостаточная форма: поля пути, «Запустить», после
  * успешного создания job'а — toast с «Показать» через `showInFolder` IPC.
@@ -62,6 +63,13 @@ interface Summary {
    * «я всё сделал в Правке — просто вырежи это», без повторного детекта.
    */
   savedSilenceSegments: [number, number][];
+  /**
+   * Оффтоп-сегменты, принятые (status=accepted) при детекте/ревью оффтопа, в
+   * АБСОЛЮТНЫХ (stream) секундах. Оффтоп несёт обе координаты (stream_*_s +
+   * локальные start_s/end_s) — рендер режет исходник, поэтому берём абсолютные.
+   * Ровно то, что превью в «Правке» уже проигрывало как вырезанное.
+   */
+  savedOfftopicSegments: [number, number][];
   /**
    * Диапазон обработки (range_in/range_out) в АБСОЛЮТНЫХ секундах исходника,
    * либо null если границы нет (обрабатывали весь файл). Рендер обрежет вывод
@@ -131,6 +139,29 @@ function extractSummary(doc: any): Summary {
     .filter(([s, e]) => e > s)
     .sort((a, b) => a[0] - b[0]);
 
+  // Оффтоп: bundle {segments:[...]} (см. llm_offtopic/merger.py). Каждый сегмент
+  // несёт локальные start_s/end_s (от range_in) И абсолютные stream_*_s (их
+  // проставляет merger.stream_offset и пересчитывает save в «Правке»). Рендер
+  // режет исходный stream → берём абсолютные; если их нет (старый файл) —
+  // локальные + тот же offset, что и для тишины. Только accepted — rejected
+  // оффтоп в «Правке» показан, но не вырезается.
+  const rawOfftopic: any[] = Array.isArray(doc?.offtopic?.segments)
+    ? doc.offtopic.segments
+    : [];
+  const savedOfftopicSegments = rawOfftopic
+    .filter((o) => o?.status === "accepted")
+    .map((o): [number, number] => {
+      const st = Number.isFinite(o.stream_start_s)
+        ? Number(o.stream_start_s)
+        : (Number(o.start_s) || 0) + offset;
+      const en = Number.isFinite(o.stream_end_s)
+        ? Number(o.stream_end_s)
+        : (Number(o.end_s) || 0) + offset;
+      return [Math.round(st * 1000) / 1000, Math.round(en * 1000) / 1000];
+    })
+    .filter(([s, e]) => e > s)
+    .sort((a, b) => a[0] - b[0]);
+
   // Диапазон обработки: range_in/range_out хранятся таймкодами ("HH:MM:SS.mmm")
   // в АБСОЛЮТНЫХ секундах исходника. Рендер обрежет вывод по этому окну.
   // parseTimecode → мс|null; null-граница = «без ограничения» с этой стороны.
@@ -167,6 +198,7 @@ function extractSummary(doc: any): Summary {
       null,
     mutedSegments,
     savedSilenceSegments,
+    savedOfftopicSegments,
     rangeStartS,
     rangeEndS,
   };
@@ -185,6 +217,7 @@ function fmtS(secs: number): string {
 }
 
 export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps) {
+  const [format, setFormat] = useState<"vegas" | "mp4">("mp4");
   const [form, setForm] = useState<FormState>(loadForm);
   const [summary, setSummary] = useState<Summary | null>(null);
   const [loadingSummary, setLoadingSummary] = useState(false);
@@ -192,12 +225,18 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
 
   // --- рендер + удаление тишины ---------------------------------------------
   const [removeSilence, setRemoveSilence] = useState(false);
+  // Вырезать оффтоп, принятый в «Правке». Как и тишину — включаем по умолчанию,
+  // если в проекте есть accepted-оффтоп (иначе разметка молча пропала бы), но
+  // даём снять галочку. Отдельного детекта тут нет: оффтоп размечается в «Правке».
+  const [removeOfftopic, setRemoveOfftopic] = useState(false);
   // Пресет скорость↔качество энкодера. balanced по умолчанию — как на бэке.
   const [quality, setQuality] = useState<"fast" | "balanced" | "max">("balanced");
   // Однократно включаем «удалить тишину», если в проекте уже есть размеченная
   // в «Правке» тишина — иначе труд пользователя молча проигнорировался бы.
   // Гвард по decisionsPath, чтобы не перебивать ручное снятие галочки.
   const autoSilenceRef = useRef<string | null>(null);
+  // То же для оффтопа — авто-галочка один раз на проект (см. autoSilenceRef).
+  const autoOfftopicRef = useRef<string | null>(null);
   // job'ы рендера/детекта отслеживаем ЛОКАЛЬНО (нужен прогресс прямо в карточке),
   // а не только через глобальный onJobStarted — детект→рендер это два шага.
   const [silenceJobId, setSilenceJobId] = useState<string | null>(null);
@@ -275,6 +314,15 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
     if (summary.savedSilenceSegments.length > 0) setRemoveSilence(true);
   }, [summary, decisionsPath]);
 
+  // Есть принятый в «Правке» оффтоп → включаем «удалить оффтоп» по умолчанию
+  // (один раз на проект). Пользователь может снять галочку — повторно не жмём.
+  useEffect(() => {
+    if (!summary) return;
+    if (autoOfftopicRef.current === decisionsPath) return;
+    autoOfftopicRef.current = decisionsPath;
+    if (summary.savedOfftopicSegments.length > 0) setRemoveOfftopic(true);
+  }, [summary, decisionsPath]);
+
   // Дефолтные пути в save-dialog'ах — рядом с decisions.json. Разделитель
   // угадываем по самому пути, чтобы работало и на Windows, и на POSIX.
   const { sep, dirOf } = useMemo(() => {
@@ -291,6 +339,10 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
   // сохранённой тишины, либо пользователь хочет перепроверить с нуля).
   const hasSavedSilence = (summary?.savedSilenceSegments.length ?? 0) > 0;
 
+  // Оффтоп размечается только в «Правке» (детекта оффтопа тут нет), поэтому
+  // единственный источник — сохранённые accepted-сегменты.
+  const hasSavedOfftopic = (summary?.savedOfftopicSegments.length ?? 0) > 0;
+
   // Итоговая тишина на вырезание: сохранённая из Правки ИЛИ (фолбэк) детект.
   const silenceSegments = useMemo<[number, number][]>(() => {
     if (!removeSilence) return [];
@@ -298,13 +350,27 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
     return silenceResult ? silenceResult.segments : [];
   }, [removeSilence, hasSavedSilence, summary, silenceResult]);
 
-  // Финальный список сегментов на вырезание: заглушки + (опц.) тишина.
-  // Сортируем по началу — render_video ожидает упорядоченные непересекающиеся
-  // интервалы (бэкенд их валидирует, но клиенту дешевле отдать сразу чистые).
+  // Оффтоп на вырезание — только если включена галочка и он есть в проекте.
+  const offtopicSegments = useMemo<[number, number][]>(() => {
+    if (!removeOfftopic || !hasSavedOfftopic) return [];
+    return summary!.savedOfftopicSegments;
+  }, [removeOfftopic, hasSavedOfftopic, summary]);
+
+  // Маты НЕ вырезаем, а ГЛУШИМ: звук в ноль, кадры остаются (segments_to_mute).
+  // Это основная задача проекта — всегда включены, отдельной галочки нет.
+  // В превью «Правки» и в Vegas-экспорте мат тоже глушится, не режется —
+  // финальный рендер теперь ведёт себя так же.
+  const muteAudioSegments = useMemo<[number, number][]>(
+    () => summary?.mutedSegments ?? [],
+    [summary]
+  );
+
+  // Финальный список на ВЫРЕЗАНИЕ (кадры уходят): (опц.) тишина + (опц.) оффтоп.
+  // Маты сюда НЕ входят — они глушатся, а не режутся. Сортируем по началу;
+  // перекрытия склеиваем и для рендера, и для точной сводки длительности.
   const renderSegments = useMemo<[number, number][]>(() => {
-    const base = summary?.mutedSegments ?? [];
-    return [...base, ...silenceSegments].sort((a, b) => a[0] - b[0]);
-  }, [summary, silenceSegments]);
+    return mergeIntervals([...silenceSegments, ...offtopicSegments]);
+  }, [silenceSegments, offtopicSegments]);
 
   // Что останется в итоге. При заданном диапазоне база — длина окна
   // (range_out−range_in), иначе неизвестна (весь файл) → null, не показываем.
@@ -402,8 +468,8 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
       toast.error("Укажи, куда сохранить итоговое видео");
       return;
     }
-    if (renderSegments.length === 0) {
-      toast.error("Нет сегментов на вырезание — ни заглушек, ни тишины");
+    if (renderSegments.length === 0 && muteAudioSegments.length === 0) {
+      toast.error("Нечего делать — ни матов на заглушку, ни тишины, ни оффтопа");
       return;
     }
     setRenderDone(null);
@@ -414,6 +480,7 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
         input_path: summary.stream,
         output_path: form.renderOutputPath,
         segments_to_remove: renderSegments,
+        segments_to_mute: muteAudioSegments,
         quality,
         range_start: summary.rangeStartS,
         range_end: summary.rangeEndS,
@@ -429,17 +496,13 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
   };
 
   return (
-    <div className="mx-auto max-w-6xl space-y-6 p-8">
+    <div className="screen-page export-page space-y-5">
       <header className="space-y-1">
-        <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-wider text-subtle">
-          <Send className="h-3.5 w-3.5" /> Экспорт
-        </div>
         <h1 className="text-2xl font-semibold tracking-tight text-fg">
           Выгрузка проекта
         </h1>
         <p className="max-w-2xl text-sm text-muted">
-          Соберите скрипт для Sony Vegas Pro — это перенесёт все заглушенные
-          места прямо на таймлайн. Либо соберите финальное видео здесь же.
+          Выберите формат и параметры готовой записи.
         </p>
       </header>
 
@@ -448,11 +511,11 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
           <div className="text-[11px] uppercase tracking-wider text-subtle">
             Источник
           </div>
-          <div className="truncate font-mono text-xs text-fg">{decisionsPath}</div>
+          <div className="truncate text-sm text-fg" title={decisionsPath}>{(summary?.stream ?? decisionsPath).replace(/\\/g, "/").split("/").pop()}</div>
         </div>
         <div className="flex items-center gap-3 text-xs">
-          <Stat color="text-err" label="Мутов" value={summary?.mutes ?? "—"} />
-          <Stat color="text-warn" label="Вырезов" value={summary?.cuts ?? "—"} />
+          <Stat color="text-err" label="Мутов" value={summary ? muteAudioSegments.length : "—"} />
+          <Stat color="text-warn" label="Вырезов" value={summary ? renderSegments.length : "—"} />
           <Stat color="text-brand-from" label="Хайлайтов" value={summary?.highlights ?? "—"} />
         </div>
         {summary?.workdir && (
@@ -461,10 +524,10 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
             size="sm"
             onClick={async () => {
               const ok = await window.twitchCut.showInFolder(summary.workdir!);
-              if (!ok) toast.error("Не удалось открыть workdir");
+              if (!ok) toast.error("Не удалось открыть папку проекта");
             }}
           >
-            <FolderOpen className="h-3.5 w-3.5" /> Открыть workdir
+            <FolderOpen className="h-3.5 w-3.5" /> Папка проекта
           </Button>
         )}
         {loadingSummary && (
@@ -472,11 +535,18 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
         )}
       </Card>
 
+      <div className="export-workspace"><div className="export-main">
+      <div className="export-formats" role="group" aria-label="Формат экспорта">
+        <button type="button" aria-pressed={format === "vegas"} onClick={() => setFormat("vegas")}><strong>Скрипт Vegas Pro</strong><span>Разметка для дальнейшего монтажа · .cs</span></button>
+        <button type="button" aria-pressed={format === "mp4"} onClick={() => setFormat("mp4")}><strong>Видео MP4</strong><span>Готовая запись с заглушками и вырезами</span></button>
+      </div>
+      <div hidden={format !== "vegas"}>
+
       {/* Главное действие — скрипт для Vegas. На всю ширину, с крупной кнопкой. */}
       <Card
         variant="elevated"
         padding="lg"
-        className="flex flex-col gap-5 border-warn/20 md:flex-row md:items-center"
+        className="flex flex-col gap-5 border-white/10 md:flex-row md:items-center"
       >
         <div className="flex-1 space-y-3">
           <CardHead
@@ -509,19 +579,21 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
         </Button>
       </Card>
 
+      </div>
+      <div hidden={format !== "mp4"}>
       {/* Финальный рендер с опциональным удалением тишины */}
       <Card
         variant="elevated"
         padding="lg"
-        className="flex flex-col gap-5 border-green-500/20"
+        className="flex flex-col gap-5 border-white/10"
       >
-        <div className="space-y-4">
+        <div className="export-options">
           <CardHead
             icon={<Video className="h-4 w-4" />}
             gradient="from-green-500/25 to-green-500/0"
             iconColor="text-green-400"
             title="Финальный рендер"
-            desc="Вырезать заглушки и опционально тишину, смонтировать готовое видео."
+            desc="Заглушить мат (звук в ноль, кадры остаются), опционально вырезать тишину и оффтоп, смонтировать готовое видео."
           />
 
           {/* Опция: удалить тишину */}
@@ -594,6 +666,35 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
             </label>
           </div>
 
+          {/* Опция: удалить оффтоп. Источник — только разметка из «Правки»
+              (детекта оффтопа тут нет), поэтому блок показываем лишь когда в
+              проекте есть принятые оффтоп-сегменты. */}
+          {hasSavedOfftopic && (
+            <div className="rounded-lg bg-black/20 p-4">
+              <label className="flex cursor-pointer items-start gap-3">
+                <input
+                  type="checkbox"
+                  checked={removeOfftopic}
+                  onChange={(e) => setRemoveOfftopic(e.target.checked)}
+                  className="mt-0.5 h-4 w-4 rounded border-white/20 bg-black/30 text-primary focus:ring-2 focus:ring-primary focus:ring-offset-0"
+                />
+                <div className="flex-1">
+                  <span className="text-sm font-medium text-fg">Удалить оффтоп</span>
+                  <p className="mt-0.5 text-xs text-muted">
+                    Вырежем куски, принятые как оффтоп в «Правке». Отклонённые
+                    останутся в видео.
+                  </p>
+                  {removeOfftopic && (
+                    <div className="mt-2 rounded bg-violet-500/10 px-2 py-1.5 text-xs text-violet-200">
+                      Из «Правки»: {summary!.savedOfftopicSegments.length} сегментов ·{" "}
+                      {fmtMs(segmentsDurationMs(summary!.savedOfftopicSegments))} вырежем
+                    </div>
+                  )}
+                </div>
+              </label>
+            </div>
+          )}
+
           {/* Диапазон обработки: показываем, если range_out задан (не весь файл). */}
           {summary?.rangeEndS != null && (
             <div className="rounded-lg bg-blue-500/10 px-3 py-2 text-xs text-blue-200">
@@ -632,56 +733,9 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
             </div>
           </div>
 
-          {/* Итоговая статистика */}
-          <div className="rounded-lg bg-black/20 px-4 py-3">
-            <div className="flex items-baseline gap-2 text-xs text-muted">
-              <span>Заглушки:</span>
-              <span className="font-mono text-sm text-fg">
-                {summary?.mutedSegments.length ?? 0}
-              </span>
-              <span>·</span>
-              <span>{fmtMs(segmentsDurationMs(summary?.mutedSegments ?? []))}</span>
-            </div>
-            {removeSilence && silenceSegments.length > 0 && (
-              <div className="mt-1 flex items-baseline gap-2 text-xs text-muted">
-                <span>Тишина:</span>
-                <span className="font-mono text-sm text-amber-400">
-                  {silenceSegments.length}
-                </span>
-                <span>·</span>
-                <span>{fmtMs(segmentsDurationMs(silenceSegments))}</span>
-              </div>
-            )}
-            <div className="mt-2 flex items-baseline gap-2 border-t border-white/8 pt-2 text-xs font-semibold text-fg">
-              <span>Всего вырежем:</span>
-              <span className="font-mono text-sm">{renderSegments.length}</span>
-              <span>·</span>
-              <span>{fmtMs(segmentsDurationMs(renderSegments))}</span>
-            </div>
-            {keptDurationMs != null && (
-              <div className="mt-1 flex items-baseline gap-2 text-xs text-green-300">
-                <span>Останется:</span>
-                <span className="font-mono text-sm">≈{fmtMs(keptDurationMs)}</span>
-              </div>
-            )}
-          </div>
-
-          {/* Путь выхода */}
-          <div className="space-y-2">
-            <Label eyebrow>Итоговое видео</Label>
-            <FileField
-              kind="save"
-              value={form.renderOutputPath}
-              onChange={(v) => setF("renderOutputPath", v)}
-              defaultPath={renderDefault}
-              filters={[
-                { name: "MP4 video", extensions: ["mp4"] },
-                { name: "Все", extensions: ["*"] },
-              ]}
-              placeholder="…/render.mp4"
-            />
-          </div>
-
+          {/* Итоговая статистика. Два РАЗНЫХ действия: ВЫРЕЗАЕМ (тишина+оффтоп —
+              кадры уходят, длительность сокращается) и ЗАГЛУШАЕМ (мат — звук в
+              ноль, кадры остаются). Мат вне суммы «вырежем». */}
           {/* Прогресс рендера */}
           {renderJob.state?.status === "running" && (
             <div className="flex items-center gap-2 rounded-lg bg-green-500/10 px-3 py-2 text-xs text-green-200">
@@ -701,6 +755,46 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
           )}
         </div>
 
+
+      </Card>
+
+      </div>
+
+      </div>
+      <aside className="export-summary" aria-label="Сводка экспорта">
+        <SourcePoster key={summary?.stream} path={summary?.stream} />
+        <div className="p-4">
+          <h2 className="text-sm font-semibold">{format === "mp4" ? "Итоговое видео" : "Разметка для Vegas"}</h2>
+          <p className="mt-1 text-xs text-muted">Кадр исходной записи</p>
+          <dl className="detail-facts">
+            <div><dt>Формат</dt><dd>{format === "mp4" ? "MP4" : "Скрипт .cs"}</dd></div>
+            <div><dt>Заглушки</dt><dd>{summary ? muteAudioSegments.length : "—"}</dd></div>
+            {format === "mp4" && <>
+              <div><dt>Вырезы</dt><dd>{renderSegments.length} · {fmtMs(segmentsDurationMs(renderSegments))}</dd></div>
+              <div><dt>Качество</dt><dd>{quality === "fast" ? "Быстро" : quality === "max" ? "Максимальное" : "Баланс"}</dd></div>
+              <div className="export-total"><dt>Длительность</dt><dd>{keptDurationMs != null ? `≈${fmtMs(keptDurationMs)}` : "Уточнится при рендере"}</dd></div>
+            </>}
+          </dl>
+          <p className="text-xs leading-relaxed text-muted">{format === "mp4" ? "Заглушки убирают звук, сохраняя кадры. Выбранные участки тишины и оффтопа вырезаются целиком." : "Откройте исходную запись в Vegas Pro и запустите сохранённый скрипт для переноса разметки."}</p>
+        </div>
+      </aside></div>
+      <footer className="export-footer" hidden={format !== "mp4"}>
+          {/* Путь выхода */}
+          <div className="space-y-2">
+            <Label eyebrow>Итоговое видео</Label>
+            <FileField
+              kind="save"
+              value={form.renderOutputPath}
+              onChange={(v) => setF("renderOutputPath", v)}
+              defaultPath={renderDefault}
+              filters={[
+                { name: "MP4 video", extensions: ["mp4"] },
+                { name: "Все", extensions: ["*"] },
+              ]}
+              placeholder="…/render.mp4"
+            />
+          </div>
+
         <Button
           size="lg"
           onClick={runRender}
@@ -708,27 +802,13 @@ export function ExportScreen({ decisionsPath, onJobStarted }: ExportScreenProps)
             !form.renderOutputPath ||
             renderRunning ||
             (removeSilence && !hasSavedSilence && !silenceResult) ||
-            renderSegments.length === 0
+            (renderSegments.length === 0 && muteAudioSegments.length === 0)
           }
           loading={busy === "render"}
         >
-          <Video className="h-4 w-4" /> Рендер
+          <Video className="h-4 w-4" /> Начать рендер
         </Button>
-      </Card>
-
-      {/* Нарезка на клипы и NotebookLM переехали во вкладку «AI Tiktok». */}
-      <Card variant="surface" padding="md" className="flex items-center gap-3">
-        <div className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-violet-500/25 to-violet-500/0 text-brand-from">
-          <Sparkles className="h-4 w-4" />
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="text-sm font-medium text-fg">Нарезка на клипы и хайлайты</div>
-          <div className="text-xs text-muted">
-            Сборка пакета NotebookLM, импорт моментов и нарезка коротких клипов теперь
-            во вкладке «AI Tiktok» слева.
-          </div>
-        </div>
-      </Card>
+      </footer>
     </div>
   );
 }
@@ -747,7 +827,7 @@ function CardHead({
   desc: string;
 }) {
   return (
-    <div>
+    <div className="export-card-heading">
       <div
         className={`mb-3 inline-flex h-9 w-9 items-center justify-center rounded-lg bg-gradient-to-br ${gradient} ${iconColor}`}
       >

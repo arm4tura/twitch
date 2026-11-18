@@ -34,8 +34,9 @@ from .settings import (
     save_settings as _save_settings,
     validate_settings as _validate_settings,
 )
-from .waveform import compute_waveform
+from .waveform import compute_waveform, compute_waveform_range
 from .runner import (
+    run_detect_offtopic_job,
     run_detect_silence_job,
     run_download_vod_job,
     run_export_vegas_highlights_job,
@@ -48,6 +49,7 @@ from .runner import (
 )
 from .schemas import (
     DecisionsPayload,
+    DetectOfftopicRequest,
     DetectSilenceRequest,
     DownloadVodRequest,
     ExportVegasHighlightsRequest,
@@ -58,6 +60,7 @@ from .schemas import (
     ProcessJobRequest,
     RenderHighlightsRequest,
     RenderRequest,
+    TestConnectionRequest,
 )
 from .state import JobKind, JobStore
 
@@ -107,6 +110,41 @@ def _authorize_data_path(path_str: str, *, must_exist: bool = True) -> Path:
     if not any(root in p.parents or root == p for root in allowed_roots):
         raise HTTPException(status_code=403, detail=f"path not authorized: {p}")
     return p
+
+
+def _previous_decisions(path: Path) -> dict[str, Any] | None:
+    """Что лежит в decisions.json прямо сейчас — для журнала правок.
+
+    Нужно ДО перезаписи. Журнал — необязательная диагностика, поэтому любая
+    проблема с чтением (нет файла, битый json) означает «сравнивать не с чем»,
+    а не ошибку сохранения.
+    """
+    if not _edit_journal_enabled():
+        return None
+    try:
+        data = read_json(path)
+    except Exception:  # noqa: BLE001
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _edit_journal_enabled() -> bool:
+    try:
+        return bool(_load_settings().get("edit_journal"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _journal_save(path: Path, doc: Any, previous: dict[str, Any] | None) -> None:
+    """Дописать журнал правок. НИКОГДА не мешает сохранению — только лог."""
+    if not isinstance(doc, dict) or not _edit_journal_enabled():
+        return
+    try:
+        from ..edit_journal import record_save
+
+        record_save(path, doc, previous)
+    except Exception:  # noqa: BLE001
+        logger.warning("edit journal write failed for %s", path, exc_info=True)
 
 
 def _extract_vod_id(raw: str) -> str:
@@ -259,6 +297,21 @@ def create_app(
         )
         return _state_to_response(state)
 
+    @app.post("/jobs/detect-offtopic", response_model=JobResponse)
+    async def create_detect_offtopic_job(req: DetectOfftopicRequest):
+        # Секрет (req.api_key) едет в теле по loopback, используется джобой
+        # транзитно и не персистится (см. runner._run_detect_offtopic_sync).
+        # Путь по исходнику читает локальный файл — заносим его в whitelist,
+        # как вход остальных джоб (resolve_source_path отвергает URL). Транскрипт
+        # стрима не whitelist'им: он берётся из decisions, не отдаётся в /media.
+        if req.source_audio:
+            app.state.store.allow_media(req.source_audio)
+        state = _spawn(
+            JobKind.DETECT_OFFTOPIC,
+            lambda s: run_detect_offtopic_job(app.state.store, s, req),
+        )
+        return _state_to_response(state)
+
     # --- VOD download (Twitch) ----------------------------------------------
 
     @app.get("/vod/info")
@@ -364,7 +417,13 @@ def create_app(
     async def write_decisions_endpoint(path: str = Query(...), payload: DecisionsPayload = Body(...)):
         p = _authorize_data_path(path, must_exist=False)
         p.parent.mkdir(parents=True, exist_ok=True)
+        # Читаем предыдущее состояние ДО записи: журнал правок сравнивает
+        # «что было на диске» с «что пришло». В сам документ ничего не
+        # добавляем — decisions.json должен остаться байт-в-байт тем, что
+        # прислал фронт (см. test_decisions_read_write_roundtrip).
+        previous = _previous_decisions(p)
         write_json(p, payload.decisions)
+        _journal_save(p, payload.decisions, previous)
         # Регистрируем в реестре Recent Projects — покрывает случай, когда
         # пользователь правит существующий decisions.json из UI (Timeline).
         try:
@@ -441,6 +500,56 @@ def create_app(
         _save_settings(validated)
         return {"ok": True}
 
+    # --- AI provider/template config (без секретов) -------------------------
+
+    @app.get("/ai/providers")
+    async def get_ai_providers():
+        """Встроенные пресеты + сохранённые пользовательские (из settings.json).
+
+        Секретов не содержит: провайдер хранит только api_key_ref (ссылку на
+        запись в safeStorage), не сам ключ.
+        """
+        from ..llm_offtopic import BUILTIN_PROVIDERS
+
+        builtins = [p.model_dump() for p in BUILTIN_PROVIDERS]
+        saved = _load_settings().get("ai_providers") or []
+        return {"builtin": builtins, "custom": saved}
+
+    @app.get("/ai/templates")
+    async def get_ai_templates():
+        """Встроенные шаблоны промптов + сохранённые пользовательские клоны."""
+        from ..llm_offtopic import BUILTIN_TEMPLATES
+
+        builtins = [t.model_dump() for t in BUILTIN_TEMPLATES]
+        saved = _load_settings().get("ai_templates") or []
+        return {"builtin": builtins, "custom": saved}
+
+    @app.post("/ai/test-connection")
+    async def test_ai_connection(req: TestConnectionRequest):
+        """Проверить доступность провайдера (лёгкий ping-запрос к LLM).
+
+        Синхронная проверка (не job): результат нужен UI сразу. Секрет
+        (req.api_key) используется транзитно и не персистится/не логируется.
+        Сетевой round-trip — в to_thread, чтобы не блокировать event-loop.
+        """
+        from ..llm_offtopic import AIProvider, LLMClient, builtin_provider
+
+        provider = builtin_provider(req.provider_id)
+        if provider is None:
+            if not req.provider:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"unknown provider_id={req.provider_id!r} and no custom `provider`",
+                )
+            try:
+                provider = AIProvider.model_validate(req.provider)
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(status_code=422, detail=f"invalid provider: {exc}")
+
+        client = LLMClient(provider, api_key=req.api_key)
+        ok, detail = await asyncio.to_thread(client.test_connection)
+        return {"ok": ok, "detail": detail}
+
     @app.get("/settings/logs_dir")
     async def get_logs_dir():
         """Путь к папке логов / конфига. Frontend показывает кнопку «Открыть»
@@ -506,6 +615,37 @@ def create_app(
         except Exception as exc:  # noqa: BLE001
             logger.exception("waveform failed for %s", resolved)
             raise HTTPException(status_code=500, detail=f"waveform failed: {exc}")
+
+    @app.get("/waveform/range")
+    async def get_waveform_range(
+        path: str = Query(..., description="Абсолютный путь к stream.mp4/mp3/wav"),
+        start: float = Query(..., ge=0.0, description="Начало окна, сек"),
+        end: float = Query(..., gt=0.0, description="Конец окна, сек"),
+        res: int = Query(2048, ge=64, le=8192, description="Бакетов в окне"),
+    ):
+        """Peaks ТОЛЬКО для видимого окна («слой детали», как в Audacity/Reaper).
+
+        НЕ кэшируется на диск: комбинаций (start, end, res) бесконечно, а декод
+        узкого слайса дешёвый (`-ss` до `-i`). Фронт кэширует тайлы в памяти.
+
+        Whitelist тот же, что у /waveform и /media — иначе левый сайт мог бы
+        снять peaks произвольного файла (peaks-инфа приватна).
+        """
+        allowed = app.state.store.allowed_media()
+        resolved = resolve_and_authorize(path, allowed)
+        if end <= start:
+            raise HTTPException(status_code=422, detail="end must be > start")
+        try:
+            return await asyncio.to_thread(
+                compute_waveform_range, resolved, start, end, res
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("waveform range failed for %s", resolved)
+            raise HTTPException(status_code=500, detail=f"waveform range failed: {exc}")
 
     @app.post("/waveform/allow")
     async def allow_media_path(payload: dict[str, Any] = Body(...)):

@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import { muteGainAt, type MuteRegion } from "../lib/muteGain";
 
 /**
  * useTimelinePlayback — весь аудио-плейбек экрана правки: скрытый <audio>,
@@ -7,11 +9,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
  *
  * Работает В АУДИО-КООРДИНАТАХ (секунды исходного <audio>). Конвертацию
  * локальное↔аудио делает вызывающий (useTimelineCoords) — сюда всё приходит
- * уже в аудио-секундах. `getMuteRegions` возвращает заглушённые участки в
- * аудио-координатах: их читаем на старте превью, чтобы глушить в реальном
- * времени. `getSkipRegions` (опц.) — ВЫРЕЗАННЫЕ участки (accepted silence): во
- * время непрерывного превью (playFrom) плейхед перепрыгивает их, чтобы звучало
- * ровно как финальный рендер.
+ * уже в аудио-секундах. `muteRegions` — заглушённые участки в аудио-координатах;
+ * список ЖИВОЙ (не снимок на момент старта), поэтому правка границы во время
+ * превью слышна сразу. `getSkipRegions` (опц.) — ВЫРЕЗАННЫЕ участки (accepted
+ * silence): во время непрерывного превью (playFrom) плейхед перепрыгивает их,
+ * чтобы звучало ровно как финальный рендер.
  *
  * Обработчики onTimeUpdate/onPause вешаются пропсами на сам <audio> в render —
  * см. audioProps. Раньше их вешали через addEventListener в useEffect, и
@@ -47,7 +49,7 @@ export interface TimelinePlayback {
 }
 
 export function useTimelinePlayback(
-  getMuteRegions: () => Array<[number, number]>,
+  muteRegions: readonly MuteRegion[],
   getSkipRegions?: () => Array<[number, number]>
 ): TimelinePlayback {
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -58,7 +60,16 @@ export function useTimelinePlayback(
   // выделение» — наоборот, играют оригинал, поэтому applyMutesRef там false.
   const rafRef = useRef<number | null>(null);
   const applyMutesRef = useRef(false);
-  const muteRegionsRef = useRef<Array<[number, number]>>([]);
+  // Окна для гейта — ЖИВЫЕ, а не снимок на момент play(). Со снимком правка
+  // границы во время превью не слышалась до перезапуска: гейт глушил по старым
+  // числам, а на волне уже была новая граница — и на слух это выглядело как
+  // «звук не совпадает с графиком». Сортировка нужна muteGainAt (ранний выход).
+  const sortedMuteRegions = useMemo(
+    () => [...muteRegions].sort((x, y) => x[0] - y[0]),
+    [muteRegions]
+  );
+  const muteRegionsRef = useRef<readonly MuteRegion[]>(sortedMuteRegions);
+  muteRegionsRef.current = sortedMuteRegions;
   // Пропуск вырезанных участков (accepted silence) при непрерывном превью: во
   // время playFrom rAF перепрыгивает currentTime через эти окна, чтобы звучало
   // «как в финальном рендере» — вырезанное не слышно вовсе (в отличие от mute,
@@ -120,7 +131,7 @@ export function useTimelinePlayback(
     skipTargetRef.current = null;
     if (el) {
       if (!el.paused) el.pause();
-      el.muted = false; // снять реалтайм-глушение
+      el.volume = 1; // снять реалтайм-глушение (рампу гейна)
       // Догнать throttled-стейт до финальной позиции: пока играли, текст
       // обновлялся ~15 Гц, на стопе он должен встать ровно.
       flushCurrentAudioS(el.currentTime);
@@ -130,9 +141,9 @@ export function useTimelinePlayback(
 
   /**
    * rAF-скан во время превью «как в экспорте»: чаще, чем timeupdate (~4 Гц),
-   * поэтому граница мьюта не «протекает». Глушит <audio>.muted, когда
-   * currentTime попадает в заглушённый участок, и снимает глушение вне их.
-   * Также двигает плейхед плавно и ловит стоп по playUntil.
+   * поэтому граница мьюта не «протекает». Ведёт <audio>.volume по кривой из
+   * muteGainAt (ноль внутри окна, рампы снаружи — см. lib/muteGain). Также
+   * двигает плейхед плавно и ловит стоп по playUntil.
    */
   const scanMutes = useCallback(() => {
     const el = audioRef.current;
@@ -159,14 +170,10 @@ export function useTimelinePlayback(
     }
     setCurrentAudioS(t);
     if (applyMutesRef.current) {
-      let inMute = false;
-      for (const [a, b] of muteRegionsRef.current) {
-        if (t >= a && t < b) {
-          inMute = true;
-          break;
-        }
-      }
-      if (el.muted !== inMute) el.muted = inMute;
+      // Окно [a,b) — ровно тишина, как в экспорте; рампы против щелчка лежат
+      // СНАРУЖИ окна (см. lib/muteGain — там же замер, почему не внутри).
+      const vol = muteGainAt(t, muteRegionsRef.current);
+      if (el.volume !== vol) el.volume = vol;
     }
     if (playUntilRef.current != null && t >= playUntilRef.current) {
       stopPlayback();
@@ -219,10 +226,18 @@ export function useTimelinePlayback(
       const until = aEnd + pad;
       el.currentTime = from;
       playUntilRef.current = until;
-      // Реалтайм-глушение: список заглушённых участков в audio-координатах.
+      // Реалтайм-глушение: сами окна гейт берёт из живого muteRegionsRef.
       applyMutesRef.current = applyMutes;
-      el.muted = false;
-      muteRegionsRef.current = applyMutes ? getMuteRegions() : [];
+      el.volume = 1;
+      // Превью КОНКРЕТНОГО окна («прослушать» мат/тишину/оффтоп) играет ровно
+      // [aStart,aEnd] — БЕЗ перепрыгивания вырезанных участков. Иначе, если сам
+      // сегмент accepted (а accepted-оффтоп/тишина попадают в getSkipRegions) и
+      // от прошлого playFrom остался включённым applySkipsRef, rAF молча
+      // перескочит именно тот кусок, который просили прослушать. Пропуск — только
+      // для непрерывного playFrom (пробел), поэтому здесь его гасим.
+      applySkipsRef.current = false;
+      skipRegionsRef.current = [];
+      skipTargetRef.current = null;
       // Точная страховка: timeupdate/rAF могут не совпасть с концом окна —
       // дублируем стоп таймером на длину окна (playbackRate = 1).
       if (stopTimerRef.current != null) window.clearTimeout(stopTimerRef.current);
@@ -238,7 +253,7 @@ export function useTimelinePlayback(
         /* автоплей может быть заблокирован до первого жеста — игнор */
       });
     },
-    [stopPlayback, scanMutes, getMuteRegions]
+    [stopPlayback, scanMutes]
   );
 
   /**
@@ -255,8 +270,7 @@ export function useTimelinePlayback(
       el.currentTime = Math.max(0, aStart);
       playUntilRef.current = null; // нет границы окна — играем до конца дорожки
       applyMutesRef.current = applyMutes;
-      el.muted = false;
-      muteRegionsRef.current = applyMutes ? getMuteRegions() : [];
+      el.volume = 1;
       // Пропуск вырезанных участков (accepted silence) — чтобы превью звучало
       // ровно как финальный рендер: вырезанное не проигрывается, а перепрыгивается.
       applySkipsRef.current = true;
@@ -274,7 +288,7 @@ export function useTimelinePlayback(
         /* автоплей может быть заблокирован до первого жеста — игнор */
       });
     },
-    [scanMutes, getMuteRegions]
+    [scanMutes]
   );
 
   const seekAudio = useCallback(
@@ -305,7 +319,7 @@ export function useTimelinePlayback(
         skipRegionsRef.current = [];
         skipTargetRef.current = null;
       }
-      el.muted = false;
+      el.volume = 1;
       el.currentTime = Math.max(0, audioT);
       // Seek в середину вырезанного куска (accepted silence) — приземлиться на его
       // конец, как если бы этот кусок уже был удалён в финальном видео. Берём

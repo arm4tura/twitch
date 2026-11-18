@@ -1,5 +1,6 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { cn } from "../../lib/cn";
+import { drawWaveTile, SHOW_RMS_CORE, type WaveTile } from "./waveTile";
 
 /**
  * TimelineCanvas — главный DAW-таймлайн всего стрима (архетип Vegas/Reaper).
@@ -34,7 +35,24 @@ export interface TimelineView {
 }
 
 export interface TimelineCanvasProps {
-  peaks: number[];
+  /**
+   * Данные волны для отрисовки — базовый слой (весь стрим) ИЛИ подгруженная
+   * крошка видимого окна. Родитель выбирает лучший доступный тайл (см.
+   * useWaveformTile), канвас просто рисует то, что дали.
+   */
+  tile: WaveTile;
+  /**
+   * Подложка — базовый слой (весь стрим). Рисуется под `tile` и ТОЛЬКО там, где
+   * тайл детали не покрывает окно: при резком пане это единственное, что видно
+   * в новом краю, пока не доехал фетч. null — подложка не нужна (tile и есть
+   * база).
+   */
+  underlay?: WaveTile | null;
+  /**
+   * Глобальная нормировка амплитуды (максимум по всему стриму). Всегда от
+   * БАЗОВОГО слоя: нормируй по тайлу — и волна «задышит» на каждой подгрузке.
+   */
+  norm: number;
   durationS: number;
   blocks: TimelineBlock[];
   view: TimelineView;
@@ -56,7 +74,6 @@ export interface TimelineCanvasProps {
 
 const VBW = 1000; // виртуальная ширина viewBox — SVG растянется по контейнеру
 const VBH = 220;
-const TARGET_BARS = 1200; // столбиков волны в видимом окне
 const MIN_SPAN = 0.4; // минимальная ширина окна зума, сек
 const MIN_DUR = 0.03; // минимальная длина блока, сек
 const HANDLE_HIT = 12; // ширина зоны захвата края, vb-единицы
@@ -75,7 +92,9 @@ interface DragState {
 }
 
 function TimelineCanvasImpl({
-  peaks,
+  tile,
+  underlay,
+  norm,
   durationS,
   blocks,
   view,
@@ -110,24 +129,10 @@ function TimelineCanvasImpl({
     [vStart, span]
   );
 
-  // Предрасчёт: |peaks| один раз + глобальный максимум. Раньше и то, и другое
-  // считалось на КАЖДОМ кадре зума внутри построения волны (Math.abs по всему
-  // массиву + аллокация slice) — на длинном стриме это и есть главный лаг.
-  // Теперь волна рисуется на <canvas> прямыми fillRect по этому массиву.
-  const { absPeaks, maxPeak } = useMemo(() => {
-    const arr = new Float32Array(peaks.length);
-    let m = 0.0001;
-    for (let i = 0; i < peaks.length; i++) {
-      const v = Math.abs(peaks[i]);
-      arr[i] = v;
-      if (v > m) m = v;
-    }
-    return { absPeaks: arr, maxPeak: m };
-  }, [peaks]);
-
   // --- волна на <canvas> ----------------------------------------------------
-  // fillRect в цикле на порядок дешевле, чем строить ~50 KB SVG <path> и заново
-  // тесселировать его каждый кадр. Canvas 2D одинаков в Chromium на Mac и Windows.
+  // Canvas, а не SVG: строить ~50 KB <path> и заново тесселировать его каждый
+  // кадр зума — главный источник лагов. Canvas 2D одинаков в Chromium на Mac и
+  // Windows. Сама отрисовка — в waveTile.ts (общая с OverviewStrip).
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const canvasBoxRef = useRef<HTMLDivElement | null>(null);
   const sizeRef = useRef({ w: 0, h: 0, dpr: 1 });
@@ -144,43 +149,36 @@ function TimelineCanvasImpl({
     // Центральная ось.
     ctx.fillStyle = "rgba(255,255,255,0.06)";
     ctx.fillRect(0, h / 2 - 0.5, w, 1);
-    const n = absPeaks.length;
-    if (!n) return;
-    const ve = vStart + span;
-    const cy = h / 2;
-    const amp = h - 24 * (h / VBH); // тот же запас сверху/снизу, что был в SVG
-    const bars = Math.max(1, Math.min(TARGET_BARS, Math.floor(w)));
-    const barW = w / bars;
-    const barVis = Math.max(barW * 0.8, 1);
-    const off = (barW - barVis) / 2;
-    const i0f = (vStart / dur) * n;
-    const i1f = (ve / dur) * n;
-    const sliceLen = Math.max(i1f - i0f, 1);
-    // Один path из всех столбиков, одна заливка — заметно дешевле, чем fillRect
-    // на каждый бар. Цвет в rgba(): canvas 2D не парсит CSS-Color-4 «/ alpha».
-    ctx.beginPath();
-    for (let i = 0; i < bars; i++) {
-      const p0 = i0f + (i / bars) * sliceLen;
-      const p1 = i0f + ((i + 1) / bars) * sliceLen;
-      const a = Math.floor(p0);
-      const b = Math.ceil(p1);
-      let v: number;
-      if (b - a <= 1) {
-        const f = p0 - a;
-        const v0 = absPeaks[Math.max(0, Math.min(a, n - 1))] ?? 0;
-        const v1 = absPeaks[Math.max(0, Math.min(a + 1, n - 1))] ?? v0;
-        v = v0 + (v1 - v0) * f;
-      } else {
-        let m = 0;
-        for (let j = Math.max(0, a); j < b && j < n; j++) if (absPeaks[j] > m) m = absPeaks[j];
-        v = m;
-      }
-      const bh = Math.max((v / maxPeak) * amp, 1.2);
-      ctx.rect(i * barW + off, cy - bh / 2, barVis, bh);
+    const viewEnd = vStart + span;
+    const common = {
+      w,
+      h,
+      viewStart: vStart,
+      viewEnd,
+      norm,
+      padPx: 24 * (h / VBH), // тот же запас сверху/снизу, что был в SVG
+      // Один тон: контур серый, ядро RMS отключено (см. SHOW_RMS_CORE) —
+      // светлая заливка внутри читалась как «белое пятно», а не как энергия.
+      contourColor: "rgba(139,153,173,0.9)",
+      coreColor: SHOW_RMS_CORE ? "rgba(181,195,214,0.95)" : undefined,
+      minHalfPx: 0.5,
+    };
+    // Подложка: грубая база рисуется ТОЛЬКО там, где деталь не покрывает окно.
+    // Без этого резкий пан за край подгруженного тайла откатывал всю волну к
+    // базе (жалоба «меняется на старую версию»); теперь грубым остаётся лишь
+    // тот край, куда данные ещё не доехали.
+    if (underlay && underlay !== tile) {
+      // tile без бакетов (заглушка до загрузки) ничего не рисует — тогда и
+      // вырезать под него нечего, иначе в подложке была бы дырка.
+      const clip = tile.max.length > 0;
+      drawWaveTile(ctx, underlay, {
+        ...common,
+        skipStart: clip ? tile.start : undefined,
+        skipEnd: clip ? tile.end : undefined,
+      });
     }
-    ctx.fillStyle = "rgba(148,163,184,0.5)";
-    ctx.fill();
-  }, [absPeaks, maxPeak, dur, vStart, span]);
+    drawWaveTile(ctx, tile, common);
+  }, [tile, underlay, norm, vStart, span]);
 
   // Ресайз canvas под контейнер (DPR-aware) + перерисовка. RO создаём один раз:
   // измерение и перерисовку зовём через ref, иначе смена drawWave на каждый
@@ -418,7 +416,7 @@ function TimelineCanvasImpl({
     <div
       ref={canvasBoxRef}
       className={cn(
-        "relative block h-full w-full overflow-hidden rounded-lg border border-white/8 bg-black/30",
+        "relative block h-full w-full overflow-hidden rounded-lg border border-white/[0.08] bg-black/30",
         className
       )}
     >

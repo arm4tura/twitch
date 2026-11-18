@@ -2,24 +2,19 @@ import { forwardRef, type HTMLAttributes } from "react";
 import { cva, type VariantProps } from "class-variance-authority";
 import { cn } from "../../lib/cn";
 
-/**
- * Card — базовая поверхность. Три уровня:
- * - surface: приглушённый zinc-900 фон, чуть светлее body.
- * - elevated: заметная тень + внутренний highlight, для CTA-карточек Dashboard.
- * - glass: полупрозрачный zinc + backdrop-blur, для sidebar / toolbar.
- */
+/** Flat workspace surfaces; variants retained for existing callers. */
 const cardStyles = cva("rounded-card border transition-colors", {
   variants: {
     variant: {
-      surface: "bg-surface/60 border-white/5",
-      elevated: "bg-surface border-white/[0.06] shadow-card",
-      glass: "bg-surface/40 border-white/5 backdrop-blur-xl",
+      surface: "bg-surface border-white/10",
+      elevated: "bg-surface border-white/10",
+      glass: "bg-surface border-white/10",
     },
     padding: {
       none: "p-0",
       sm: "p-3",
-      md: "p-5",
-      lg: "p-6",
+      md: "p-4",
+      lg: "p-5",
     },
   },
   defaultVariants: { variant: "surface", padding: "md" },

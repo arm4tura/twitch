@@ -8,6 +8,17 @@ name: Build desktop (Windows + macOS)
 #   - ручной запуск (workflow_dispatch) — собирает артефакты БЕЗ публикации,
 #     удобно проверить сборку, не создавая релиз.
 #
+# Бэкенд (Python) собирается PyInstaller'ом в самостоятельный каталог и едет
+# внутри установщика (backend/packaging/twitch-cut-backend.spec): ни Python,
+# ни torch пользователю ставить не нужно, при первом запуске докачиваются
+# только ONNX-модели. PyInstaller не умеет кросс-сборку, поэтому бэкенд под
+# каждую архитектуру собирается на раннере этой архитектуры:
+#   - Windows x64 — windows-latest;
+#   - macOS arm64 — macos-latest, macOS x64 — macos-15-intel.
+# Мак-бэкенды собираются отдельными джобами и сходятся в одну джобу
+# electron-builder (--arm64 --x64 за один вызов): так latest-mac.yml для
+# автообновления содержит обе архитектуры, а не ту, что залилась последней.
+#
 # Публикация идёт через electron-builder --publish, который читает секцию
 # build.publish (github / arm4tura / twitch) из desktop/package.json и заливает
 # артефакты в релиз, соответствующий тегу. Токен — штатный GITHUB_TOKEN,
@@ -35,13 +46,38 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
-    defaults:
-      run:
-        working-directory: desktop # весь Electron-проект живёт здесь
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-win.txt
+
+      # Окружение бэкенда: onnxruntime-directml, без torch.
+      - name: Install backend dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-win.txt
+          pip install -e . --no-deps
+          pip install "pyinstaller>=6.10,<7" "pytest==9.1.1" "httpx==0.28.1"
+
+      - name: Backend tests
+        working-directory: backend
+        run: python -m pytest -q
+
+      - name: Build backend (PyInstaller)
+        working-directory: backend
+        run: pyinstaller --noconfirm --clean --distpath dist/x64 packaging/twitch-cut-backend.spec
+
+      - name: Smoke-test backend
+        working-directory: backend
+        run: dist/x64/twitch-cut-backend/twitch-cut-backend.exe --help
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -51,6 +87,7 @@ jobs:
           cache-dependency-path: desktop/package-lock.json
 
       - name: Install dependencies
+        working-directory: desktop
         run: npm ci
 
       # Кладём бинарник TwitchDownloaderCLI в build/tdcli/win-x64 ДО electron-builder.
@@ -59,6 +96,7 @@ jobs:
       # иначе в установщик Windows downloader не попадёт (backend докачал бы на
       # первом запуске, но лучше сразу «из коробки»).
       - name: Prepare TwitchDownloaderCLI (win-x64)
+        working-directory: desktop
         run: npm run prepare-tdcli
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -67,13 +105,15 @@ jobs:
       # Ручной запуск → только собираем, не публикуем (--publish never).
       - name: Build & publish installer (on tag)
         if: startsWith(github.ref, 'refs/tags/v')
-        run: npm run build && npx electron-builder --win --publish always
+        working-directory: desktop
+        run: npm run build && npx electron-builder --win --x64 --publish always
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build installer only (manual run)
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        run: npm run build && npx electron-builder --win --publish never
+        working-directory: desktop
+        run: npm run build && npx electron-builder --win --x64 --publish never
 
       # Всегда прикладываем установщик как artifact — можно скачать со страницы
       # запуска даже при ручном прогоне без релиза.
@@ -86,7 +126,61 @@ jobs:
             desktop/release/latest.yml
           if-no-files-found: error
 
+  backend-macos:
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-latest
+          - arch: x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-mac.txt
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-mac.txt
+          pip install -e . --no-deps
+          pip install "pyinstaller>=6.10,<7" "pytest==9.1.1" "httpx==0.28.1"
+
+      - name: Backend tests
+        working-directory: backend
+        run: python -m pytest -q
+
+      - name: Build backend (PyInstaller)
+        working-directory: backend
+        run: pyinstaller --noconfirm --clean --distpath dist/${{ matrix.arch }} packaging/twitch-cut-backend.spec
+
+      - name: Smoke-test backend
+        working-directory: backend
+        run: dist/${{ matrix.arch }}/twitch-cut-backend/twitch-cut-backend --help
+
+      # tar, а не каталог: upload-artifact теряет права на исполнение.
+      - name: Pack backend
+        working-directory: backend
+        run: tar czf backend-macos-${{ matrix.arch }}.tgz -C dist/${{ matrix.arch }} twitch-cut-backend
+
+      - name: Upload backend
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-macos-${{ matrix.arch }}
+          path: backend/backend-macos-${{ matrix.arch }}.tgz
+          if-no-files-found: error
+
   build-macos:
+    needs: backend-macos
     runs-on: macos-latest
     defaults:
       run:
@@ -95,6 +189,21 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Download backends
+        uses: actions/download-artifact@v4
+        with:
+          pattern: backend-macos-*
+          path: backend-artifacts
+          merge-multiple: true
+
+      - name: Unpack backends
+        working-directory: .
+        run: |
+          for arch in arm64 x64; do
+            mkdir -p backend/dist/$arch
+            tar xzf backend-artifacts/backend-macos-$arch.tgz -C backend/dist/$arch
+          done
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -120,13 +229,13 @@ jobs:
       # так что windows- и macos-джобы мирно кладут артефакты рядом.
       - name: Build & publish dmg (on tag)
         if: startsWith(github.ref, 'refs/tags/v')
-        run: npm run build && npx electron-builder --mac --publish always
+        run: npm run build && npx electron-builder --mac --arm64 --x64 --publish always
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build dmg only (manual run)
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        run: npm run build && npx electron-builder --mac --publish never
+        run: npm run build && npx electron-builder --mac --arm64 --x64 --publish never
 
       - name: Upload dmg artifact
         uses: actions/upload-artifact@v4

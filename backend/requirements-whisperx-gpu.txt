@@ -1,8 +1,11 @@
 # =============================================================================
-# GPU (NVIDIA CUDA 12.6) lock-файл для Windows/Linux.
+# НЕОБЯЗАТЕЛЬНЫЙ движок WhisperX: GPU (NVIDIA CUDA 12.6) lock для Windows/Linux.
 #
-# ПОЛНЫЙ снимок рабочей среды, сгенерирован из `pip freeze`. Ставится через:
-#   pip install -r requirements-gpu.txt
+# В сборку приложения НЕ входит: движок по умолчанию (GigaAM) работает через
+# onnxruntime без torch (requirements-win.txt / requirements-mac.txt). Этот
+# файл — прежний полный снимок torch-окружения, для разработчика, которому
+# нужен WhisperX на CUDA. Ставится через:
+#   pip install -r requirements-whisperx-gpu.txt
 #
 # Первая строка `--extra-index-url` заставляет pip брать torch+cu126 колёса
 # с PyTorch-индекса, а не CPU-версию с PyPI.

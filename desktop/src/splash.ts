@@ -49,9 +49,9 @@ function render(p: Progress): void {
     badgeEl.style.display = "inline-block";
     badgeEl.classList.remove("cpu");
     if (lastAccel === "cuda") {
-      badgeEl.textContent = "GPU (CUDA)";
+      badgeEl.textContent = "GPU";
     } else if (lastAccel === "mps") {
-      badgeEl.textContent = "GPU (Apple Metal)";
+      badgeEl.textContent = "Apple CoreML";
     } else {
       badgeEl.textContent = "CPU — медленнее";
       badgeEl.classList.add("cpu");

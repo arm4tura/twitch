@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { AppShell } from "./AppShell";
 import { DashboardScreen } from "./screens/DashboardScreen";
@@ -44,7 +44,17 @@ export function App() {
   // Dashboard-экран рендерит свои StatCard'ы из того же эндпоинта, но тянет
   // их независимо — badge важен даже когда пользователь на Timeline/Export.
   const [runningJobs, setRunningJobs] = useState(0);
+  // «Тяжёлая» обработка = всё, что перезаписывает decisions.json целиком
+  // (process/download/render/export). Только она блокирует «Правку»/«Экспорт».
+  // Детект оффтопа/тишины запускается ИЗ самой «Правки» — блокировать её им
+  // нельзя, иначе пользователь застревает (ушёл в TikTok — назад уже никак).
+  const [busy, setBusy] = useState(false);
   const timelineActions = useTimelineActions();
+  // Ручка «опросить /jobs прямо сейчас». Нужна, чтобы после финала джобы не
+  // ждать до 3с очередного тика: `busy` гасит «Правку»/«Экспорт», и без
+  // немедленного опроса вкладки оставались бы серыми ещё пару секунд после
+  // того, как обработка уже закончилась.
+  const refreshJobsRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -52,17 +62,25 @@ export function App() {
       try {
         const jobs = await listJobs();
         if (!alive) return;
-        setRunningJobs(
-          jobs.filter((j) => j.status === "running" || j.status === "pending").length
+        const running = jobs.filter(
+          (j) => j.status === "running" || j.status === "pending"
+        );
+        setRunningJobs(running.length);
+        setBusy(
+          running.some(
+            (j) => j.kind !== "detect_offtopic" && j.kind !== "detect_silence"
+          )
         );
       } catch {
         /* backend не готов — тихо, покажем при следующем тике */
       }
     };
+    refreshJobsRef.current = () => void tick();
     tick();
     const timer = window.setInterval(tick, 3000);
     return () => {
       alive = false;
+      refreshJobsRef.current = null;
       window.clearInterval(timer);
     };
   }, []);
@@ -99,6 +117,7 @@ export function App() {
         screen={screen}
         onNavigate={setScreen}
         runningJobs={runningJobs}
+        busy={busy}
         hasActiveJob={!!activeJobId}
         hasDecisions={!!decisionsPath}
       >
@@ -117,6 +136,7 @@ export function App() {
               <DashboardScreen
                 onNew={() => setScreen("new")}
                 onOpen={(path) => goToTimeline(path)}
+                onExport={(path) => { setDecisionsPath(path); setScreen("export"); }}
               />
             )}
             {screen === "new" && <NewJobScreen onJobStarted={goToJob} />}
@@ -124,6 +144,15 @@ export function App() {
               <JobScreen
                 jobId={activeJobId}
                 onDone={(p) => p && goToTimeline(p)}
+                // Джоба завершилась и оставила decisions.json — открываем
+                // «Правку»/«Экспорт» СРАЗУ, не дожидаясь клика по «Открыть
+                // таймлайн». Экран не переключаем: пользователь мог уйти на
+                // другую вкладку, дёргать его оттуда нельзя. Плюс немедленный
+                // re-poll /jobs, чтобы `busy` снялся сейчас, а не через 3с.
+                onReady={(p) => {
+                  setDecisionsPath(p);
+                  refreshJobsRef.current?.();
+                }}
                 // Цепочка джоб: download_vod по завершении сам стартует
                 // process-джобу и перецепляет экран на неё (один поток «скачал →
                 // обработал → таймлайн», ноль кликов). goToJob сбрасывает лог и

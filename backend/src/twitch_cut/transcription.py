@@ -34,6 +34,11 @@ def _stub_missing_speechbrain_optionals() -> None:
     Это универсальнее, чем стабить модули по именам поштучно: покрывает
     все нынешние и будущие проблемные интеграции сразу.
 
+    Обёртка при этом ОБЯЗАНА сохранять глубину стека оригинального
+    `__getattr__` (см. комментарий у `_safe_getattr` ниже) — иначе ломается
+    frame-based guard самого speechbrain и модули начинают импортироваться
+    прямо во время обхода `sys.modules`.
+
     Идемпотентно.
     """
     global _SPEECHBRAIN_K2_STUBBED
@@ -52,7 +57,28 @@ def _stub_missing_speechbrain_optionals() -> None:
         _SPEECHBRAIN_K2_STUBBED = True
         return
 
-    _original_getattr = LazyModule.__getattr__
+    # КРИТИЧНО: обёртка обязана вызывать self.ensure_module(1) НАПРЯМУЮ, а не
+    # оригинальный __getattr__. Внутри ensure_module speechbrain делает
+    # sys._getframe(stacklevel + 1) и, если вызывающий фрейм — stdlib inspect.py,
+    # поднимает AttributeError, чтобы НЕ выполнять ленивый импорт (защита ровно
+    # от того, что inspect.getmodule() перебирает sys.modules и дёргает __file__
+    # у каждого). Вызов оригинального __getattr__ из обёртки добавляет лишний
+    # Python-фрейм, счёт _getframe съезжает, guard видит transcription.py вместо
+    # inspect.py и не срабатывает. Последствия: speechbrain реально импортирует
+    # модуль во время обхода стека (шумный deprecation-варнинг про
+    # speechbrain.pretrained), а в глубоком стеке getframeinfo → getmodule →
+    # снова __getattr__ по всем LazyModule даёт RecursionError.
+    # Наша функция ставится НА МЕСТО __getattr__, поэтому глубина фреймов при
+    # прямом вызове ensure_module(1) совпадает с оригинальной.
+    if not callable(getattr(LazyModule, "ensure_module", None)):
+        # Незнакомая версия speechbrain: не патчим вслепую, иначе рискуем
+        # сломать frame-based guard.
+        _SPEECHBRAIN_K2_STUBBED = True
+        logger.warning(
+            "speechbrain.LazyModule без ensure_module — патч пропущен "
+            "(проверьте совместимость версии speechbrain)"
+        )
+        return
 
     # Атрибуты, которые inspect / importlib / pickle трогают на любом модуле —
     # для них возвращаем безопасные заглушки, а не поднимаем ImportError.
@@ -63,7 +89,10 @@ def _stub_missing_speechbrain_optionals() -> None:
 
     def _safe_getattr(self, attr: str) -> Any:
         try:
-            return _original_getattr(self, attr)
+            # stacklevel=1 — ровно как в оригинальном LazyModule.__getattr__.
+            # AttributeError от inspect-guard пролетает наружу нетронутым:
+            # getattr(module, "__file__", None) снаружи вернёт дефолт.
+            return getattr(self.ensure_module(1), attr)
         except ImportError:
             # Ленивый импорт упал — optional-пакет не установлен.
             # Для attrs, которые нужны inspect/importlib, отдаём безопасные
@@ -85,27 +114,13 @@ def _stub_missing_speechbrain_optionals() -> None:
     LazyModule.__getattr__ = _safe_getattr  # type: ignore[assignment]
 
     # DeprecatedModuleRedirect наследуется от LazyModule и переопределяет
-    # ensure_module — но НЕ __getattr__ (он унаследован). Ловим на всякий случай
-    # если это когда-нибудь изменится.
+    # ensure_module — но НЕ __getattr__ (он унаследован, и наш патч на нём уже
+    # действует). Ловим на всякий случай, если это когда-нибудь изменится:
+    # _safe_getattr написан через self.ensure_module, поэтому корректно
+    # работает и для подкласса (его ensure_module сам добавляет stacklevel+1).
     Deprecated = getattr(_sb_importutils, "DeprecatedModuleRedirect", None)
     if Deprecated is not None and "__getattr__" in Deprecated.__dict__:
-        _dep_original = Deprecated.__getattr__
-
-        def _dep_safe(self, attr: str) -> Any:
-            try:
-                return _dep_original(self, attr)
-            except ImportError:
-                if attr == "__file__":
-                    return f"<lazy-stub:{self.target}>"
-                if attr == "__name__":
-                    return self.target
-                if attr in _SAFE_MODULE_ATTRS:
-                    return None
-                raise AttributeError(
-                    f"deprecated lazy module {self.target!r} could not be loaded"
-                )
-
-        Deprecated.__getattr__ = _dep_safe  # type: ignore[assignment]
+        Deprecated.__getattr__ = _safe_getattr  # type: ignore[assignment]
 
     _SPEECHBRAIN_K2_STUBBED = True
     logger.info(
@@ -388,10 +403,10 @@ def transcribe_audio(
         import whisperx  # type: ignore
     except ImportError as exc:
         raise RuntimeError(
-            "WhisperX не установлен. Установите зависимости из "
-            "requirements-gpu.txt (GPU) или requirements-mac.txt / "
-            "requirements-cpu-win.txt (CPU), либо используйте "
-            "--mock-transcript для smoke-теста."
+            "WhisperX не установлен: он больше не входит в сборку приложения "
+            "(тянет torch и CUDA на несколько гигабайт). Движок по умолчанию — "
+            "GigaAM, он работает без него. Для запуска из исходников WhisperX "
+            "ставится отдельно: pip install -e \".[whisperx]\"."
         ) from exc
 
     logger.info(

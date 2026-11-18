@@ -97,6 +97,8 @@ def _match_at(
     word_index: int | None = None,
     prev_end_ms: int | None = None,
     next_start_ms: int | None = None,
+    match_type: str = "surface",
+    needs_review: bool = False,
 ) -> ProfanityMatch:
     return ProfanityMatch(
         word=word,
@@ -110,8 +112,9 @@ def _match_at(
         stream_end_ms=end_ms,
         confidence=0.9,
         segment_id=segment_id,
-        match_type="surface",
+        match_type=match_type,
         timing_source="word",
+        needs_review=needs_review,
         prev_word_local_end_ms=prev_end_ms,
         prev_word_stream_end_ms=prev_end_ms,
         next_word_local_start_ms=next_start_ms,
@@ -187,6 +190,27 @@ def test_close_swears_in_one_outburst_stay_joined():
     assert doc["mutes"][0]["matched_token_count"] == 3
 
 
+def test_pause_between_adjacent_swears_splits_the_mute():
+    # Соседство по индексу слова НЕ значит «вплотную»: в паузе слов нет, поэтому
+    # индексы соседние даже через секунды тишины. На реальном стриме «блять»
+    # 337.806 (w898) и «блять» 341.488 (w899) слиплись в мьют длиной 4.1 с, а
+    # поджатие по звуку потом оставило только второе слово — первый мат остался
+    # слышен. Разрыв больше mute_join_gap_ms => две отдельные группы.
+    first = _match_at("блять", 337_806, 338_046, segment_id="seg_19", word_index=898)
+    second = _match_at("блять", 341_488, 341_769, segment_id="seg_19", word_index=899)
+    doc = build_decisions(
+        stream_path=Path("stream.mp4"),
+        original_path=Path("original.mp4"),
+        range_in=parse_timecode("00:00:00"),
+        range_out=parse_timecode("00:10:00"),
+        matches=[first, second],
+        config=PipelineConfig(mute_join_gap_ms=600),
+    )
+    mutes = doc["mutes"]
+    assert len(mutes) == 2
+    assert all(m["end"] - m["start"] < 1.0 for m in mutes)
+
+
 def test_broken_word_timing_is_capped_to_max_word_seconds():
     # whisper.cpp выдал слову 'блять' длительность 9.48с (end = конец
     # сегмента). В режиме 'word' хвост должен обрезаться до max_word_seconds.
@@ -202,3 +226,92 @@ def test_broken_word_timing_is_capped_to_max_word_seconds():
     mute = doc["mutes"][0]
     # start 1.0 - 0.08 padding = 0.92; конец = 1.0 + 1.5 + 0.12 padding = 2.62
     assert mute["end"] - mute["start"] < 2.0
+
+
+def _one_mute(matches):
+    doc = build_decisions(
+        stream_path=Path("stream.mp4"),
+        original_path=Path("original.mp4"),
+        range_in=parse_timecode("00:00:00"),
+        range_out=parse_timecode("00:10:00"),
+        matches=matches,
+        config=PipelineConfig(mute_join_gap_ms=600),
+    )
+    assert len(doc["mutes"]) == 1
+    return doc["mutes"][0]
+
+
+def _mute_with(cross_ms: int, *, padding_before_ms: int = 140):
+    """Один мьют на слове 5.000..5.300, у которого предыдущее слово кончается
+    РОВНО на его начале — типичная сетка ASR в связной речи."""
+    match = _match_at("блять", 5000, 5300, word_index=7, prev_end_ms=5000)
+    doc = build_decisions(
+        stream_path=Path("stream.mp4"),
+        original_path=Path("original.mp4"),
+        range_in=parse_timecode("00:00:00"),
+        range_out=parse_timecode("00:10:00"),
+        matches=[match],
+        config=PipelineConfig(
+            mute_padding_before_ms=padding_before_ms,
+            mute_head_cross_prev_ms=cross_ms,
+        ),
+    )
+    assert len(doc["mutes"]) == 1
+    return doc["mutes"][0]
+
+
+def test_neighbour_clamp_eats_head_padding_when_words_are_contiguous():
+    """Исходное поведение и причина ручки: сетка слов идёт вплотную, поэтому
+    клэмп по концу предыдущего слова съедает ВЕСЬ головной padding.
+
+    Это делало mute_padding_before_ms бездействующим ровно в связной речи —
+    именно там, где человек потом расширял голову руками (12 из 12 расширений на
+    vod_2847020280_20260817_2330)."""
+    mute = _mute_with(0)
+    assert mute["start"] == 5.0, "padding 140 мс схлопнулся в ноль — так и было"
+    assert mute["head_cross_ms"] == 0
+
+
+def test_head_padding_may_cross_into_previous_word_by_the_allowance():
+    """С допуском голова заходит на разметку соседа ровно на разрешённые мс."""
+    mute = _mute_with(100)
+    assert mute["start"] == 4.9
+    assert mute["head_cross_ms"] == 100
+
+
+def test_head_cross_never_exceeds_the_padding_itself():
+    """Допуск — это снятие клэмпа, а не второй padding: больше
+    mute_padding_before_ms голова не растёт даже при огромном допуске."""
+    mute = _mute_with(5000, padding_before_ms=140)
+    assert mute["start"] == 4.86
+    assert mute["head_cross_ms"] == 140
+
+
+def test_solid_match_next_to_soft_fragment_is_still_muted():
+    """Твёрдый матч в группе — мьют, даже если рядом мягкий обрубок.
+
+    Раньше статус решал any(needs_review), и на vod_2847020280 группа «бля» +
+    «ь» (surface + short_fragment) уходила в review — то есть мат оставался
+    слышен, пока человек не переключит статус руками. Янтарный флаг при этом
+    остаётся: 'accepted' + needs_review=True.
+    """
+    solid = _match_at("бля", 1000, 1200, word_index=5)
+    soft = _match_at(
+        "ь", 1250, 1350, word_index=6, match_type="short_fragment", needs_review=True
+    )
+    mute = _one_mute([solid, soft])
+    assert mute["matched_token_count"] == 2
+    assert mute["status"] == "accepted"
+    assert mute["needs_review"] is True
+    assert mute["match_type"] == "short_fragment+surface"
+
+
+def test_group_of_only_soft_fragments_goes_to_review():
+    """Обратная защита: группа, в которой кроме мягких матчей ничего нет, в
+    экспорт по умолчанию не идёт (это те самые ложные 'её/ей/бы')."""
+    soft = _match_at(
+        "ей", 1000, 1200, word_index=5, match_type="short_fragment", needs_review=True
+    )
+    mute = _one_mute([soft])
+    assert mute["status"] == "review"
+    assert mute["needs_review"] is True

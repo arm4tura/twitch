@@ -58,16 +58,16 @@ module.exports = {
         ],
       },
       borderRadius: {
-        card: "10px",
+        card: "6px",
       },
       boxShadow: {
         card:
-          "0 1px 0 rgb(255 255 255 / 0.03) inset, 0 20px 40px -20px rgb(0 0 0 / 0.6)",
-        glow: "0 0 0 1px rgb(139 92 246 / 0.5), 0 8px 24px -8px rgb(139 92 246 / 0.35)",
+          "none",
+        glow: "none",
       },
       backgroundImage: {
         brand:
-          "linear-gradient(135deg, rgb(var(--brand-from)) 0%, rgb(var(--brand-to)) 100%)",
+          "none",
         "top-glow":
           "linear-gradient(to bottom, rgb(255 255 255 / 0.08), rgb(255 255 255 / 0) 40%)",
       },
