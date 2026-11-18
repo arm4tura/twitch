@@ -129,7 +129,13 @@ def ensure_model(
 def _download(
     url: str, dest: Path, name: str, on_progress: Optional[DownloadProgressFn]
 ) -> None:
-    with urllib.request.urlopen(url, timeout=60) as response, dest.open("wb") as out:
+    # CA-bundle из certifi: собранный бэкенд на macOS системных сертификатов
+    # не видит (см. fetch_tdcli._ssl_context).
+    from .fetch_tdcli import _ssl_context
+
+    with urllib.request.urlopen(url, timeout=60, context=_ssl_context()) as response, dest.open(
+        "wb"
+    ) as out:
         total = int(response.headers.get("Content-Length") or 0)
         done = 0
         while True:

@@ -35,12 +35,18 @@ import {
 /**
  * Writable корень данных. В упакованном приложении сам код read-only
  * (внутри установки), поэтому модели/логи/настройки живут отдельно:
- *   - portable: папка <exe_dir>/TwitchCutter-Data, если она писабельна;
- *   - обычная установка: app.getPath("userData") (%APPDATA%\Twitch Cutter).
+ *   - portable (только Windows): папка <exe_dir>/TwitchCutter-Data, если она
+ *     писабельна;
+ *   - обычная установка: app.getPath("userData") (%APPDATA%\Twitch Cutter,
+ *     ~/Library/Application Support/Twitch Cut).
  * В dev (не упаковано) — тоже userData, чтобы отделить от исходников.
+ *
+ * На macOS портативного режима нет: exe лежит внутри .app, а /Applications
+ * для админа писабелен — данные уехали бы ВНУТРЬ бандла (ломает подпись и
+ * пропадают при первом же обновлении, которое заменяет .app целиком).
  */
 function resolveDataDir(): string {
-  if (app.isPackaged) {
+  if (app.isPackaged && process.platform === "win32") {
     const exeDir = path.dirname(app.getPath("exe"));
     const portable = path.join(exeDir, "TwitchCutter-Data");
     try {

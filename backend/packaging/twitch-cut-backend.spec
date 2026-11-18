@@ -45,6 +45,9 @@ datas += copy_metadata("pymorphy3")
 # Бандл-ffmpeg (imageio_ffmpeg/binaries/ffmpeg-*) — им режем, клеим и
 # извлекаем аудио.
 datas += collect_data_files("imageio_ffmpeg")
+# Корневые сертификаты для HTTPS (скачивание моделей и TwitchDownloaderCLI):
+# собранный Python на macOS системных сертификатов не видит.
+datas += collect_data_files("certifi")
 # Встроенный словарь мата (config.default_banwords_path ищет в sys._MEIPASS).
 for name in ("banwords.txt", "banwords.example.txt"):
     if (BACKEND / name).exists():
@@ -57,6 +60,7 @@ hiddenimports += collect_submodules("twitch_cut")
 # uvicorn выбирает реализацию цикла/протоколов по строке во время запуска.
 hiddenimports += collect_submodules("uvicorn")
 hiddenimports += collect_submodules("websockets")
+hiddenimports += ["certifi"]
 
 excludes = [
     # Тяжёлые пакеты, которых в рантайме быть не должно. Если они случайно

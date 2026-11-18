@@ -75,9 +75,17 @@ jobs:
         working-directory: backend
         run: pyinstaller --noconfirm --clean --distpath dist/x64 packaging/twitch-cut-backend.spec
 
+      # Как первый запуск у пользователя: собранный бэкенд сам качает модели
+      # из релиза (HTTPS, sha256) и поднимает ускоритель. Ловит забытые в
+      # сборке данные (сертификаты, словари) до того, как их найдёт пользователь.
       - name: Smoke-test backend
         working-directory: backend
-        run: dist/x64/twitch-cut-backend/twitch-cut-backend.exe --help
+        env:
+          TWITCH_CUT_DATA_DIR: ${{ runner.temp }}/twitch-cut-data
+        run: |
+          dist/x64/twitch-cut-backend/twitch-cut-backend.exe --help
+          dist/x64/twitch-cut-backend/twitch-cut-backend.exe prefetch
+          dist/x64/twitch-cut-backend/twitch-cut-backend.exe accel
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -165,7 +173,12 @@ jobs:
 
       - name: Smoke-test backend
         working-directory: backend
-        run: dist/${{ matrix.arch }}/twitch-cut-backend/twitch-cut-backend --help
+        env:
+          TWITCH_CUT_DATA_DIR: ${{ runner.temp }}/twitch-cut-data
+        run: |
+          dist/${{ matrix.arch }}/twitch-cut-backend/twitch-cut-backend --help
+          dist/${{ matrix.arch }}/twitch-cut-backend/twitch-cut-backend prefetch
+          dist/${{ matrix.arch }}/twitch-cut-backend/twitch-cut-backend accel
 
       # tar, а не каталог: upload-artifact теряет права на исполнение.
       - name: Pack backend

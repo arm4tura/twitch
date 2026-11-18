@@ -78,3 +78,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Скачанные из CI установщики для ручной проверки
+release-check/

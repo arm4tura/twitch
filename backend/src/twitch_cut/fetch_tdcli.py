@@ -93,11 +93,12 @@ def _vendor_dir() -> Path:
 def _ssl_context() -> ssl.SSLContext:
     """SSL-контекст с надёжным набором корневых сертификатов.
 
-    На macOS системный Python по умолчанию НЕ использует связку сертификатов
-    Keychain — `urllib` падает с `CERTIFICATE_VERIFY_FAILED`, пока пользователь
-    вручную не запустит «Install Certificates.command». Чтобы не заставлять его
-    это делать, берём CA-bundle из `certifi` (он и так тянется транзитивно через
-    requests/huggingface_hub, которые есть в зависимостях проекта). Если certifi
+    На macOS Python с python.org (и собранный из него бэкенд) по умолчанию НЕ
+    использует связку сертификатов Keychain — `urllib` падает с
+    `CERTIFICATE_VERIFY_FAILED`, пока пользователь вручную не запустит
+    «Install Certificates.command». Чтобы не заставлять его это делать, берём
+    CA-bundle из `certifi` — он в прямых зависимостях проекта и едет внутри
+    собранного бэкенда. Им же качает модели `onnx_models`. Если certifi
     почему-то нет — откатываемся на дефолтный контекст (лучше попробовать, чем
     гарантированно упасть)."""
     try:
