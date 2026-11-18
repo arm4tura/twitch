@@ -126,7 +126,7 @@ jobs:
       # Всегда прикладываем установщик как artifact — можно скачать со страницы
       # запуска даже при ручном прогоне без релиза.
       - name: Upload installer artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: twitch-cut-windows-installer
           path: |
@@ -186,7 +186,7 @@ jobs:
         run: tar czf backend-macos-${{ matrix.arch }}.tgz -C dist/${{ matrix.arch }} twitch-cut-backend
 
       - name: Upload backend
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: backend-macos-${{ matrix.arch }}
           path: backend/backend-macos-${{ matrix.arch }}.tgz
@@ -251,7 +251,7 @@ jobs:
         run: npm run build && npx electron-builder --mac --arm64 --x64 --publish never
 
       - name: Upload dmg artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: twitch-cut-macos-dmg
           path: |
