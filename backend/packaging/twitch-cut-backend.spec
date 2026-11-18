@@ -89,7 +89,11 @@ pyz = PYZ(a.pure)  # noqa: F821
 exe = EXE(  # noqa: F821
     pyz,
     a.scripts,
-    [],
+    # UTF-8 mode внутри exe. Собранный интерпретатор НЕ читает PYTHONUTF8 из
+    # окружения, а без него stdout в pipe идёт в кодировке системы (cp1251 /
+    # cp1252), и первый же rich-print русского текста или «→» валит процесс
+    # UnicodeEncodeError'ом.
+    [("X utf8_mode=1", None, "OPTION")],
     exclude_binaries=True,
     name="twitch-cut-backend",
     debug=False,
